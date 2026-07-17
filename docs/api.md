@@ -1,14 +1,13 @@
 # Internal API
 
-PyMTLF uses `/internal/v1` for private versioned APIs. Future state-changing
-payloads will carry `contract_version: "1.0"` when their owning phase activates
-them. This API is not a 3GPP SBI.
+PyMTLF uses `/internal/v1` for private APIs. This API is not a 3GPP SBI.
 
-Phase 1 registers only:
+The current foundation registers:
 
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /internal/v1/artifacts/{sha256}`
+- `POST /internal/v1/data-source-selection`
 
 Accuracy reports, datasets, model-ready events, model apply results, and the
 active-state query remain semantic inventory in the transition plan. Their
@@ -35,4 +34,6 @@ The default deployment binds to loopback and does not provide application-level
 authentication or TLS. Non-loopback deployment requires a separate trust and
 network-policy decision.
 
-Generation-journal and readiness semantics are documented in `state.md`.
+The data-source selection request carries only `availableDataSources`; it does
+not expose MongoDB credentials or ADRF fetch instructions. PyMTLF returns its
+configured `storageMode` when the available source set satisfies that mode.

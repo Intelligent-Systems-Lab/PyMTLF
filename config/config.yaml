@@ -2,7 +2,6 @@ server:
   binding_host: "127.0.0.1"
   port: 9092
 storage:
-  database_path: "data/mtlf-state.sqlite3"
   artifact_root: "data/artifacts"
 artifact:
   public_base_url: "http://127.0.0.1:9092"
@@ -10,8 +9,7 @@ artifact:
   max_extracted_bytes: 1073741824
   max_single_file_bytes: 536870912
   max_entries: 32
-reconciliation:
-  retry_interval_seconds: 1
-  shutdown_timeout_seconds: 5
+data_source:
+  storage_mode: "mongodb"
 log:
   level: "INFO"

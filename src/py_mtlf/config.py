@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -23,10 +24,9 @@ class ServerSettings(FrozenSettings):
 
 
 class StorageSettings(FrozenSettings):
-    database_path: Path = Path("data/mtlf-state.sqlite3")
     artifact_root: Path = Path("data/artifacts")
 
-    @field_validator("database_path", "artifact_root", mode="before")
+    @field_validator("artifact_root", mode="before")
     @classmethod
     def path_must_not_be_blank(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -71,9 +71,8 @@ class ArtifactSettings(FrozenSettings):
         return self
 
 
-class ReconciliationSettings(FrozenSettings):
-    retry_interval_seconds: float = Field(default=1, gt=0)
-    shutdown_timeout_seconds: float = Field(default=5, gt=0)
+class DataSourceSettings(FrozenSettings):
+    storage_mode: Literal["adrf", "mongodb", "dual"] = "mongodb"
 
 
 class LogSettings(FrozenSettings):
@@ -92,7 +91,7 @@ class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
     storage: StorageSettings = StorageSettings()
     artifact: ArtifactSettings = ArtifactSettings()
-    reconciliation: ReconciliationSettings = ReconciliationSettings()
+    data_source: DataSourceSettings = DataSourceSettings()
     log: LogSettings = LogSettings()
 
 

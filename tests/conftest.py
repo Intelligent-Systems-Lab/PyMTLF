@@ -66,7 +66,6 @@ def build_bundle(
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         storage=StorageSettings(
-            database_path=tmp_path / "state.sqlite3",
             artifact_root=tmp_path / "artifacts",
         ),
         artifact=ArtifactSettings(public_base_url="http://127.0.0.1:9092"),

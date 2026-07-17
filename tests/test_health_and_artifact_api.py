@@ -20,16 +20,6 @@ def test_app_supports_repeated_startup_and_shutdown(settings):
             assert client.get("/health/ready").status_code == 200
 
 
-def test_readiness_detects_database_failure(settings):
-    app = create_app(settings)
-    with TestClient(app) as client:
-        app.state.journal.close()
-        response = client.get("/health/ready")
-
-    assert response.status_code == 503
-    assert response.json()["database"] == "unavailable"
-
-
 def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
     app = create_app(settings)
     with TestClient(app) as client:
@@ -41,6 +31,8 @@ def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["artifacts"] == "unavailable"
+    assert "database" not in response.json()
+    assert "reconciliation" not in response.json()
 
 
 def test_artifact_get_has_immutable_integrity_headers(settings, bundle_path):

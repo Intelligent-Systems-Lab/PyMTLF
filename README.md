@@ -1,12 +1,15 @@
 # PyMTLF
 
 PyMTLF is the private MTLF backend used by the local NWDAF implementation. It is
-not a standalone 3GPP network function. NWDAF Go remains the owner of all
-standard SBI and ADRF communication.
+not a standalone 3GPP network function. NWDAF Go owns standard SBI routing and
+the standard ADRF subscription and callback procedures. PyMTLF will consume
+ADRF fetch instructions and retrieve the referenced data directly in a later
+phase.
 
-Phase 1 provides the service lifecycle, internal durable-state models, durable
-generation journal, startup reconciliation seam, and immutable model artifact
-repository. Accuracy policy and training are intentionally not active yet.
+The current foundation provides the service lifecycle, health endpoints,
+storage-mode selection handshake, and immutable model artifact repository.
+Accuracy policy, direct data retrieval, and training are intentionally not
+active yet.
 
 ## Development
 

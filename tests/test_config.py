@@ -11,7 +11,8 @@ def test_defaults_use_confirmed_phase_one_values():
 
     assert settings.server.binding_host == "127.0.0.1"
     assert settings.server.port == 9092
-    assert settings.storage.database_path == Path("data/mtlf-state.sqlite3")
+    assert settings.storage.artifact_root == Path("data/artifacts")
+    assert settings.data_source.storage_mode == "mongodb"
     assert settings.artifact.max_compressed_bytes == 256 * 1024 * 1024
     assert settings.artifact.max_extracted_bytes == 1024 * 1024 * 1024
     assert settings.artifact.max_single_file_bytes == 512 * 1024 * 1024
@@ -48,7 +49,24 @@ def test_single_file_limit_must_not_exceed_total_limit():
         ArtifactSettings(max_single_file_bytes=11, max_extracted_bytes=10)
 
 
-@pytest.mark.parametrize("field", ["database_path", "artifact_root"])
-def test_storage_paths_must_not_be_blank(field):
+def test_storage_path_must_not_be_blank():
     with pytest.raises(ValidationError):
-        StorageSettings.model_validate({field: " "})
+        StorageSettings(artifact_root=" ")
+
+
+@pytest.mark.parametrize("value", ["invalid", "", "MONGODB"])
+def test_storage_mode_rejects_unknown_value(value):
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"data_source": {"storage_mode": value}})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"storage": {"database_path": "data/old.sqlite3"}},
+        {"reconciliation": {"retry_interval_seconds": 1}},
+    ],
+)
+def test_removed_state_machine_config_is_rejected(payload):
+    with pytest.raises(ValidationError):
+        Settings.model_validate(payload)
