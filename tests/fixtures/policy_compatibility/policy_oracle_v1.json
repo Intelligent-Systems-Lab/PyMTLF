@@ -1,0 +1,559 @@
+{
+  "schema_version": "1.0",
+  "baseline": {
+    "repository": "NWDAF",
+    "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+    "recorded_at": "2026-07-17T00:00:00Z"
+  },
+  "fixtures": [
+    {
+      "fixture_id": "cold_start_baseline",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_ColdStartBuildsBaselineWithoutTrigger"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "min_buffer_samples": 5,
+        "fixed_floor": 100
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 150
+          },
+          "sample_count": 5
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "baseline_samples": 1,
+          "window_hits": 0,
+          "retrain": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "minimum_sample_ownership",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_DoesNotRepeatAnLFMatchedSampleGate"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "min_buffer_samples": 3
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 300
+          },
+          "sample_count": 1
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "accepted_by_mtlf": true,
+          "retrain": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "AnLF sample gate is authoritative; Go MTLF does not repeat it"
+    },
+    {
+      "fixture_id": "fixed_floor_ineligible",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_BaselineReadyRequiresRelGate"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "min_buffer_samples": 3,
+        "min_std": 100,
+        "fixed_floor": 100,
+        "z_score_threshold": 3
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 160
+          },
+          "sample_count": 5
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "window_hits": 0,
+          "retrain": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "zscore_degradation_window",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_TriggersOnlyAfterBaselineReady"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "min_buffer_samples": 3,
+        "min_std": 1,
+        "fixed_floor": 100,
+        "z_score_threshold": 3,
+        "required_hits_in_window": 2
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 150
+          }
+        },
+        {
+          "step": 2,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 150
+          }
+        },
+        {
+          "step": 3,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 150
+          }
+        },
+        {
+          "step": 4,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 300
+          }
+        },
+        {
+          "step": 5,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 700
+          }
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 3,
+          "window_hits": 0,
+          "retrain": false
+        },
+        {
+          "step": 4,
+          "window_hits": 1,
+          "retrain": false
+        },
+        {
+          "step": 5,
+          "window_hits": 2,
+          "retrain": true
+        }
+      ],
+      "retrain_trigger_expected": true,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "chronic_percentile",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_ChronicPathTriggersWithoutDegradation"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "chronic_enabled": true,
+        "chronic_metric": "MAE",
+        "aggregator": "percentile",
+        "percentile": 75
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 1000
+          },
+          "actual_traffic_scale": 2048
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "chronic_hit": true,
+          "retrain": true
+        }
+      ],
+      "retrain_trigger_expected": true,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "low_traffic_overprediction",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_LowTrafficOverpredictionTriggers"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "low_traffic_overprediction_enabled": true,
+        "max_actual_traffic_scale": 1024,
+        "min_predicted_traffic_scale": 4096,
+        "prediction_overshoot_ratio": 4
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "actual_traffic_scale": 512,
+          "predicted_traffic_scale": 8192
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "low_traffic_overprediction_hit": true,
+          "retrain": true
+        }
+      ],
+      "retrain_trigger_expected": true,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "traffic_scale_eligibility",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_ChronicPathRequiresTrafficScale"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "chronic_enabled": true,
+        "min_decision_traffic_scale": 1024
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 1000
+          },
+          "actual_traffic_scale": 512
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "eligible": false,
+          "retrain": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "per_scope_isolation",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_MultiScopeIsolation"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE",
+        "recent_buffer_size": 5
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 300
+          }
+        },
+        {
+          "step": 2,
+          "scope_id": "group:test-b",
+          "metrics": {
+            "MAE": 150
+          }
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 2,
+          "scope_count": 2,
+          "state_isolated": true
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "stale_scope_gc",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/state_store.go",
+        "test_path": "internal/mtlf/state_store_test.go",
+        "test_name": "TestMonitorStateStore_GCExpiredScopes"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "scope_state_ttl_seconds": 60
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "scope-a",
+          "logical_time": "2026-07-17T00:00:00Z",
+          "metrics": {
+            "MAE": 10
+          }
+        },
+        {
+          "step": 2,
+          "logical_time": "2026-07-17T00:02:00Z",
+          "operation": "gc"
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 2,
+          "scope_exists": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "retrain_inflight_suppression",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_SkipWhenRetrainingInFlight"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "MAE"
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 700
+          },
+          "retraining_inflight": true
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "retrain_dispatch_count": 0
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "concurrent/in-flight state suppresses another dispatch"
+    },
+    {
+      "fixture_id": "report_id_duplicate",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/mtlf.go",
+        "test_path": "internal/mtlf/model_accuracy_report_test.go",
+        "test_name": "TestHandleModelAccuracyReportDeduplicatesAndRejectsStaleGeneration"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {},
+      "ordered_reports": [
+        {
+          "step": 1,
+          "report_id": "report-1",
+          "generation": 2
+        },
+        {
+          "step": 2,
+          "report_id": "report-1",
+          "generation": 2
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "accepted": true
+        },
+        {
+          "step": 2,
+          "duplicate": true,
+          "accepted_without_reprocessing": true
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "same report_id is idempotent within process lifetime"
+    },
+    {
+      "fixture_id": "generation_transition",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/mtlf.go",
+        "test_path": "internal/mtlf/model_accuracy_report_test.go",
+        "test_name": "TestHandleModelAccuracyReportDeduplicatesAndRejectsStaleGeneration"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {},
+      "ordered_reports": [
+        {
+          "step": 1,
+          "report_id": "report-current",
+          "generation": 2
+        },
+        {
+          "step": 2,
+          "report_id": "report-old",
+          "generation": 1
+        },
+        {
+          "step": 3,
+          "report_id": "report-new",
+          "generation": 3
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 2,
+          "stale_rejected": true
+        },
+        {
+          "step": 3,
+          "new_generation_resets_policy_state": true
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "lower generation is stale; higher generation advances and resets model policy state"
+    },
+    {
+      "fixture_id": "missing_primary_metric",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/trigger.go",
+        "test_path": "internal/mtlf/trigger_test.go",
+        "test_name": "TestHandleAccuracyReports_MissingPrimaryMetricSkipsScope"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {
+        "primary_metric": "WAPE"
+      },
+      "ordered_reports": [
+        {
+          "step": 1,
+          "scope_id": "group:test",
+          "metrics": {
+            "MAE": 0.1
+          }
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "scope_skipped": true,
+          "retrain": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "not_applicable"
+    },
+    {
+      "fixture_id": "retrain_terminal_behavior",
+      "classification": "historical_invariant",
+      "provenance": {
+        "repository": "NWDAF",
+        "commit": "9fd11f004a65d7b2a3c06d034755dd299069c929",
+        "source_path": "internal/mtlf/training.go",
+        "test_path": "internal/mtlf/training_test.go",
+        "test_name": "TestHandleTrainingComplete_Failure_ClearsRetraining"
+      },
+      "logical_clock": "2026-07-17T00:00:00Z",
+      "policy_config": {},
+      "ordered_reports": [
+        {
+          "step": 1,
+          "training_task_id": "task-1",
+          "terminal_status": "FAILED"
+        }
+      ],
+      "expected_steps": [
+        {
+          "step": 1,
+          "inflight_removed": true,
+          "retraining_flag": false,
+          "model_provisioned": false
+        }
+      ],
+      "retrain_trigger_expected": false,
+      "dedup_stale_behavior": "terminal callback is idempotently removed; success path is covered by TestHandleTrainingComplete_Success_ClearsInFlight"
+    }
+  ]
+}
