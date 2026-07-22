@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -71,10 +70,6 @@ class ArtifactSettings(FrozenSettings):
         return self
 
 
-class DataSourceSettings(FrozenSettings):
-    storage_mode: Literal["adrf", "mongodb", "dual"] = "mongodb"
-
-
 class LogSettings(FrozenSettings):
     level: str = "INFO"
 
@@ -91,7 +86,6 @@ class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
     storage: StorageSettings = StorageSettings()
     artifact: ArtifactSettings = ArtifactSettings()
-    data_source: DataSourceSettings = DataSourceSettings()
     log: LogSettings = LogSettings()
 
 

@@ -9,7 +9,5 @@ artifact:
   max_extracted_bytes: 1073741824
   max_single_file_bytes: 536870912
   max_entries: 32
-data_source:
-  storage_mode: "mongodb"
 log:
   level: "INFO"

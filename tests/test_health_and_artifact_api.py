@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
@@ -10,6 +12,7 @@ def test_health_is_ready_after_startup(settings):
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+    UUID(response.json()["processInstanceId"])
 
 
 def test_app_supports_repeated_startup_and_shutdown(settings):
@@ -23,6 +26,7 @@ def test_app_supports_repeated_startup_and_shutdown(settings):
 def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
     app = create_app(settings)
     with TestClient(app) as client:
+
         def fail_probe():
             raise OSError("storage unavailable")
 
@@ -65,3 +69,4 @@ def test_contract_only_routes_are_not_registered(settings):
     with TestClient(create_app(settings)) as client:
         assert client.post("/internal/v1/accuracy-reports", json={}).status_code == 404
         assert client.post("/internal/v1/model-apply-results", json={}).status_code == 404
+        assert client.post("/internal/v1/data-source-selection", json={}).status_code == 404

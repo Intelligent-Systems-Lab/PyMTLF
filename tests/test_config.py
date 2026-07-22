@@ -12,7 +12,6 @@ def test_defaults_use_confirmed_phase_one_values():
     assert settings.server.binding_host == "127.0.0.1"
     assert settings.server.port == 9092
     assert settings.storage.artifact_root == Path("data/artifacts")
-    assert settings.data_source.storage_mode == "mongodb"
     assert settings.artifact.max_compressed_bytes == 256 * 1024 * 1024
     assert settings.artifact.max_extracted_bytes == 1024 * 1024 * 1024
     assert settings.artifact.max_single_file_bytes == 512 * 1024 * 1024
@@ -52,12 +51,6 @@ def test_single_file_limit_must_not_exceed_total_limit():
 def test_storage_path_must_not_be_blank():
     with pytest.raises(ValidationError):
         StorageSettings(artifact_root=" ")
-
-
-@pytest.mark.parametrize("value", ["invalid", "", "MONGODB"])
-def test_storage_mode_rejects_unknown_value(value):
-    with pytest.raises(ValidationError):
-        Settings.model_validate({"data_source": {"storage_mode": value}})
 
 
 @pytest.mark.parametrize(

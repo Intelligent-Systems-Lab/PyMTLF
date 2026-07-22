@@ -7,7 +7,7 @@ The current foundation registers:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /internal/v1/artifacts/{sha256}`
-- `POST /internal/v1/data-source-selection`
+- `POST /internal/v1/sync`
 
 Accuracy reports, datasets, model-ready events, model apply results, and the
 active-state query remain semantic inventory in the transition plan. Their
@@ -34,6 +34,7 @@ The default deployment binds to loopback and does not provide application-level
 authentication or TLS. Non-loopback deployment requires a separate trust and
 network-policy decision.
 
-The data-source selection request carries only `availableDataSources`; it does
-not expose MongoDB credentials or ADRF fetch instructions. PyMTLF returns its
-configured `storageMode` when the available source set satisfies that mode.
+The sync request carries the containing NWDAF identity and typed data-source
+availability. It does not expose MongoDB credentials, raw data, model artifacts,
+or ADRF fetch instructions. Source preference and effective selection remain
+empty until the retrieval phase activates that policy.
