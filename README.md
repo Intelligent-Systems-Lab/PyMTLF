@@ -17,13 +17,15 @@ Before using the sample configuration, import the initial seed bundle:
 ```bash
 uv run python tools/import_seed_model.py \
   --config config/config.yaml \
-  --source /path/to/model-bundle-components \
+  --source seed_models/initial \
   --provider-namespace local-mtlf \
   --model-id 1
 ```
 
-The source directory must contain `config.json`, `model.py`, `model.npy`, and
-`scaler.pkl`. Copy the emitted `artifact_key` into
+The version-controlled source bundle is owned by this repository under
+`seed_models/initial`. It contains `config.json`, `model.py`, `model.npy`, and
+`scaler.pkl`. The import command packages those components into the immutable
+runtime repository below `data/artifacts`. Copy the emitted `artifact_key` into
 `model_provision.seed_models[].artifact_key`. Startup fails if a configured
 seed artifact is missing or its manifest identity does not match the
 descriptor.
@@ -38,7 +40,9 @@ uv run python run.py --config config/config.yaml
 ```
 
 The default listener is `127.0.0.1:9092`. Runtime state is stored below
-`data/`, which is excluded from git.
+`data/`, which is excluded from git. The tracked source seed remains under
+`seed_models/`; PyAnLF is only a provisioned artifact consumer and does not
+provide the initial model source.
 
 See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
 standard-shaped operations PyMTLF sends through the containing Go NWDAF.

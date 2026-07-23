@@ -136,4 +136,7 @@ representation. PyMTLF never calls PyAnLF directly.
 The default listener is `127.0.0.1:9092` over ordinary HTTP. TLS, OAuth
 delegation, independent NRF registration, and cross-Go-restart persistence are
 outside the current deployment. Runtime artifacts live below `data/`, which is
-excluded from git.
+excluded from git. The reproducible, version-controlled initial bundle source
+is owned by PyMTLF under `seed_models/initial`; importing it publishes a
+content-addressed runtime artifact. PyAnLF receives only the resulting Model
+Provision metadata and downloads the artifact from this service.

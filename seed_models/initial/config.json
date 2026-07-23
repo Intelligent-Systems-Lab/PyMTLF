@@ -1,0 +1,44 @@
+{
+  "TID": "initial-local-8c15371e",
+  "MODEL_PATH": "model.npy",
+  "SCALER_PATH": "scaler.pkl",
+  "MODEL_SCRIPT": "model.py",
+  "model": {
+    "input_size": 10,
+    "output_size": 2,
+    "num_channels": [
+      32,
+      64,
+      64,
+      64
+    ],
+    "kernel_size": 2,
+    "dropout": 0.2
+  },
+  "inference": {
+    "seq_length": 30,
+    "out_seq_len": 1,
+    "feature_order": [
+      "total_vol",
+      "ul_vol",
+      "dl_vol",
+      "total_nb_pkts",
+      "ul_nb_pkts",
+      "dl_nb_pkts",
+      "ul_thr",
+      "dl_thr",
+      "ul_pkt_thr",
+      "dl_pkt_thr"
+    ],
+    "output_fields": [
+      "ul_vol",
+      "dl_vol"
+    ],
+    "preprocessing": "log1p_standard_scaler"
+  },
+  "training": {
+    "trainer": "local_centralized",
+    "best_epoch": 18,
+    "local_epochs": 18
+  }
+}
