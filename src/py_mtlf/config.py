@@ -1,8 +1,11 @@
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from py_mtlf.models import SHA256_PATTERN
 
 
 class FrozenSettings(BaseModel):
@@ -70,6 +73,110 @@ class ArtifactSettings(FrozenSettings):
         return self
 
 
+class SeedModelSettings(FrozenSettings):
+    model_id: int = Field(ge=0, le=9223372036854775807)
+    artifact_key: str
+    event: str = Field(min_length=1)
+    event_filter: dict[str, Any] = Field(default_factory=dict)
+    target_ue: dict[str, Any] | None = None
+    model_interoperability: str = ""
+    use_case_context: str = ""
+
+    @field_validator("artifact_key")
+    @classmethod
+    def validate_artifact_key(cls, value: str) -> str:
+        value = value.strip()
+        if not SHA256_PATTERN.fullmatch(value):
+            raise ValueError("seed model artifact_key must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("event")
+    @classmethod
+    def normalize_event(cls, value: str) -> str:
+        return value.strip()
+
+
+class ModelProvisionSettings(FrozenSettings):
+    provider_namespace: str = "local-mtlf"
+    seed_models: tuple[SeedModelSettings, ...] = ()
+
+    @field_validator("provider_namespace")
+    @classmethod
+    def validate_provider_namespace(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("model_provision.provider_namespace must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_models(self) -> "ModelProvisionSettings":
+        model_ids = [model.model_id for model in self.seed_models]
+        if len(model_ids) != len(set(model_ids)):
+            raise ValueError("model_provision seed model IDs must be unique")
+        artifact_keys = [model.artifact_key for model in self.seed_models]
+        if len(artifact_keys) != len(set(artifact_keys)):
+            raise ValueError("model_provision seed artifact keys must be unique")
+        return self
+
+
+class NotificationSettings(FrozenSettings):
+    request_timeout_seconds: float = Field(default=5.0, gt=0, le=300)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    initial_backoff_seconds: float = Field(default=0.2, ge=0, le=60)
+    max_backoff_seconds: float = Field(default=2.0, ge=0, le=300)
+
+    @model_validator(mode="after")
+    def validate_backoff(self) -> "NotificationSettings":
+        if self.initial_backoff_seconds > self.max_backoff_seconds:
+            raise ValueError("initial notification backoff must not exceed maximum backoff")
+        return self
+
+
+class ModelMonitorSettings(FrozenSettings):
+    callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
+    report_period_seconds: int = Field(default=90, gt=0)
+    request_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    retry_interval_seconds: float = Field(default=1, gt=0, le=300)
+    retry_max_interval_seconds: float = Field(default=30, gt=0, le=600)
+
+    @field_validator("callback_uri")
+    @classmethod
+    def validate_callback_uri(cls, value: str) -> str:
+        value = value.strip()
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("model_monitor.callback_uri must be an absolute HTTP(S) URI")
+        return value
+
+    @model_validator(mode="after")
+    def validate_retry(self) -> "ModelMonitorSettings":
+        if self.retry_interval_seconds > self.retry_max_interval_seconds:
+            raise ValueError("model monitor initial retry must not exceed maximum")
+        return self
+
+
+class AccuracyPolicySettings(FrozenSettings):
+    enabled: bool = True
+    reference_buffer_size: int = Field(default=12, gt=0)
+    min_reference_samples: int = Field(default=5, gt=0)
+    min_std: float = Field(default=0.14, gt=0)
+    fixed_floor: float = Field(default=0.05, ge=0)
+    z_score_threshold: float = Field(default=1.3, gt=0)
+    decision_window_size: int = Field(default=5, gt=0)
+    required_hits: int = Field(default=3, gt=0)
+    scope_state_ttl_seconds: int = Field(default=600, gt=0)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "AccuracyPolicySettings":
+        if self.required_hits > self.decision_window_size:
+            object.__setattr__(self, "required_hits", self.decision_window_size)
+        if self.min_reference_samples > self.reference_buffer_size:
+            raise ValueError(
+                "accuracy_policy.min_reference_samples must not exceed reference_buffer_size"
+            )
+        return self
+
+
 class LogSettings(FrozenSettings):
     level: str = "INFO"
 
@@ -86,6 +193,10 @@ class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
     storage: StorageSettings = StorageSettings()
     artifact: ArtifactSettings = ArtifactSettings()
+    model_provision: ModelProvisionSettings = ModelProvisionSettings()
+    model_monitor: ModelMonitorSettings = ModelMonitorSettings()
+    accuracy_policy: AccuracyPolicySettings = AccuracyPolicySettings()
+    notification: NotificationSettings = NotificationSettings()
     log: LogSettings = LogSettings()
 
 

@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from uuid import uuid4
@@ -7,9 +8,18 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from py_mtlf.api import artifacts, health, sync
+from py_mtlf.api import artifacts, health, ml_model_monitor, ml_model_provision, sync
 from py_mtlf.config import Settings
+from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.artifacts import ArtifactRepository
+from py_mtlf.core.monitor_reconciler import MonitorSubscriptionReconciler
+from py_mtlf.core.monitor_store import (
+    MonitorRegistrationStore,
+    MonitorSubscriptionProjectionStore,
+)
+from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
+from py_mtlf.core.provision_store import ProvisionResourceStore
+from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.models import PrivateError
 
@@ -35,8 +45,28 @@ def create_app(
     artifact_repository = artifact_repository or ArtifactRepository(
         settings.storage.artifact_root, settings.artifact
     )
+    seed_catalog = SeedCatalog(settings.model_provision, artifact_repository)
+    state_lock = threading.RLock()
+    provision_store = ProvisionResourceStore(seed_catalog, state_lock)
+    provision_notifications = ProvisionNotificationDispatcher(
+        settings.notification,
+        provision_store,
+    )
     runtime = RuntimeState(process_instance_id=str(uuid4()))
-    sync_projection = SyncProjection()
+    sync_projection = SyncProjection(state_lock)
+    monitor_registrations = MonitorRegistrationStore(state_lock)
+    monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
+    monitor_reconciler = MonitorSubscriptionReconciler(
+        settings.model_monitor,
+        sync_projection,
+        monitor_registrations,
+        monitor_subscriptions,
+        state_lock,
+    )
+    accuracy_policy = AccuracyPolicy(
+        settings.accuracy_policy,
+        settings.model_provision.provider_namespace,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -44,11 +74,16 @@ def create_app(
         logger.info("MTLF backend startup begin")
         try:
             artifact_repository.open()
+            seed_catalog.open()
+            provision_notifications.open()
+            monitor_reconciler.open()
             runtime.artifact_status = "ready"
             runtime.accepting_requests = True
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
+            monitor_reconciler.shutdown()
+            provision_notifications.shutdown()
             runtime.accepting_requests = False
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
@@ -57,16 +92,35 @@ def create_app(
     app.state.settings = settings
     app.state.runtime = runtime
     app.state.artifacts = artifact_repository
+    app.state.seed_catalog = seed_catalog
+    app.state.provision_store = provision_store
+    app.state.provision_notifications = provision_notifications
     app.state.sync_projection = sync_projection
+    app.state.monitor_registrations = monitor_registrations
+    app.state.monitor_subscriptions = monitor_subscriptions
+    app.state.monitor_reconciler = monitor_reconciler
+    app.state.accuracy_policy = accuracy_policy
+    app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
+    app.include_router(ml_model_provision.router)
+    app.include_router(ml_model_monitor.router)
     app.include_router(sync.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        del request, exc
+        if request.url.path.startswith("/internal/v1/ml-model-"):
+            from py_mtlf.api.problems import problem_response
+
+            return problem_response(
+                status.HTTP_400_BAD_REQUEST,
+                "Bad Request",
+                "request validation failed",
+                cause="INVALID_MSG_FORMAT",
+            )
+        del exc
         payload = PrivateError(
             code="VALIDATION_ERROR",
             message="request validation failed",

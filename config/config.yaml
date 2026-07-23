@@ -9,5 +9,33 @@ artifact:
   max_extracted_bytes: 1073741824
   max_single_file_bytes: 536870912
   max_entries: 32
+model_provision:
+  provider_namespace: "local-mtlf"
+  seed_models:
+    - model_id: 1
+      artifact_key: "5b11c450bc11d0d41474ad5a720d473e59ba2e9c41f2a321b83384e12593db7f"
+      event: "UE_COMMUNICATION"
+      event_filter: {}
+notification:
+  request_timeout_seconds: 5
+  max_attempts: 3
+  initial_backoff_seconds: 0.2
+  max_backoff_seconds: 2
+model_monitor:
+  callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
+  report_period_seconds: 90
+  request_timeout_seconds: 30
+  retry_interval_seconds: 1
+  retry_max_interval_seconds: 30
+accuracy_policy:
+  enabled: true
+  reference_buffer_size: 12
+  min_reference_samples: 5
+  min_std: 0.14
+  fixed_floor: 0.05
+  z_score_threshold: 1.3
+  decision_window_size: 5
+  required_hits: 3
+  scope_state_ttl_seconds: 600
 log:
   level: "INFO"

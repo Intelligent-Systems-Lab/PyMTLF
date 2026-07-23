@@ -6,10 +6,27 @@ the standard ADRF subscription and callback procedures. PyMTLF will consume
 ADRF fetch instructions and retrieve the referenced data directly in a later
 phase.
 
-The current foundation provides the service lifecycle, health endpoints,
-storage-mode selection handshake, and immutable model artifact repository.
-Accuracy policy, direct data retrieval, and training are intentionally not
-active yet.
+The current runtime provides the service lifecycle, health and sync endpoints,
+an immutable model artifact repository, a configured seed-model catalog,
+standard-shaped Model Provision and ML Model Monitor resources, and a
+degradation-only WAPE policy. Direct training-data retrieval, local training,
+new model generation, and retrained-model reprovision remain deferred.
+
+Before using the sample configuration, import the initial seed bundle:
+
+```bash
+uv run python tools/import_seed_model.py \
+  --config config/config.yaml \
+  --source /path/to/model-bundle-components \
+  --provider-namespace local-mtlf \
+  --model-id 1
+```
+
+The source directory must contain `config.json`, `model.py`, `model.npy`, and
+`scaler.pkl`. Copy the emitted `artifact_key` into
+`model_provision.seed_models[].artifact_key`. Startup fails if a configured
+seed artifact is missing or its manifest identity does not match the
+descriptor.
 
 ## Development
 
@@ -22,3 +39,6 @@ uv run python run.py --config config/config.yaml
 
 The default listener is `127.0.0.1:9092`. Runtime state is stored below
 `data/`, which is excluded from git.
+
+See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
+standard-shaped operations PyMTLF sends through the containing Go NWDAF.

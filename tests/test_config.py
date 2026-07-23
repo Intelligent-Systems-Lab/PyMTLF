@@ -3,7 +3,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from py_mtlf.config import ArtifactSettings, Settings, StorageSettings, load_settings
+from py_mtlf.config import (
+    ArtifactSettings,
+    ModelProvisionSettings,
+    SeedModelSettings,
+    Settings,
+    StorageSettings,
+    load_settings,
+)
 
 
 def test_defaults_use_confirmed_phase_one_values():
@@ -51,6 +58,16 @@ def test_single_file_limit_must_not_exceed_total_limit():
 def test_storage_path_must_not_be_blank():
     with pytest.raises(ValidationError):
         StorageSettings(artifact_root=" ")
+
+
+def test_seed_model_ids_and_artifact_keys_are_unique():
+    seed = SeedModelSettings(
+        model_id=1,
+        artifact_key="a" * 64,
+        event="UE_COMMUNICATION",
+    )
+    with pytest.raises(ValidationError, match="IDs must be unique"):
+        ModelProvisionSettings(seed_models=(seed, seed))
 
 
 @pytest.mark.parametrize(

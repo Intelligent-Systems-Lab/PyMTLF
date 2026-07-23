@@ -1,0 +1,319 @@
+import json
+import logging
+import threading
+from dataclasses import dataclass
+from time import monotonic
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+import httpx
+
+from py_mtlf.config import ModelMonitorSettings
+from py_mtlf.core.monitor_store import (
+    MonitorRegistrationResource,
+    MonitorRegistrationStore,
+    MonitorSubscriptionProjection,
+    MonitorSubscriptionProjectionStore,
+)
+from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.wire.ml_model_monitor import (
+    MLModelMonitorSubscription,
+    MonitorReportingRequirement,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedMonitorRestore:
+    subscription_ids: dict[str, str]
+    orphan_subscription_ids: frozenset[str]
+
+
+class MonitorSubscriptionReconciler:
+    def __init__(
+        self,
+        settings: ModelMonitorSettings,
+        projection: SyncProjection,
+        registrations: MonitorRegistrationStore,
+        subscriptions: MonitorSubscriptionProjectionStore,
+        state_lock=None,
+    ) -> None:
+        self._settings = settings
+        self._projection = projection
+        self._registrations = registrations
+        self._subscriptions = subscriptions
+        self._condition = threading.Condition(state_lock or threading.RLock())
+        self._subscription_ids: dict[str, str] = {}
+        self._orphan_subscription_ids: set[str] = set()
+        self._closing = False
+        self._worker: threading.Thread | None = None
+        self._session = httpx.Client()
+
+    def open(self) -> None:
+        with self._condition:
+            if self._worker is not None:
+                return
+            self._closing = False
+            self._worker = threading.Thread(
+                target=self._run,
+                name="monitor-subscription-reconciler",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def shutdown(self) -> None:
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=self._settings.request_timeout_seconds + 1)
+        self._session.close()
+        with self._condition:
+            self._worker = None
+
+    def refresh(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def restore(
+        self,
+        subscriptions: tuple[MonitorSubscriptionProjection, ...],
+    ) -> None:
+        prepared = self.prepare_restore(
+            self._registrations.snapshot(),
+            subscriptions,
+        )
+        self.commit_restore(prepared)
+        self.finalize_restore()
+
+    def prepare_restore(
+        self,
+        registrations: tuple[MonitorRegistrationResource, ...],
+        subscriptions: tuple[MonitorSubscriptionProjection, ...],
+    ) -> PreparedMonitorRestore:
+        available = list(subscriptions)
+        restored: dict[str, str] = {}
+        for registration in registrations:
+            for index, candidate in enumerate(available):
+                if (
+                    candidate.owner_registration_id == registration.registration_id
+                    and self._same_scope(
+                        self._subscription_for(registration),
+                        candidate.representation,
+                    )
+                ):
+                    restored[registration.registration_id] = candidate.subscription_id
+                    available.pop(index)
+                    break
+        return PreparedMonitorRestore(
+            subscription_ids=restored,
+            orphan_subscription_ids=frozenset(
+                candidate.subscription_id for candidate in available
+            ),
+        )
+
+    def commit_restore(self, prepared: PreparedMonitorRestore) -> None:
+        with self._condition:
+            self._subscription_ids = dict(prepared.subscription_ids)
+            self._orphan_subscription_ids = set(
+                prepared.orphan_subscription_ids
+            )
+
+    def finalize_restore(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, str]:
+        with self._condition:
+            return dict(self._subscription_ids)
+
+    def orphans(self) -> frozenset[str]:
+        with self._condition:
+            return frozenset(self._orphan_subscription_ids)
+
+    def owns(self, registration_id: str, subscription_id: str) -> bool:
+        with self._condition:
+            return (
+                self._subscription_ids.get(registration_id) == subscription_id
+                and subscription_id not in self._orphan_subscription_ids
+            )
+
+    def _run(self) -> None:
+        delay = self._settings.retry_interval_seconds
+        next_attempt = 0.0
+        while True:
+            with self._condition:
+                while not self._closing:
+                    action = self._next_action()
+                    now = monotonic()
+                    if action is not None and now >= next_attempt:
+                        break
+                    timeout = None if action is None else max(0.0, next_attempt - now)
+                    self._condition.wait(timeout=timeout)
+                if self._closing:
+                    return
+            try:
+                kind, registration_id = action
+                if kind == "create":
+                    self._create(registration_id)
+                elif kind == "delete":
+                    self._delete(registration_id)
+                else:
+                    self._delete_orphan(registration_id)
+                delay = self._settings.retry_interval_seconds
+                next_attempt = 0.0
+            except Exception:
+                logger.exception("Monitor subscription reconciliation failed: action=%s", action)
+                next_attempt = monotonic() + delay
+                delay = min(delay * 2, self._settings.retry_max_interval_seconds)
+
+    def _next_action(self) -> tuple[str, str] | None:
+        if self._orphan_subscription_ids:
+            return "delete_orphan", min(self._orphan_subscription_ids)
+        desired = {
+            resource.registration_id
+            for resource in self._registrations.snapshot()
+        }
+        for registration_id in sorted(desired):
+            if registration_id not in self._subscription_ids:
+                return "create", registration_id
+        for registration_id in sorted(self._subscription_ids):
+            if registration_id not in desired:
+                return "delete", registration_id
+        return None
+
+    def _create(self, registration_id: str) -> None:
+        resource = self._registrations.get(registration_id)
+        if resource is None:
+            return
+        representation = self._subscription_for(resource)
+        response = self._request(
+            "POST",
+            "/internal/v1/ml-model-monitor/subscriptions",
+            headers={
+                "X-NWDAF-Monitor-Registration-Id": registration_id,
+            },
+            json=representation.model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            ),
+        )
+        if response.status_code != 201:
+            raise RuntimeError(
+                f"monitor subscription create returned status {response.status_code}"
+            )
+        accepted = MLModelMonitorSubscription.model_validate(response.json())
+        if not self._same_scope(representation, accepted):
+            raise RuntimeError("monitor subscription response changed the requested scope")
+        subscription_id = urlsplit(
+            response.headers.get("Location", "")
+        ).path.rstrip("/").rsplit("/", 1)[-1]
+        if not subscription_id:
+            raise RuntimeError("monitor subscription create response has no resource identity")
+        with self._condition:
+            if self._registrations.get(registration_id) is not None:
+                self._subscription_ids[registration_id] = subscription_id
+                self._subscriptions.upsert(
+                    subscription_id,
+                    registration_id,
+                    accepted,
+                )
+                logger.info(
+                    "ML Model Monitor subscription active subscription_id=%s "
+                    "registration_id=%s",
+                    subscription_id,
+                    registration_id,
+                )
+                return
+        self._delete_remote(subscription_id)
+
+    def _delete(self, registration_id: str) -> None:
+        with self._condition:
+            subscription_id = self._subscription_ids.get(registration_id, "")
+        if not subscription_id:
+            return
+        self._delete_remote(subscription_id)
+        self._subscriptions.delete(subscription_id)
+        with self._condition:
+            self._subscription_ids.pop(registration_id, None)
+        logger.info(
+            "ML Model Monitor subscription removed subscription_id=%s "
+            "registration_id=%s",
+            subscription_id,
+            registration_id,
+        )
+
+    def _delete_orphan(self, subscription_id: str) -> None:
+        self._delete_remote(subscription_id)
+        self._subscriptions.delete(subscription_id)
+        with self._condition:
+            self._orphan_subscription_ids.discard(subscription_id)
+        logger.info(
+            "Orphan ML Model Monitor subscription removed subscription_id=%s",
+            subscription_id,
+        )
+
+    def _delete_remote(self, subscription_id: str) -> None:
+        response = self._request(
+            "DELETE",
+            f"/internal/v1/ml-model-monitor/subscriptions/{subscription_id}",
+        )
+        if response.status_code not in {204, 404}:
+            raise RuntimeError(
+                f"monitor subscription delete returned status {response.status_code}"
+            )
+
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        projection = self._projection.snapshot()
+        if projection is None:
+            raise RuntimeError("containing NWDAF is not synchronized")
+        base_uri = projection.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        return self._session.request(
+            method,
+            base_uri + path,
+            timeout=self._settings.request_timeout_seconds,
+            follow_redirects=False,
+            **kwargs,
+        )
+
+    def _subscription_for(
+        self,
+        resource: MonitorRegistrationResource,
+    ) -> MLModelMonitorSubscription:
+        registration = resource.representation
+        return MLModelMonitorSubscription(
+            modelIds=[registration.model_id],
+            notificationUri=self._settings.callback_uri,
+            notifCorrId=str(uuid4()),
+            modelMetric="ACCURACY",
+            eventReportReq=MonitorReportingRequirement(
+                notifMethod="PERIODIC",
+                repPeriod=self._settings.report_period_seconds,
+            ),
+            mLEvent=registration.ml_event,
+            mLEventFilter=registration.ml_event_filter,
+            tgtUe=registration.target_ue,
+        )
+
+    @staticmethod
+    def _same_scope(
+        left: MLModelMonitorSubscription,
+        right: MLModelMonitorSubscription,
+    ) -> bool:
+        fields = ("model_ids", "ml_event", "ml_event_filter", "target_ue")
+        return all(
+            json.dumps(
+                getattr(left, field),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            == json.dumps(
+                getattr(right, field),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for field in fields
+        )

@@ -123,6 +123,21 @@ class ArtifactRepository:
                 artifacts.append(self.metadata(path.name))
         return artifacts
 
+    def manifest(self, key: str) -> dict[str, object]:
+        metadata = self.metadata(key)
+        try:
+            with tarfile.open(metadata.path, "r:gz") as archive:
+                member = archive.getmember("config.json")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise InvalidArtifactError("artifact config.json cannot be read")
+                value = json.loads(stream.read(self._settings.max_single_file_bytes + 1))
+        except (KeyError, tarfile.TarError, OSError, json.JSONDecodeError) as exc:
+            raise InvalidArtifactError("artifact manifest cannot be read") from exc
+        if not isinstance(value, dict):
+            raise InvalidArtifactError("artifact manifest must contain an object")
+        return value
+
     def protected_delete(self, key: str, protected_keys: set[str]) -> bool:
         self._validate_key(key)
         if key in protected_keys:

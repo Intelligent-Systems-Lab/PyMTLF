@@ -1,40 +1,139 @@
-# Internal API
+# PyMTLF HTTP API
 
-PyMTLF uses `/internal/v1` for private APIs. This API is not a 3GPP SBI.
+PyMTLF is the private MTLF backend of a containing Go NWDAF. It is not an
+independently registered 3GPP NF. Go owns public
+`Nnwdaf_MLModelProvision`/`Nnwdaf_MLModelMonitor` SBI exposure and routes the
+same Release 18-shaped representations to the backend.
 
-The current foundation registers:
+The implementation is authoritative:
 
-- `GET /health/live`
-- `GET /health/ready`
-- `GET /internal/v1/artifacts/{sha256}`
-- `POST /internal/v1/sync`
+- routes: `src/py_mtlf/api/`
+- wire models: `src/py_mtlf/wire/`
+- application wiring: `src/py_mtlf/app.py`
+- provision and monitor state: `src/py_mtlf/core/`
 
-Accuracy reports, datasets, model-ready events, model apply results, and the
-active-state query remain semantic inventory in the transition plan. Their
-runtime models and routes are added only in the phase that activates each
-operation.
+FastAPI exposes `/docs`, `/redoc`, and `/openapi.json` while running.
 
-Private errors use this shape:
+## Endpoint Summary
 
-```json
-{
-  "code": "ARTIFACT_NOT_FOUND",
-  "message": "artifact was not found",
-  "retryable": false,
-  "correlation_id": "request-or-resource-id"
-}
-```
+| Caller | Method and path | Purpose | Success |
+| --- | --- | --- | --- |
+| Go or operator | `GET /health/live` | Process liveness | `200` |
+| Go | `GET /health/ready` | Artifact readiness and process identity | `200` or `503` |
+| Go | `POST /internal/v1/sync` | Replace the recoverable containing-NWDAF snapshot | `200` |
+| PyAnLF through Go | `POST /internal/v1/ml-model-provision/subscriptions` | Create a provision resource | `201` |
+| PyAnLF through Go | `PUT /internal/v1/ml-model-provision/subscriptions/{id}` | Replace a provision resource | `200` |
+| PyAnLF through Go | `DELETE /internal/v1/ml-model-provision/subscriptions/{id}` | Delete a provision resource | `204` |
+| PyAnLF through Go | `POST /internal/v1/ml-model-monitor/registrations` | Register one READY model-use scope | `201` |
+| PyAnLF through Go | `DELETE /internal/v1/ml-model-monitor/registrations/{id}` | Deregister a model-use scope | `204` |
+| Go | `POST /internal/v1/ml-model-monitor/notifications` | Deliver a correlated accuracy notification | `204` |
+| PyAnLF | `GET /internal/v1/artifacts/{sha256}` | Download an immutable model bundle | `200` |
 
-Artifact GET responses include exact `Content-Length`, `application/gzip`, a
-strong SHA-256 ETag, `X-Artifact-SHA256`, and immutable cache semantics. Artifact
-keys are lowercase 64-character SHA-256 values; there is no mutable `latest`
-alias or directory listing.
+JSON Model Provision and Monitor errors use `application/problem+json`.
+Malformed standard-shaped bodies return `400`; unknown resources or
+correlations return `404`. Resource creation returns an owner-generated UUID
+in `Location`.
 
-The default deployment binds to loopback and does not provide application-level
-authentication or TLS. Non-loopback deployment requires a separate trust and
-network-policy decision.
+## Health And Sync
 
-The sync request carries the containing NWDAF identity and typed data-source
-availability. It does not expose MongoDB credentials, raw data, model artifacts,
-or ADRF fetch instructions. Source preference and effective selection remain
-empty until the retrieval phase activates that policy.
+`GET /health/ready` returns the current `processInstanceId` and artifact
+status. A configured seed catalog is validated during startup. A missing
+artifact, invalid archive, or manifest identity mismatch prevents readiness
+instead of producing a fake model URL.
+
+`POST /internal/v1/sync` carries:
+
+- containing NWDAF identity and Go internal callback base URI
+- data-source availability and source selection
+- Model Provision subscription snapshots
+- Model Monitor registration snapshots
+- MTLF-destined Model Monitor subscription projections, including the private
+  `ownerRegistrationId` needed to distinguish an active resource from an
+  orphan after process restart
+
+Sync does not carry MongoDB credentials, raw observations, model bytes, ADRF
+fetch instructions, or accuracy-policy baseline state. Provision and monitor
+control intent is restored; the volatile WAPE baseline intentionally restarts
+empty.
+
+## Initial Model Provision
+
+The request and accepted representation use the Release 18
+`NwdafMLModelProvSubsc` shape. PyMTLF resolves each `mLEventSubscs` entry
+against its configured seed catalog.
+
+When `eventReq.immRep` is true and a compatible seed exists, the `201` or `200`
+representation includes `mLEventNotifs` with:
+
+- the requested event and notification correlation
+- `modelUniqueId`
+- the seed's applicability filter and target, when configured
+- `mLFileAddr.mLModelUrl` pointing to the immutable artifact endpoint
+
+If one generic seed covers multiple active-demand entries, PyMTLF reports that
+model once rather than duplicating the same model notification for every
+covered entry.
+
+Without immediate reporting, the accepted resource is returned first and a
+standard `NwdafMLModelProvNotif` is delivered asynchronously through Go to the
+original notification destination. A no-match request remains a valid
+subscription but does not invent an address or start training.
+
+Artifact responses use `application/gzip`, exact `Content-Length`, a strong
+SHA-256 ETag, `X-Artifact-SHA256`, `nosniff`, and immutable cache semantics.
+There is no mutable `latest` alias or directory listing.
+
+## ML Model Monitoring
+
+PyMTLF owns Model Monitor registrations. Each local registration represents a
+READY AnLF model-use scope. A reconciliation worker creates one corresponding
+standard `MLModelMonitorSub` through Go; Go routes it to PyAnLF. Registration
+create/delete is not blocked on that downstream resource operation, and
+transport failures retry with bounded backoff.
+
+Incoming `MLModelMonitorNotify` is located by `notifCorrId`. A valid
+notification must contain at least one `modelAccuInfos` or `anaFeedbacks`
+entry. The current policy consumes `modelAccuInfos[].deviation` as a WAPE error
+ratio:
+
+- missing `deviation` is a liveness report and does not update the baseline
+- only the degradation path is active
+- reference samples, population standard deviation with `min_std`, the fixed
+  WAPE floor, strict z-score comparison, and N-in-M decisions are configured
+  under `accuracy_policy`
+- each canonical event/filter/target/consumer scope has independent state
+- any degraded scope claims one model-level in-flight retrain intent and
+  records all active scopes
+
+This phase creates only the retrain intent seam. Dataset retrieval, local
+training, new artifact publication, generation advancement, and updated-model
+reprovision are not active yet.
+
+## Outbound Dependency
+
+PyMTLF calls only the containing Go NWDAF for monitor-subscription resources:
+
+| Purpose | Method and Go path | Required success |
+| --- | --- | --- |
+| Create monitor subscription | `POST /internal/v1/ml-model-monitor/subscriptions` | `201`, `Location`, JSON |
+| Delete monitor subscription | `DELETE /internal/v1/ml-model-monitor/subscriptions/{id}` | `204`; `404` is terminal cleanup |
+
+Create also sends the private
+`X-NWDAF-Monitor-Registration-Id` header. The request body remains the
+Release 18 `MLModelMonitorSub` representation; Go stores the header only in
+its process-local sync mirror. On restart, PyMTLF accepts a restored
+subscription as active only when this owner identity still exists and its
+standard scope still matches. Otherwise the resource is isolated as an
+orphan and deleted through the same Go path before it can update policy.
+
+The callback URI in the standard subscription points back to
+`/internal/v1/ml-model-monitor/notifications`. Go replaces it with its own
+internal callback while routing, then restores the PyMTLF URI in the accepted
+representation. PyMTLF never calls PyAnLF directly.
+
+## Deployment Boundary
+
+The default listener is `127.0.0.1:9092` over ordinary HTTP. TLS, OAuth
+delegation, independent NRF registration, and cross-Go-restart persistence are
+outside the current deployment. Runtime artifacts live below `data/`, which is
+excluded from git.

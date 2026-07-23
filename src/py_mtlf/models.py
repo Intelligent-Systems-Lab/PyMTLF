@@ -3,6 +3,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from py_mtlf.wire.ml_model import MLModelProvisionSnapshot
+from py_mtlf.wire.ml_model_monitor import (
+    MLModelMonitorRegistrationSnapshot,
+    MLModelMonitorSubscriptionSnapshot,
+)
+
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -109,6 +115,18 @@ class BackendSyncRequest(DomainModel):
     smf_resources: list[SmfResourceSnapshot] = Field(alias="smfResources")
     data_source_availability: DataSourceAvailability = Field(alias="dataSourceAvailability")
     mtlf_source_selection: DataSourceSelection = Field(alias="mtlfSourceSelection")
+    ml_model_provision_subscriptions: list[MLModelProvisionSnapshot] = Field(
+        default_factory=list,
+        alias="mlModelProvisionSubscriptions",
+    )
+    ml_model_monitor_registrations: list[MLModelMonitorRegistrationSnapshot] = Field(
+        default_factory=list,
+        alias="mlModelMonitorRegistrations",
+    )
+    ml_model_monitor_subscriptions: list[MLModelMonitorSubscriptionSnapshot] = Field(
+        default_factory=list,
+        alias="mlModelMonitorSubscriptions",
+    )
 
 
 class BackendSyncResponse(DomainModel):
