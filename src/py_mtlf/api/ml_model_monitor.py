@@ -105,4 +105,6 @@ def receive_monitor_notification(
             [decision.evaluated for decision in decisions],
             [decision.triggered for decision in decisions],
         )
+    if any(decision.triggered for decision in decisions):
+        request.app.state.dataset_coordinator.accept_policy_intents()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

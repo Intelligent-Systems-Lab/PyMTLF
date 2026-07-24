@@ -2,15 +2,15 @@
 
 PyMTLF is the private MTLF backend used by the local NWDAF implementation. It is
 not a standalone 3GPP network function. NWDAF Go owns standard SBI routing and
-the standard ADRF subscription and callback procedures. PyMTLF will consume
-ADRF fetch instructions and retrieve the referenced data directly in a later
-phase.
+the standard ADRF subscription and callback procedures. PyMTLF consumes ADRF
+fetch instructions and retrieves the referenced records directly.
 
 The current runtime provides the service lifecycle, health and sync endpoints,
 an immutable model artifact repository, a configured seed-model catalog,
 standard-shaped Model Provision and ML Model Monitor resources, and a
-degradation-only WAPE policy. Direct training-data retrieval, local training,
-new model generation, and retrained-model reprovision remain deferred.
+degradation-only WAPE policy, scope-aware historical dataset retrieval, and
+read-only MongoDB fallback access. Local training, new model generation, and
+retrained-model reprovision remain deferred.
 
 Before using the sample configuration, import the initial seed bundle:
 

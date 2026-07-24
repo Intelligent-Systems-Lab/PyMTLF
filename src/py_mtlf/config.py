@@ -177,6 +177,55 @@ class AccuracyPolicySettings(FrozenSettings):
         return self
 
 
+class AdrfSettings(FrozenSettings):
+    mode: str = "nrf"
+    configured_endpoint: str = ""
+    discovery_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    request_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    retry_initial_backoff_seconds: float = Field(default=2, ge=0, le=60)
+    retry_max_backoff_seconds: float = Field(default=30, gt=0, le=600)
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "AdrfSettings":
+        mode = self.mode.strip().lower()
+        object.__setattr__(self, "mode", mode)
+        if mode not in {"nrf", "configured"}:
+            raise ValueError("adrf.mode must be 'nrf' or 'configured'")
+        if mode == "configured":
+            object.__setattr__(
+                self,
+                "configured_endpoint",
+                _validate_http_base_url(
+                    self.configured_endpoint,
+                    "adrf.configured_endpoint",
+                ),
+            )
+        if self.retry_initial_backoff_seconds > self.retry_max_backoff_seconds:
+            raise ValueError("ADRF initial retry backoff must not exceed maximum")
+        return self
+
+
+class MongoDatasetSettings(FrozenSettings):
+    url: str = "mongodb://127.0.0.1:27017"
+    database: str = "free5gc"
+    collection: str = "nwdaf_raw_notifications"
+    connect_timeout_ms: int = Field(default=5000, gt=0)
+    read_timeout_ms: int = Field(default=30000, gt=0)
+
+
+class DatasetSettings(FrozenSettings):
+    retrieval_window_seconds: int = Field(default=1800, gt=0)
+    watchdog_timeout_seconds: int = Field(default=120, gt=0)
+    fetch_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    max_redirects: int = Field(default=3, ge=0, le=10)
+    max_retry_attempts: int = Field(default=3, ge=1, le=10)
+    retry_initial_backoff_seconds: float = Field(default=1, ge=0, le=60)
+    retry_max_backoff_seconds: float = Field(default=30, gt=0, le=600)
+    max_concurrent_jobs: int = Field(default=2, gt=0, le=32)
+    max_records_per_job: int = Field(default=100000, gt=0)
+    mongodb: MongoDatasetSettings = MongoDatasetSettings()
+
+
 class LogSettings(FrozenSettings):
     level: str = "INFO"
 
@@ -196,6 +245,8 @@ class Settings(FrozenSettings):
     model_provision: ModelProvisionSettings = ModelProvisionSettings()
     model_monitor: ModelMonitorSettings = ModelMonitorSettings()
     accuracy_policy: AccuracyPolicySettings = AccuracyPolicySettings()
+    adrf: AdrfSettings = AdrfSettings()
+    dataset: DatasetSettings = DatasetSettings()
     notification: NotificationSettings = NotificationSettings()
     log: LogSettings = LogSettings()
 

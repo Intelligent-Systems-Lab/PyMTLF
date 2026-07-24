@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -93,18 +94,7 @@ class SmfResourceSnapshot(DomainModel):
     target_api_root: str = Field(min_length=1, alias="targetApiRoot")
     nwdaf_subscription_ids: list[str] = Field(alias="nwdafSubscriptionIds")
     pending_cleanup: bool = Field(alias="pendingCleanup")
-
-
-class DataSourceAvailability(DomainModel):
-    adrf: bool
-    mongodb: bool
-
-
-class DataSourceSelection(DomainModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
-
-    preferred_source: str = Field(default="", alias="preferredSource")
-    effective_source: str = Field(default="", alias="effectiveSource")
+    subscription: dict[str, Any] | None = None
 
 
 class BackendSyncRequest(DomainModel):
@@ -113,8 +103,10 @@ class BackendSyncRequest(DomainModel):
     containing_nwdaf: NwdafIdentity = Field(alias="containingNwdaf")
     events_subscriptions: list[EventsSubscriptionSnapshot] = Field(alias="eventsSubscriptions")
     smf_resources: list[SmfResourceSnapshot] = Field(alias="smfResources")
-    data_source_availability: DataSourceAvailability = Field(alias="dataSourceAvailability")
-    mtlf_source_selection: DataSourceSelection = Field(alias="mtlfSourceSelection")
+    training_data_source: Literal["adrf", "mongodb", "unavailable"] = Field(
+        default="unavailable",
+        alias="trainingDataSource",
+    )
     ml_model_provision_subscriptions: list[MLModelProvisionSnapshot] = Field(
         default_factory=list,
         alias="mlModelProvisionSubscriptions",
@@ -134,5 +126,3 @@ class BackendSyncResponse(DomainModel):
 
     process_instance_id: str = Field(alias="processInstanceId")
     snapshot_accepted: bool = Field(alias="snapshotAccepted")
-    mongodb_available: bool = Field(alias="mongodbAvailable")
-    source_selection: DataSourceSelection = Field(alias="sourceSelection")

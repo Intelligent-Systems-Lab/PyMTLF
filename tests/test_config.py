@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from py_mtlf.config import (
+    AdrfSettings,
     ArtifactSettings,
     ModelProvisionSettings,
     SeedModelSettings,
@@ -80,3 +81,27 @@ def test_seed_model_ids_and_artifact_keys_are_unique():
 def test_removed_state_machine_config_is_rejected(payload):
     with pytest.raises(ValidationError):
         Settings.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "other"},
+        {"mode": "configured", "configured_endpoint": ""},
+        {"mode": "configured", "configured_endpoint": "http://example.com/path"},
+        {"mode": "configured", "configured_endpoint": "http://example.com:invalid"},
+        {"retry_initial_backoff_seconds": 3, "retry_max_backoff_seconds": 2},
+    ],
+)
+def test_adrf_settings_reject_invalid_mode_endpoint_and_backoff(payload):
+    with pytest.raises(ValidationError):
+        AdrfSettings.model_validate(payload)
+
+
+def test_adrf_configured_endpoint_is_normalized():
+    settings = AdrfSettings(
+        mode="configured",
+        configured_endpoint="http://adrf.example:9888/",
+    )
+
+    assert settings.configured_endpoint == "http://adrf.example:9888"

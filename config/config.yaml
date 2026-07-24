@@ -37,5 +37,28 @@ accuracy_policy:
   decision_window_size: 5
   required_hits: 3
   scope_state_ttl_seconds: 600
+adrf:
+  mode: "nrf"
+  configured_endpoint: ""
+  discovery_timeout_seconds: 30
+  request_timeout_seconds: 120
+  retry_initial_backoff_seconds: 2
+  retry_max_backoff_seconds: 30
+dataset:
+  retrieval_window_seconds: 1800
+  watchdog_timeout_seconds: 120
+  fetch_timeout_seconds: 120
+  max_redirects: 3
+  max_retry_attempts: 3
+  retry_initial_backoff_seconds: 1
+  retry_max_backoff_seconds: 30
+  max_concurrent_jobs: 2
+  max_records_per_job: 100000
+  mongodb:
+    url: "mongodb://127.0.0.1:27017"
+    database: "free5gc"
+    collection: "nwdaf_raw_notifications"
+    connect_timeout_ms: 5000
+    read_timeout_ms: 30000
 log:
   level: "INFO"

@@ -8,10 +8,12 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from py_mtlf.api import artifacts, health, ml_model_monitor, ml_model_provision, sync
+from py_mtlf.api import adrf, artifacts, health, ml_model_monitor, ml_model_provision, sync
 from py_mtlf.config import Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
+from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
+from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.monitor_reconciler import MonitorSubscriptionReconciler
 from py_mtlf.core.monitor_store import (
     MonitorRegistrationStore,
@@ -67,6 +69,13 @@ def create_app(
         settings.accuracy_policy,
         settings.model_provision.provider_namespace,
     )
+    adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
+    dataset_coordinator = DatasetCoordinator(
+        settings.dataset,
+        sync_projection,
+        accuracy_policy,
+        adrf_resolver,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -82,6 +91,7 @@ def create_app(
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
+            dataset_coordinator.shutdown()
             monitor_reconciler.shutdown()
             provision_notifications.shutdown()
             runtime.accepting_requests = False
@@ -100,18 +110,25 @@ def create_app(
     app.state.monitor_subscriptions = monitor_subscriptions
     app.state.monitor_reconciler = monitor_reconciler
     app.state.accuracy_policy = accuracy_policy
+    app.state.dataset_coordinator = dataset_coordinator
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
     app.include_router(ml_model_provision.router)
     app.include_router(ml_model_monitor.router)
     app.include_router(sync.router)
+    app.include_router(adrf.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        if request.url.path.startswith("/internal/v1/ml-model-"):
+        if request.url.path.startswith(
+            (
+                "/internal/v1/ml-model-",
+                "/internal/v1/adrf-data-management/",
+            )
+        ):
             from py_mtlf.api.problems import problem_response
 
             return problem_response(

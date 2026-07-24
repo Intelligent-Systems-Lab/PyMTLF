@@ -33,7 +33,19 @@ class RetrainIntent:
     model_key: ModelKey
     triggering_scope_key: str
     active_scope_keys: tuple[str, ...]
+    triggering_scope: "ScopeReference"
+    active_scopes: tuple["ScopeReference", ...]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class ScopeReference:
+    scope_key: str
+    consumer_id: str
+    model_ids: tuple[int, ...]
+    ml_event: str
+    ml_event_filter: dict
+    target_ue: dict | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,7 @@ class AccuracyPolicy:
         self._clock = clock
         self._lock = threading.RLock()
         self._scopes: dict[tuple[ModelKey, str], ScopePolicyState] = {}
+        self._scope_references: dict[tuple[ModelKey, str], ScopeReference] = {}
         self._in_flight: set[ModelKey] = set()
         self._generation: dict[ModelKey, int] = {}
         self._intents: list[RetrainIntent] = []
@@ -77,6 +90,16 @@ class AccuracyPolicy:
             for info in notification.model_accuracy_info:
                 model_key = (self._provider_namespace, info.model_id)
                 scope_key = self.scope_key(subscription, registration)
+                self._scope_references[(model_key, scope_key)] = ScopeReference(
+                    scope_key=scope_key,
+                    consumer_id=registration.consumer_id if registration else "",
+                    model_ids=tuple(subscription.model_ids),
+                    ml_event=subscription.ml_event,
+                    ml_event_filter=dict(subscription.ml_event_filter or {}),
+                    target_ue=(
+                        dict(subscription.target_ue) if subscription.target_ue is not None else None
+                    ),
+                )
                 if info.deviation is None:
                     self._liveness_reports += 1
                     decisions.append(PolicyDecision(evaluated=False))
@@ -115,11 +138,7 @@ class AccuracyPolicy:
         baseline_ready = len(state.reference) >= self._settings.min_reference_samples
         mean = fmean(state.reference) if state.reference else 0.0
         std = pstdev(state.reference) if state.reference else 0.0
-        z_score = (
-            (deviation - mean) / max(std, self._settings.min_std)
-            if state.reference
-            else 0.0
-        )
+        z_score = (deviation - mean) / max(std, self._settings.min_std) if state.reference else 0.0
         signal = bool(state.reference) and z_score > self._settings.z_score_threshold
         eligible = deviation > self._settings.fixed_floor
         hit = baseline_ready and eligible and signal
@@ -139,9 +158,7 @@ class AccuracyPolicy:
         if triggered:
             active_scope_keys = tuple(
                 sorted(
-                    key
-                    for (candidate_model, key) in self._scopes
-                    if candidate_model == model_key
+                    key for (candidate_model, key) in self._scopes if candidate_model == model_key
                 )
             )
             for (candidate_model, _key), candidate in self._scopes.items():
@@ -153,6 +170,10 @@ class AccuracyPolicy:
                     model_key=model_key,
                     triggering_scope_key=scope_key,
                     active_scope_keys=active_scope_keys,
+                    triggering_scope=self._scope_references[(model_key, scope_key)],
+                    active_scopes=tuple(
+                        self._scope_references[(model_key, key)] for key in active_scope_keys
+                    ),
                     created_at=now,
                 )
             )
@@ -176,14 +197,19 @@ class AccuracyPolicy:
                 return
             self._generation[model_key] = generation
             self._in_flight.discard(model_key)
-            for key in [
-                key for key in self._scopes if key[0] == model_key
-            ]:
+            for key in [key for key in self._scopes if key[0] == model_key]:
                 self._scopes.pop(key, None)
+                self._scope_references.pop(key, None)
 
     def intents(self) -> tuple[RetrainIntent, ...]:
         with self._lock:
             return tuple(self._intents)
+
+    def take_intents(self) -> tuple[RetrainIntent, ...]:
+        with self._lock:
+            intents = tuple(self._intents)
+            self._intents.clear()
+            return intents
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -202,6 +228,7 @@ class AccuracyPolicy:
             if state.last_update < cutoff and key[0] not in self._in_flight
         ]:
             self._scopes.pop(key, None)
+            self._scope_references.pop(key, None)
 
     @staticmethod
     def scope_key(

@@ -16,8 +16,7 @@ def test_sync_replaces_go_owned_projection(settings):
         },
         "eventsSubscriptions": [],
         "smfResources": [],
-        "dataSourceAvailability": {"adrf": True, "mongodb": False},
-        "mtlfSourceSelection": {"preferredSource": "", "effectiveSource": ""},
+        "trainingDataSource": "adrf",
     }
     app = create_app(settings)
     with TestClient(app) as client:
@@ -25,14 +24,11 @@ def test_sync_replaces_go_owned_projection(settings):
 
     assert response.status_code == 200
     assert response.json()["snapshotAccepted"] is True
-    assert response.json()["sourceSelection"] == {
-        "preferredSource": "",
-        "effectiveSource": "",
-    }
+    assert "trainingDataSource" not in response.json()
     UUID(response.json()["processInstanceId"])
     snapshot = app.state.sync_projection.snapshot()
     assert snapshot is not None
-    assert snapshot.data_source_availability.adrf is True
+    assert snapshot.training_data_source == "adrf"
 
 
 def test_sync_restores_provision_resources_and_reconciles_seed(
@@ -64,8 +60,7 @@ def test_sync_restores_provision_resources_and_reconciles_seed(
         },
         "eventsSubscriptions": [],
         "smfResources": [],
-        "dataSourceAvailability": {"adrf": True, "mongodb": False},
-        "mtlfSourceSelection": {"preferredSource": "", "effectiveSource": ""},
+        "trainingDataSource": "adrf",
         "mlModelProvisionSubscriptions": [
             {
                 "subscriptionId": "11111111-1111-4111-8111-111111111111",
@@ -106,8 +101,7 @@ def test_sync_rejects_duplicate_monitor_identity_without_partial_commit(settings
         },
         "eventsSubscriptions": [],
         "smfResources": [],
-        "dataSourceAvailability": {"adrf": True, "mongodb": False},
-        "mtlfSourceSelection": {"preferredSource": "", "effectiveSource": ""},
+        "trainingDataSource": "adrf",
     }
     app = create_app(settings)
     with TestClient(app) as client:

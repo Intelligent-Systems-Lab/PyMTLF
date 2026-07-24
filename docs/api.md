@@ -27,6 +27,7 @@ FastAPI exposes `/docs`, `/redoc`, and `/openapi.json` while running.
 | PyAnLF through Go | `POST /internal/v1/ml-model-monitor/registrations` | Register one READY model-use scope | `201` |
 | PyAnLF through Go | `DELETE /internal/v1/ml-model-monitor/registrations/{id}` | Deregister a model-use scope | `204` |
 | Go | `POST /internal/v1/ml-model-monitor/notifications` | Deliver a correlated accuracy notification | `204` |
+| Go | `POST /internal/v1/adrf-data-management/retrieval-notifications` | Deliver a complete ADRF retrieval notification | `204` |
 | PyAnLF | `GET /internal/v1/artifacts/{sha256}` | Download an immutable model bundle | `200` |
 
 JSON Model Provision and Monitor errors use `application/problem+json`.
@@ -44,15 +45,16 @@ instead of producing a fake model URL.
 `POST /internal/v1/sync` carries:
 
 - containing NWDAF identity and Go internal callback base URI
-- data-source availability and source selection
+- accepted Events Subscription and SMF collection-resource snapshots
+- current `trainingDataSource` (`adrf`, `mongodb`, or `unavailable`)
 - Model Provision subscription snapshots
 - Model Monitor registration snapshots
 - MTLF-destined Model Monitor subscription projections, including the private
   `ownerRegistrationId` needed to distinguish an active resource from an
   orphan after process restart
 
-Sync does not carry MongoDB credentials, raw observations, model bytes, ADRF
-fetch instructions, or accuracy-policy baseline state. Provision and monitor
+Sync does not carry MongoDB credentials, ADRF endpoints, raw observations,
+model bytes, fetch instructions, or accuracy-policy baseline state. Provision and monitor
 control intent is restored; the volatile WAPE baseline intentionally restarts
 empty.
 
@@ -105,18 +107,48 @@ ratio:
 - any degraded scope claims one model-level in-flight retrain intent and
   records all active scopes
 
-This phase creates only the retrain intent seam. Dataset retrieval, local
-training, new artifact publication, generation advancement, and updated-model
-reprovision are not active yet.
+One model-level retrain intent snapshots the triggering scope and every active
+scope for that model. The dataset coordinator resolves those scopes through
+the synced Events and SMF resources, fixes one historical time window, and
+uses the synced source without cross-source fallback. Every required scope
+must contain at least one valid UPF record before a `READY` snapshot is
+published. `READY` keeps the model retrain-in-flight until the local-training
+workflow consumes it. Local training, artifact publication, generation
+advancement, and updated-model reprovision are not active yet.
+
+## Historical Dataset Retrieval
+
+In ADRF mode, PyMTLF independently resolves `nadrf-datamanagement` through the
+containing Go NWDAF's generic NRF proxy or uses `adrf.configured_endpoint`.
+For each accepted SMF collection resource it creates a Release 18-shaped
+retrieval subscription through Go, accepts complete callbacks on the endpoint
+listed above, and directly issues
+`GET /nadrf-datamanagement/v1/data-store-records?fetch-correlation-ids=...`.
+Go never receives dataset bytes. The workspace ADRF V0 terminal callback with
+an empty ID list is accepted only when `terminationReq=true`; it produces a
+zero-data result and does not relax the required-scope completeness rule.
+
+The pinned workspace free5GC NRF accepts ADRF registration but its older NF
+Discovery schema rejects `target-nf-type=ADRF`. Use configured mode with that
+build. NRF mode remains available for Release 18-compatible NRF
+implementations and does not silently fall back to NF Management listing.
+
+In MongoDB mode, PyMTLF opens the configured collection read-only and queries
+distinct accepted SUPIs with the same inclusive time window. Only documents
+with a non-empty standard `dataNotif.upfEventNotifs` alternative qualify.
+PyMTLF does not create indexes, write records, query legacy correlation IDs,
+or merge data from ADRF.
 
 ## Outbound Dependency
 
-PyMTLF calls only the containing Go NWDAF for monitor-subscription resources:
+PyMTLF calls the containing Go NWDAF for monitor and ADRF control resources:
 
 | Purpose | Method and Go path | Required success |
 | --- | --- | --- |
 | Create monitor subscription | `POST /internal/v1/ml-model-monitor/subscriptions` | `201`, `Location`, JSON |
 | Delete monitor subscription | `DELETE /internal/v1/ml-model-monitor/subscriptions/{id}` | `204`; `404` is terminal cleanup |
+| Create ADRF retrieval subscription | `POST /internal/v1/adrf-data-management/data-retrieval-subscriptions` | `201`, `Location`, JSON |
+| Delete ADRF retrieval subscription | `DELETE /internal/v1/adrf-data-management/data-retrieval-subscriptions/{id}` | `204`; peer `404` is terminal cleanup |
 
 Create also sends the private
 `X-NWDAF-Monitor-Registration-Id` header. The request body remains the
