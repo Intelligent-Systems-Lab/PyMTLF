@@ -12,7 +12,7 @@ def test_sync_replaces_go_owned_projection(settings):
         "containingNwdaf": {
             "nfInstanceId": "nwdaf-1",
             "apiBaseUri": "http://127.0.0.1:8080",
-            "internalCallbackBaseUri": "http://127.0.0.1:8090",
+            "internalCallbackBaseUri": "http://127.0.0.1:8091",
         },
         "eventsSubscriptions": [],
         "smfResources": [],
@@ -57,7 +57,7 @@ def test_sync_restores_provision_resources_and_reconciles_seed(
         "containingNwdaf": {
             "nfInstanceId": "nwdaf-1",
             "apiBaseUri": "http://127.0.0.1:8080",
-            "internalCallbackBaseUri": "http://127.0.0.1:8090",
+            "internalCallbackBaseUri": "http://127.0.0.1:8091",
         },
         "eventsSubscriptions": [],
         "smfResources": [],
@@ -98,7 +98,7 @@ def test_sync_rejects_duplicate_monitor_identity_without_partial_commit(settings
         "containingNwdaf": {
             "nfInstanceId": "nwdaf-1",
             "apiBaseUri": "http://127.0.0.1:8080",
-            "internalCallbackBaseUri": "http://127.0.0.1:8090",
+            "internalCallbackBaseUri": "http://127.0.0.1:8091",
         },
         "eventsSubscriptions": [],
         "smfResources": [],

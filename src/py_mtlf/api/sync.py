@@ -1,8 +1,11 @@
+import logging
+
 from fastapi import APIRouter, HTTPException, Request, status
 
 from py_mtlf.models import BackendSyncRequest, BackendSyncResponse
 
 router = APIRouter(prefix="/internal/v1", tags=["sync"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("/sync", response_model=BackendSyncResponse)
@@ -57,6 +60,10 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
     for resource in restored:
         request.app.state.provision_notifications.enqueue(resource)
     request.app.state.monitor_reconciler.finalize_restore()
+    logger.info(
+        "Backend snapshot accepted training_data_source=%s",
+        payload.training_data_source,
+    )
     return BackendSyncResponse(
         processInstanceId=request.app.state.runtime.process_instance_id,
         snapshotAccepted=True,
