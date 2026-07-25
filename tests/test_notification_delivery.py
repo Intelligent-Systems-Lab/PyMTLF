@@ -13,7 +13,10 @@ from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.seed_catalog import ModelCatalog
-from py_mtlf.wire.ml_model import MLModelProvisionSubscription
+from py_mtlf.wire.ml_model import (
+    MLModelProvisionSnapshot,
+    MLModelProvisionSubscription,
+)
 
 
 def wait_until(predicate, timeout: float = 2) -> None:
@@ -197,3 +200,68 @@ def test_deleted_resource_cancels_retry(
 
     assert calls == 1
     assert dispatcher.delivered_version(resource.subscription_id) is None
+
+
+def test_repeated_sync_does_not_redeliver_unchanged_model(
+    settings,
+    bundle_path,
+    monkeypatch,
+):
+    _repository, _seed, catalog, store, resource = seeded_state(
+        settings,
+        bundle_path,
+    )
+    requests: list[list[dict]] = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, _uri, *, json):
+            requests.append(json)
+            return httpx.Response(204)
+
+    monkeypatch.setattr(
+        "py_mtlf.core.notification_delivery.httpx.Client",
+        FakeClient,
+    )
+    dispatcher = ProvisionNotificationDispatcher(
+        NotificationSettings(),
+        store,
+        catalog,
+    )
+    dispatcher.open()
+    dispatcher.enqueue(resource)
+    wait_until(lambda: len(requests) == 1)
+
+    snapshot = MLModelProvisionSnapshot(
+        subscriptionId=resource.subscription_id,
+        representation=resource.representation,
+        initiator="ANLF_BACKEND",
+        destination="MTLF_BACKEND",
+    )
+    unchanged = store.commit_from_sync(store.prepare_from_sync([snapshot]))[0]
+    assert unchanged.revision == resource.revision
+    dispatcher.enqueue(unchanged)
+    time.sleep(0.05)
+    assert len(requests) == 1
+
+    changed_representation = resource.representation.model_copy(
+        update={"notification_correlation_id": "corr-2"},
+        deep=True,
+    )
+    changed_snapshot = snapshot.model_copy(
+        update={"representation": changed_representation},
+        deep=True,
+    )
+    changed = store.commit_from_sync(store.prepare_from_sync([changed_snapshot]))[0]
+    assert changed.revision == resource.revision + 1
+    dispatcher.enqueue(changed)
+    wait_until(lambda: len(requests) == 2)
+    dispatcher.shutdown()

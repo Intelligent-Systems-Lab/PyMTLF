@@ -75,6 +75,8 @@ class ProvisionNotificationDispatcher:
         with self._condition:
             if self._closed or self._executor is None:
                 return
+            if self._delivered.get(resource.subscription_id) == desired.version:
+                return
             self._desired[resource.subscription_id] = desired
             if resource.subscription_id not in self._active:
                 self._active.add(resource.subscription_id)

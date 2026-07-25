@@ -90,8 +90,27 @@ class ProvisionResourceStore:
         restored: dict[str, ProvisionResource],
     ) -> tuple[ProvisionResource, ...]:
         with self._lock:
-            self._resources = dict(restored)
-            return tuple(self._copy(resource) for resource in restored.values())
+            reconciled: dict[str, ProvisionResource] = {}
+            for subscription_id, resource in restored.items():
+                current = self._resources.get(subscription_id)
+                if (
+                    current is not None
+                    and current.representation == resource.representation
+                    and current.family_keys == resource.family_keys
+                ):
+                    revision = current.revision
+                elif current is not None:
+                    revision = current.revision + 1
+                else:
+                    revision = 1
+                reconciled[subscription_id] = ProvisionResource(
+                    subscription_id=resource.subscription_id,
+                    representation=resource.representation,
+                    family_keys=resource.family_keys,
+                    revision=revision,
+                )
+            self._resources = reconciled
+            return tuple(self._copy(resource) for resource in reconciled.values())
 
     def snapshot(self) -> tuple[ProvisionResource, ...]:
         with self._lock:
