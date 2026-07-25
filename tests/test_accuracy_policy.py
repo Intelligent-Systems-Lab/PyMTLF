@@ -18,9 +18,28 @@ class Clock:
         return self.now
 
 
-def subscription(correlation: str, group: str) -> MLModelMonitorSubscription:
+class CatalogStub:
+    provider_namespace = "local-mtlf"
+
+    def __init__(self) -> None:
+        self.family_key = ("local-mtlf", "ue-communication-default")
+        self.current_version = ("local-mtlf", 1)
+
+    def version_key_for_id(self, model_id):
+        return self.provider_namespace, model_id
+
+    def family_for_version(self, version_key):
+        return self.family_key if version_key[1] in {1, 2} else None
+
+    def current(self, family_key):
+        if family_key != self.family_key:
+            return None
+        return type("Current", (), {"version_key": self.current_version})()
+
+
+def subscription(correlation: str, group: str, model_id: int = 1) -> MLModelMonitorSubscription:
     return MLModelMonitorSubscription(
-        modelIds=[1],
+        modelIds=[model_id],
         notificationUri="http://go.example/notify",
         notifCorrId=correlation,
         modelMetric="ACCURACY",
@@ -30,18 +49,22 @@ def subscription(correlation: str, group: str) -> MLModelMonitorSubscription:
     )
 
 
-def registration(group: str) -> MLModelMonitorRegistration:
+def registration(group: str, model_id: int = 1) -> MLModelMonitorRegistration:
     return MLModelMonitorRegistration(
         consumerId="11111111-1111-4111-8111-111111111111",
-        modelId=1,
+        modelId=model_id,
         mLEvent="UE_COMMUNICATION",
         mLEventFilter={},
         tgtUe={"intGroupIds": [group]},
     )
 
 
-def notification(correlation: str, deviation: float | None) -> MLModelMonitorNotification:
-    info = {"modelId": 1, "inferenceNum": 2}
+def notification(
+    correlation: str,
+    deviation: float | None,
+    model_id: int = 1,
+) -> MLModelMonitorNotification:
+    info = {"modelId": model_id, "inferenceNum": 2}
     if deviation is not None:
         info["deviation"] = deviation
         info["modelMetric"] = "ACCURACY"
@@ -72,7 +95,7 @@ def seed(policy, sub, reg) -> None:
 
 
 def test_degradation_only_policy_uses_reference_and_n_in_m_window():
-    policy = AccuracyPolicy(settings(), "local-mtlf")
+    policy = AccuracyPolicy(settings(), CatalogStub())
     sub = subscription("corr-a", "group-a")
     reg = registration("group-a")
     seed(policy, sub, reg)
@@ -89,18 +112,18 @@ def test_degradation_only_policy_uses_reference_and_n_in_m_window():
 
 
 def test_missing_deviation_only_updates_liveness():
-    policy = AccuracyPolicy(settings(), "local-mtlf")
+    policy = AccuracyPolicy(settings(), CatalogStub())
     sub = subscription("corr-a", "group-a")
 
     decision = policy.observe(sub, notification("corr-a", None), registration("group-a"))[0]
 
     assert not decision.evaluated
     assert policy.snapshot()["scope_count"] == 0
-    assert policy.snapshot()["liveness_reports"] == 1
+    assert policy.snapshot()["insufficient_reports"] == 1
 
 
 def test_any_scope_triggers_one_model_intent_and_resets_all_windows():
-    policy = AccuracyPolicy(settings(required_hits=1), "local-mtlf")
+    policy = AccuracyPolicy(settings(required_hits=1), CatalogStub())
     sub_a = subscription("corr-a", "group-a")
     sub_b = subscription("corr-b", "group-b")
     reg_a = registration("group-a")
@@ -121,7 +144,7 @@ def test_any_scope_triggers_one_model_intent_and_resets_all_windows():
 
 
 def test_simultaneous_same_model_reports_claim_one_in_flight_intent():
-    policy = AccuracyPolicy(settings(required_hits=1), "local-mtlf")
+    policy = AccuracyPolicy(settings(required_hits=1), CatalogStub())
     sub = subscription("corr-a", "group-a")
     reg = registration("group-a")
     seed(policy, sub, reg)
@@ -146,7 +169,7 @@ def test_scope_ttl_uses_injected_clock():
     clock = Clock()
     policy = AccuracyPolicy(
         settings(scope_state_ttl_seconds=10),
-        "local-mtlf",
+        CatalogStub(),
         clock=clock,
     )
     sub_a = subscription("corr-a", "group-a")
@@ -156,3 +179,57 @@ def test_scope_ttl_uses_injected_clock():
     policy.observe(sub_b, notification("corr-b", 0.1), registration("group-b"))
 
     assert policy.snapshot()["scope_count"] == 1
+
+
+def test_new_generation_uses_registration_as_adoption_evidence():
+    catalog = CatalogStub()
+    policy = AccuracyPolicy(settings(required_hits=1), catalog)
+    sub = subscription("corr-a", "group-a", model_id=1)
+    reg = registration("group-a", model_id=1)
+    seed(policy, sub, reg)
+    scope_key = policy.scope_key(sub, reg)
+    family_key = catalog.family_key
+    catalog.current_version = ("local-mtlf", 2)
+    policy.begin_generation(
+        family_key,
+        ("local-mtlf", 1),
+        ("local-mtlf", 2),
+        (scope_key,),
+    )
+    old_report = policy.observe(
+        sub,
+        notification("corr-a", 0.5),
+        reg,
+    )[0]
+    new_sub = subscription("corr-b", "group-a", model_id=2)
+    new_reg = registration("group-a", model_id=2)
+    policy.record_registration(new_reg)
+    first_new = policy.observe(
+        new_sub,
+        notification("corr-b", 0.1, model_id=2),
+        new_reg,
+    )[0]
+
+    assert not old_report.evaluated
+    assert first_new.evaluated
+    assert not first_new.baseline_ready
+    assert policy.snapshot()["adoption_count"] == 1
+
+
+def test_deleting_retired_registration_does_not_remove_adopted_scope():
+    catalog = CatalogStub()
+    policy = AccuracyPolicy(settings(), catalog)
+    old = registration("group-a", model_id=1)
+    policy.record_registration(old)
+    catalog.current_version = ("local-mtlf", 2)
+    new = registration("group-a", model_id=2)
+    policy.record_registration(new)
+
+    policy.remove_registration(old)
+
+    assert policy.active_scope_keys(catalog.family_key) == (
+        policy.registration_scope_key(new),
+    )
+
+    policy.remove_registration(new)
+    assert policy.active_scope_keys(catalog.family_key) == ()

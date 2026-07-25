@@ -1,8 +1,10 @@
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from uuid import uuid4
 
-from py_mtlf.core.seed_catalog import SeedCatalog, SeedModel
+from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
 from py_mtlf.wire.ml_model import (
     MLModelProvisionSnapshot,
     MLModelProvisionSubscription,
@@ -13,12 +15,12 @@ from py_mtlf.wire.ml_model import (
 class ProvisionResource:
     subscription_id: str
     representation: MLModelProvisionSubscription
-    seeds: tuple[SeedModel | None, ...]
+    family_keys: tuple[FamilyKey | None, ...]
     revision: int
 
 
 class ProvisionResourceStore:
-    def __init__(self, catalog: SeedCatalog, lock=None) -> None:
+    def __init__(self, catalog: ModelCatalog, lock=None) -> None:
         self._catalog = catalog
         self._lock = lock or threading.RLock()
         self._resources: dict[str, ProvisionResource] = {}
@@ -73,9 +75,7 @@ class ProvisionResourceStore:
     ) -> dict[str, ProvisionResource]:
         subscription_ids = [snapshot.subscription_id for snapshot in snapshots]
         if len(subscription_ids) != len(set(subscription_ids)):
-            raise ValueError(
-                "mlModelProvisionSubscriptions contains duplicate subscriptionId"
-            )
+            raise ValueError("mlModelProvisionSubscriptions contains duplicate subscriptionId")
         restored: dict[str, ProvisionResource] = {}
         for snapshot in snapshots:
             restored[snapshot.subscription_id] = self._prepare(
@@ -97,6 +97,28 @@ class ProvisionResourceStore:
         with self._lock:
             return tuple(self._copy(resource) for resource in self._resources.values())
 
+    def resources_for_family(self, family_key: FamilyKey) -> tuple[ProvisionResource, ...]:
+        with self._lock:
+            return tuple(
+                self._copy(resource)
+                for resource in self._resources.values()
+                if family_key in resource.family_keys
+            )
+
+    @contextmanager
+    def hold_resources_for_family(
+        self,
+        family_key: FamilyKey,
+    ) -> Iterator[tuple[ProvisionResource, ...]]:
+        """Keep the current model demand stable across promotion and enqueue."""
+
+        with self._lock:
+            yield tuple(
+                self._copy(resource)
+                for resource in self._resources.values()
+                if family_key in resource.family_keys
+            )
+
     def _prepare(
         self,
         subscription_id: str,
@@ -108,14 +130,13 @@ class ProvisionResourceStore:
             update={"ml_event_notifications": None},
             deep=True,
         )
-        seeds = tuple(
-            self._catalog.resolve(demand)
-            for demand in canonical.ml_event_subscriptions
+        family_keys = tuple(
+            self._catalog.resolve_key(demand) for demand in canonical.ml_event_subscriptions
         )
         return ProvisionResource(
             subscription_id=subscription_id,
             representation=canonical,
-            seeds=seeds,
+            family_keys=family_keys,
             revision=revision,
         )
 
@@ -124,6 +145,6 @@ class ProvisionResourceStore:
         return ProvisionResource(
             subscription_id=resource.subscription_id,
             representation=resource.representation.model_copy(deep=True),
-            seeds=resource.seeds,
+            family_keys=resource.family_keys,
             revision=resource.revision,
         )

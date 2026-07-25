@@ -23,6 +23,7 @@ from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.core.training_jobs import TrainingCoordinator
 from py_mtlf.models import PrivateError
 
 logger = logging.getLogger(__name__)
@@ -47,12 +48,21 @@ def create_app(
     artifact_repository = artifact_repository or ArtifactRepository(
         settings.storage.artifact_root, settings.artifact
     )
-    seed_catalog = SeedCatalog(settings.model_provision, artifact_repository)
     state_lock = threading.RLock()
+    seed_catalog = SeedCatalog(
+        settings.model_provision,
+        artifact_repository,
+        state_lock,
+    )
+    accuracy_policy = AccuracyPolicy(
+        settings.accuracy_policy,
+        seed_catalog,
+    )
     provision_store = ProvisionResourceStore(seed_catalog, state_lock)
     provision_notifications = ProvisionNotificationDispatcher(
         settings.notification,
         provision_store,
+        seed_catalog,
     )
     runtime = RuntimeState(process_instance_id=str(uuid4()))
     sync_projection = SyncProjection(state_lock)
@@ -65,16 +75,21 @@ def create_app(
         monitor_subscriptions,
         state_lock,
     )
-    accuracy_policy = AccuracyPolicy(
-        settings.accuracy_policy,
-        settings.model_provision.provider_namespace,
-    )
     adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
     dataset_coordinator = DatasetCoordinator(
         settings.dataset,
         sync_projection,
         accuracy_policy,
         adrf_resolver,
+    )
+    training_coordinator = TrainingCoordinator(
+        settings.training,
+        dataset_coordinator,
+        seed_catalog,
+        artifact_repository,
+        provision_store,
+        provision_notifications,
+        accuracy_policy,
     )
 
     @asynccontextmanager
@@ -86,11 +101,13 @@ def create_app(
             seed_catalog.open()
             provision_notifications.open()
             monitor_reconciler.open()
+            training_coordinator.open()
             runtime.artifact_status = "ready"
             runtime.accepting_requests = True
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
+            training_coordinator.shutdown()
             dataset_coordinator.shutdown()
             monitor_reconciler.shutdown()
             provision_notifications.shutdown()
@@ -103,6 +120,7 @@ def create_app(
     app.state.runtime = runtime
     app.state.artifacts = artifact_repository
     app.state.seed_catalog = seed_catalog
+    app.state.model_catalog = seed_catalog
     app.state.provision_store = provision_store
     app.state.provision_notifications = provision_notifications
     app.state.sync_projection = sync_projection
@@ -111,6 +129,7 @@ def create_app(
     app.state.monitor_reconciler = monitor_reconciler
     app.state.accuracy_policy = accuracy_policy
     app.state.dataset_coordinator = dataset_coordinator
+    app.state.training_coordinator = training_coordinator
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)

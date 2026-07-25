@@ -22,6 +22,7 @@ def _seeded_app(settings, bundle_path):
                 provider_namespace="local",
                 seed_models=(
                     SeedModelSettings(
+                        family_id="ue-communication-default",
                         model_id=1,
                         artifact_key=artifact.key,
                         event="UE_COMMUNICATION",

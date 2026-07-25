@@ -74,6 +74,7 @@ class ArtifactSettings(FrozenSettings):
 
 
 class SeedModelSettings(FrozenSettings):
+    family_id: str = Field(min_length=1)
     model_id: int = Field(ge=0, le=9223372036854775807)
     artifact_key: str
     event: str = Field(min_length=1)
@@ -95,6 +96,14 @@ class SeedModelSettings(FrozenSettings):
     def normalize_event(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("family_id")
+    @classmethod
+    def normalize_family_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("seed model family_id must not be blank")
+        return value
+
 
 class ModelProvisionSettings(FrozenSettings):
     provider_namespace: str = "local-mtlf"
@@ -110,6 +119,9 @@ class ModelProvisionSettings(FrozenSettings):
 
     @model_validator(mode="after")
     def validate_unique_models(self) -> "ModelProvisionSettings":
+        family_ids = [model.family_id for model in self.seed_models]
+        if len(family_ids) != len(set(family_ids)):
+            raise ValueError("model_provision seed family IDs must be unique")
         model_ids = [model.model_id for model in self.seed_models]
         if len(model_ids) != len(set(model_ids)):
             raise ValueError("model_provision seed model IDs must be unique")
@@ -226,6 +238,28 @@ class DatasetSettings(FrozenSettings):
     mongodb: MongoDatasetSettings = MongoDatasetSettings()
 
 
+class TrainingSettings(FrozenSettings):
+    enabled: bool = True
+    device: str = "cpu"
+    batch_size: int = Field(default=32, gt=0)
+    learning_rate: float = Field(default=0.001, gt=0)
+    epochs: int = Field(default=18, gt=0)
+    validation_ratio: float = Field(default=0.20, gt=0, lt=1)
+    random_seed: int = Field(default=42, ge=0)
+    max_concurrent_jobs: int = Field(default=1, ge=1, le=32)
+    max_queue_size: int = Field(default=16, gt=0)
+    enforce_performance_gate: bool = True
+    max_scope_wape_regression: float = Field(default=0.02, ge=0)
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "cpu":
+            raise ValueError("training.device must be 'cpu' in the current implementation")
+        return value
+
+
 class LogSettings(FrozenSettings):
     level: str = "INFO"
 
@@ -247,6 +281,7 @@ class Settings(FrozenSettings):
     accuracy_policy: AccuracyPolicySettings = AccuracyPolicySettings()
     adrf: AdrfSettings = AdrfSettings()
     dataset: DatasetSettings = DatasetSettings()
+    training: TrainingSettings = TrainingSettings()
     notification: NotificationSettings = NotificationSettings()
     log: LogSettings = LogSettings()
 

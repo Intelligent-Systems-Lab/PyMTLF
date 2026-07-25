@@ -34,11 +34,25 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
         ) from error
 
     with request.app.state.state_lock:
+        restored_model_ids = {
+            resource.representation.model_id
+            for resource in prepared_registrations.values()
+        }
+        restored_model_ids.update(
+            model_id
+            for resource in prepared_subscriptions.values()
+            for model_id in resource.representation.model_ids
+        )
+        request.app.state.model_catalog.observe_external_model_ids(restored_model_ids)
         request.app.state.sync_projection.commit(prepared_projection)
         restored = request.app.state.provision_store.commit_from_sync(prepared_provisions)
         request.app.state.monitor_registrations.commit_from_sync(prepared_registrations)
         request.app.state.monitor_subscriptions.commit_from_sync(prepared_subscriptions)
         request.app.state.monitor_reconciler.commit_restore(prepared_monitor_restore)
+        for resource in prepared_registrations.values():
+            request.app.state.accuracy_policy.record_registration(
+                resource.representation
+            )
 
     for resource in restored:
         request.app.state.provision_notifications.enqueue(resource)

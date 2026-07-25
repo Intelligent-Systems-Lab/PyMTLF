@@ -63,6 +63,7 @@ def test_storage_path_must_not_be_blank():
 
 def test_seed_model_ids_and_artifact_keys_are_unique():
     seed = SeedModelSettings(
+        family_id="ue-communication-default",
         model_id=1,
         artifact_key="a" * 64,
         event="UE_COMMUNICATION",

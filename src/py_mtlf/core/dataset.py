@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -13,8 +14,9 @@ from uuid import uuid4
 import httpx
 
 from py_mtlf.config import DatasetSettings
-from py_mtlf.core.accuracy_policy import AccuracyPolicy, ModelKey, RetrainIntent, ScopeReference
+from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.adrf_discovery import AdrfResolver, normalize_api_root
+from py_mtlf.core.seed_catalog import FamilyKey
 from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.models import BackendSyncRequest, SmfResourceSnapshot
 from py_mtlf.wire.adrf import (
@@ -33,6 +35,9 @@ class DatasetJobState(StrEnum):
     RESOLVING = "RESOLVING"
     RETRIEVING = "RETRIEVING"
     READY = "READY"
+    CLAIMED = "CLAIMED"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
 
@@ -56,7 +61,7 @@ class DatasetRecord:
 @dataclass(frozen=True)
 class DatasetSnapshot:
     job_id: str
-    model_key: ModelKey
+    family_key: FamilyKey
     triggering_scope_key: str
     required_scope_keys: tuple[str, ...]
     time_window: TimeWindow
@@ -124,6 +129,11 @@ class DatasetCoordinator:
             thread_name_prefix="dataset",
         )
         self._futures: set[Future] = set()
+        self._ready_handler: Callable[[str], None] | None = None
+
+    def set_ready_handler(self, handler: Callable[[str], None] | None) -> None:
+        with self._lock:
+            self._ready_handler = handler
 
     def accept_policy_intents(self) -> None:
         if self._closing.is_set():
@@ -163,7 +173,40 @@ class DatasetCoordinator:
             return tuple(self._jobs.values())
 
     def ready_snapshots(self) -> tuple[DatasetSnapshot, ...]:
-        return tuple(job.snapshot for job in self.jobs() if job.snapshot is not None)
+        return tuple(
+            job.snapshot
+            for job in self.jobs()
+            if job.state == DatasetJobState.READY and job.snapshot is not None
+        )
+
+    def claim_ready(self, job_id: str) -> DatasetSnapshot | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state != DatasetJobState.READY or job.snapshot is None:
+                return None
+            job.state = DatasetJobState.CLAIMED
+            return job.snapshot
+
+    def finish_claim(
+        self,
+        job_id: str,
+        *,
+        success: bool,
+        failure: str = "",
+        cancelled: bool = False,
+    ) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state != DatasetJobState.CLAIMED:
+                raise RuntimeError("dataset snapshot is not claimed")
+            job.failure = failure
+            job.state = (
+                DatasetJobState.COMPLETED
+                if success
+                else (DatasetJobState.CANCELLED if cancelled else DatasetJobState.FAILED)
+            )
+            family_key = job.intent.family_key
+        self._policy.complete_retrain(family_key)
 
     def receive_notification(self, notification: NadrfDataRetrievalNotification) -> None:
         with self._lock:
@@ -227,7 +270,7 @@ class DatasetCoordinator:
         finally:
             self._cleanup(job)
             if job.state == DatasetJobState.FAILED:
-                self._policy.complete_retrain(job.intent.model_key)
+                self._policy.complete_retrain(job.intent.family_key)
 
     def _discard_future(self, future: Future) -> None:
         with self._lock:
@@ -483,6 +526,7 @@ class DatasetCoordinator:
             serverSelectionTimeoutMS=mongo.connect_timeout_ms,
             connectTimeoutMS=mongo.connect_timeout_ms,
             socketTimeoutMS=mongo.read_timeout_ms,
+            tz_aware=True,
         )
         records: list[tuple[ResolvedResource, NadrfDataStoreRecord, datetime, str]] = []
         malformed = 0
@@ -597,7 +641,7 @@ class DatasetCoordinator:
             raise RuntimeError(f"required scopes have no valid records: {missing}")
         job.snapshot = DatasetSnapshot(
             job.job_id,
-            job.intent.model_key,
+            job.intent.family_key,
             job.intent.triggering_scope_key,
             job.intent.active_scope_keys,
             job.time_window,
@@ -613,6 +657,10 @@ class DatasetCoordinator:
             len(job.records),
             counts,
         )
+        with self._lock:
+            ready_handler = self._ready_handler
+        if ready_handler is not None:
+            ready_handler(job.job_id)
 
     def _cleanup(self, job: DatasetJob) -> None:
         snapshot = self._projection.snapshot()

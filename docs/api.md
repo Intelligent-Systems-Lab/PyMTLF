@@ -62,7 +62,9 @@ empty.
 
 The request and accepted representation use the Release 18
 `NwdafMLModelProvSubsc` shape. PyMTLF resolves each `mLEventSubscs` entry
-against its configured seed catalog.
+against its configured seed catalog. Every seed has an explicit internal
+`family_id`; the family remains stable across retraining while every promoted
+artifact receives a new standard `modelUniqueId`.
 
 When `eventReq.immRep` is true and a compatible seed exists, the `201` or `200`
 representation includes `mLEventNotifs` with:
@@ -112,9 +114,45 @@ scope for that model. The dataset coordinator resolves those scopes through
 the synced Events and SMF resources, fixes one historical time window, and
 uses the synced source without cross-source fallback. Every required scope
 must contain at least one valid UPF record before a `READY` snapshot is
-published. `READY` keeps the model retrain-in-flight until the local-training
-workflow consumes it. Local training, artifact publication, generation
-advancement, and updated-model reprovision are not active yet.
+published. `READY` is atomically claimed by the bounded local-training
+coordinator and keeps the model retrain-in-flight until a terminal outcome.
+
+The local trainer:
+
+- converts ADRF-aligned raw notifications into the bundle's fixed ten-feature
+  order, summing volume/packet fields and averaging throughput fields per
+  timestamp and scope
+- reserves the older 20% of each scope as reference validation, uses the newer
+  80% for training, and applies a purge gap between the two regions
+- fits a new `StandardScaler` only on training-period observations
+- warm-starts the current Torch model on CPU with deterministic seeds, Adam,
+  and Huber loss
+- always records current/candidate per-scope and aggregate WAPE; the
+  `training.enforce_performance_gate` switch decides whether regression blocks
+  promotion
+
+The triggering scope must be eligible for both training and evaluation.
+Other active scopes participate when eligible and otherwise remain recorded
+with an exclusion reason in logs and the candidate manifest. Scope drift
+during training is logged but does not discard an otherwise valid candidate;
+a stale base generation or removed model demand does.
+
+An accepted candidate reserves a provider-wide model ID, is packaged with the
+same four-file bundle contract,
+reloaded for validation, published under a content-addressed immutable URL,
+and atomically promoted in the process-local family catalog. Retired IDs remain
+indexed to the family but are never reused during the process lifetime. The
+existing Model Provision resources then resolve the new URL at send time.
+Notification delivery keeps only the latest desired artifact per resource,
+retries retryable failures with capped exponential backoff, and cancels a
+stale resource revision. Job completion does not wait for PyAnLF activation
+because standard callback `204` only acknowledges acceptance.
+
+After promotion, reports for the retired model ID are ignored. Each scope
+starts a fresh baseline only after PyAnLF registers the new model identity and
+PyMTLF establishes the corresponding owned subscription/correlation.
+Liveness-only reports still describe insufficient data and never signal
+activation.
 
 ## Historical Dataset Retrieval
 

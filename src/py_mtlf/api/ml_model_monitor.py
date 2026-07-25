@@ -22,6 +22,8 @@ def create_monitor_registration(
     request: Request,
 ) -> JSONResponse:
     resource = request.app.state.monitor_registrations.create(payload)
+    request.app.state.model_catalog.observe_external_model_ids({payload.model_id})
+    request.app.state.accuracy_policy.record_registration(payload)
     request.app.state.monitor_reconciler.refresh()
     location = str(
         request.url_for(
@@ -49,13 +51,19 @@ def delete_monitor_registration(
     registration_id: str,
     request: Request,
 ) -> Response:
-    if not request.app.state.monitor_registrations.delete(registration_id):
+    resource = request.app.state.monitor_registrations.get(registration_id)
+    if resource is None or not request.app.state.monitor_registrations.delete(
+        registration_id
+    ):
         return problem_response(
             status.HTTP_404_NOT_FOUND,
             "Not Found",
             f"ML Model Monitor registration {registration_id} was not found",
             cause="RESOURCE_NOT_FOUND",
         )
+    request.app.state.accuracy_policy.remove_registration(
+        resource.representation
+    )
     request.app.state.monitor_reconciler.refresh()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

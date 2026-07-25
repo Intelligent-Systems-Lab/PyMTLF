@@ -9,8 +9,10 @@ The current runtime provides the service lifecycle, health and sync endpoints,
 an immutable model artifact repository, a configured seed-model catalog,
 standard-shaped Model Provision and ML Model Monitor resources, and a
 degradation-only WAPE policy, scope-aware historical dataset retrieval, and
-read-only MongoDB fallback access. Local training, new model generation, and
-retrained-model reprovision remain deferred.
+read-only MongoDB fallback access. A bounded CPU trainer consumes READY
+datasets, warm-starts the current model, evaluates per-scope and aggregate
+WAPE, publishes a new immutable bundle, and reprovisions the current artifact
+through the existing Model Provision resource.
 
 Before using the sample configuration, import the initial seed bundle:
 
@@ -26,7 +28,8 @@ The version-controlled source bundle is owned by this repository under
 `seed_models/initial`. It contains `config.json`, `model.py`, `model.npy`, and
 `scaler.pkl`. The import command packages those components into the immutable
 runtime repository below `data/artifacts`. Copy the emitted `artifact_key` into
-`model_provision.seed_models[].artifact_key`. Startup fails if a configured
+`model_provision.seed_models[].artifact_key` and assign that seed a unique,
+non-empty `family_id`. Startup fails if a configured
 seed artifact is missing or its manifest identity does not match the
 descriptor.
 

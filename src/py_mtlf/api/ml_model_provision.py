@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, Response
 
 from py_mtlf.api.problems import problem_response
 from py_mtlf.core.provision_store import ProvisionResource
-from py_mtlf.core.seed_catalog import SeedCatalog
+from py_mtlf.core.seed_catalog import ModelCatalog
 from py_mtlf.wire.ml_model import MLModelProvisionSubscription
 
 router = APIRouter(
@@ -14,13 +14,14 @@ router = APIRouter(
 
 def _representation(
     resource: ProvisionResource,
+    catalog: ModelCatalog,
     *,
     include_immediate_report: bool,
 ) -> MLModelProvisionSubscription:
     update: dict[str, object] = {}
     if include_immediate_report:
-        notifications = SeedCatalog.notifications(
-            resource.seeds,
+        notifications = catalog.notifications(
+            resource.family_keys,
             resource.representation.notification_correlation_id,
         )
         if notifications:
@@ -54,11 +55,12 @@ def create_ml_model_provision_subscription(
     request: Request,
 ) -> JSONResponse:
     resource = request.app.state.provision_store.create(payload)
-    immediate = bool(
-        payload.event_request is not None
-        and payload.event_request.immediate_report
+    immediate = bool(payload.event_request is not None and payload.event_request.immediate_report)
+    response = _representation(
+        resource,
+        request.app.state.model_catalog,
+        include_immediate_report=immediate,
     )
-    response = _representation(resource, include_immediate_report=immediate)
     if not immediate:
         request.app.state.provision_notifications.enqueue(resource)
     location = str(
@@ -84,11 +86,12 @@ def replace_ml_model_provision_subscription(
             f"ML Model Provision subscription {subscription_id} was not found",
             cause="RESOURCE_NOT_FOUND",
         )
-    immediate = bool(
-        payload.event_request is not None
-        and payload.event_request.immediate_report
+    immediate = bool(payload.event_request is not None and payload.event_request.immediate_report)
+    response = _representation(
+        resource,
+        request.app.state.model_catalog,
+        include_immediate_report=immediate,
     )
-    response = _representation(resource, include_immediate_report=immediate)
     if not immediate:
         request.app.state.provision_notifications.enqueue(resource)
     return _json_response(response, status.HTTP_200_OK)
@@ -109,4 +112,5 @@ def delete_ml_model_provision_subscription(
             f"ML Model Provision subscription {subscription_id} was not found",
             cause="RESOURCE_NOT_FOUND",
         )
+    request.app.state.provision_notifications.cancel(subscription_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

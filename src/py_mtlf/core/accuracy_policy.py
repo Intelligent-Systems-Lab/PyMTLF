@@ -7,13 +7,12 @@ from datetime import UTC, datetime, timedelta
 from statistics import fmean, pstdev
 
 from py_mtlf.config import AccuracyPolicySettings
+from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog, ModelVersionKey
 from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorNotification,
     MLModelMonitorRegistration,
     MLModelMonitorSubscription,
 )
-
-ModelKey = tuple[str, int]
 
 
 def utc_now() -> datetime:
@@ -30,7 +29,7 @@ class ScopePolicyState:
 
 @dataclass(frozen=True)
 class RetrainIntent:
-    model_key: ModelKey
+    family_key: FamilyKey
     triggering_scope_key: str
     active_scope_keys: tuple[str, ...]
     triggering_scope: "ScopeReference"
@@ -59,23 +58,80 @@ class PolicyDecision:
     z_score: float = 0
 
 
+@dataclass
+class FamilyAdoptionState:
+    previous_version: ModelVersionKey
+    current_version: ModelVersionKey
+    expected_scope_keys: set[str]
+    adopted_scope_keys: set[str]
+
+
 class AccuracyPolicy:
     def __init__(
         self,
         settings: AccuracyPolicySettings,
-        provider_namespace: str,
+        catalog: ModelCatalog,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._settings = settings
-        self._provider_namespace = provider_namespace
+        self._catalog = catalog
         self._clock = clock
         self._lock = threading.RLock()
-        self._scopes: dict[tuple[ModelKey, str], ScopePolicyState] = {}
-        self._scope_references: dict[tuple[ModelKey, str], ScopeReference] = {}
-        self._in_flight: set[ModelKey] = set()
-        self._generation: dict[ModelKey, int] = {}
+        self._scopes: dict[tuple[FamilyKey, str], ScopePolicyState] = {}
+        self._scope_references: dict[tuple[FamilyKey, str], ScopeReference] = {}
+        self._active_versions: dict[tuple[FamilyKey, str], ModelVersionKey] = {}
+        self._in_flight: set[FamilyKey] = set()
+        self._adoptions: dict[FamilyKey, FamilyAdoptionState] = {}
         self._intents: list[RetrainIntent] = []
-        self._liveness_reports = 0
+        self._insufficient_reports = 0
+        self._rejected_version_reports = 0
+
+    def record_registration(self, registration: MLModelMonitorRegistration) -> bool:
+        version_key = self._catalog.version_key_for_id(registration.model_id)
+        family_key = self._catalog.family_for_version(version_key)
+        current = self._catalog.current(family_key)
+        if family_key is None or current is None or current.version_key != version_key:
+            return False
+        scope_key = self.registration_scope_key(registration)
+        with self._lock:
+            previous = self._active_versions.get((family_key, scope_key))
+            self._active_versions[(family_key, scope_key)] = version_key
+            self._scope_references[(family_key, scope_key)] = ScopeReference(
+                scope_key=scope_key,
+                consumer_id=registration.consumer_id,
+                model_ids=(registration.model_id,),
+                ml_event=registration.ml_event,
+                ml_event_filter=dict(registration.ml_event_filter or {}),
+                target_ue=(
+                    dict(registration.target_ue)
+                    if registration.target_ue is not None
+                    else None
+                ),
+            )
+            if previous != version_key:
+                self._scopes.pop((family_key, scope_key), None)
+            adoption = self._adoptions.get(family_key)
+            if adoption is not None and adoption.current_version == version_key:
+                adoption.adopted_scope_keys.add(scope_key)
+        return True
+
+    def remove_registration(self, registration: MLModelMonitorRegistration) -> None:
+        version_key = self._catalog.version_key_for_id(registration.model_id)
+        family_key = self._catalog.family_for_version(version_key)
+        if family_key is None:
+            return
+        scope_key = self.registration_scope_key(registration)
+        with self._lock:
+            key = (family_key, scope_key)
+            if self._active_versions.get(key) != version_key:
+                return
+            self._active_versions.pop(key, None)
+            self._scope_references.pop(key, None)
+            self._scopes.pop(key, None)
+            adoption = self._adoptions.get(family_key)
+            if adoption is not None:
+                adoption.expected_scope_keys.discard(scope_key)
+                adoption.adopted_scope_keys.discard(scope_key)
 
     def observe(
         self,
@@ -88,28 +144,41 @@ class AccuracyPolicy:
         with self._lock:
             self._gc(now)
             for info in notification.model_accuracy_info:
-                model_key = (self._provider_namespace, info.model_id)
-                scope_key = self.scope_key(subscription, registration)
-                self._scope_references[(model_key, scope_key)] = ScopeReference(
-                    scope_key=scope_key,
-                    consumer_id=registration.consumer_id if registration else "",
-                    model_ids=tuple(subscription.model_ids),
-                    ml_event=subscription.ml_event,
-                    ml_event_filter=dict(subscription.ml_event_filter or {}),
-                    target_ue=(
-                        dict(subscription.target_ue) if subscription.target_ue is not None else None
-                    ),
-                )
-                if info.deviation is None:
-                    self._liveness_reports += 1
+                if (
+                    registration is None
+                    or registration.model_id != info.model_id
+                    or info.model_id not in subscription.model_ids
+                ):
+                    self._rejected_version_reports += 1
                     decisions.append(PolicyDecision(evaluated=False))
                     continue
-                if not self._settings.enabled or model_key in self._in_flight:
+                version_key = self._catalog.version_key_for_id(info.model_id)
+                family_key = self._catalog.family_for_version(version_key)
+                current = self._catalog.current(family_key)
+                scope_key = self.scope_key(subscription, registration)
+                if (
+                    family_key is None
+                    or current is None
+                    or current.version_key != version_key
+                ):
+                    self._rejected_version_reports += 1
+                    decisions.append(PolicyDecision(evaluated=False))
+                    continue
+                self.record_registration(registration)
+                if self._active_versions.get((family_key, scope_key)) != version_key:
+                    self._rejected_version_reports += 1
+                    decisions.append(PolicyDecision(evaluated=False))
+                    continue
+                if info.deviation is None:
+                    self._insufficient_reports += 1
+                    decisions.append(PolicyDecision(evaluated=False))
+                    continue
+                if not self._settings.enabled or family_key in self._in_flight:
                     decisions.append(PolicyDecision(evaluated=False))
                     continue
                 decisions.append(
                     self._observe_one(
-                        model_key,
+                        family_key,
                         scope_key,
                         float(info.deviation),
                         now,
@@ -119,19 +188,19 @@ class AccuracyPolicy:
 
     def _observe_one(
         self,
-        model_key: ModelKey,
+        family_key: FamilyKey,
         scope_key: str,
         deviation: float,
         now: datetime,
     ) -> PolicyDecision:
-        state = self._scopes.get((model_key, scope_key))
+        state = self._scopes.get((family_key, scope_key))
         if state is None:
             state = ScopePolicyState(
                 reference=deque(maxlen=self._settings.reference_buffer_size),
                 hits=deque(maxlen=self._settings.decision_window_size),
                 last_update=now,
             )
-            self._scopes[(model_key, scope_key)] = state
+            self._scopes[(family_key, scope_key)] = state
         state.last_update = now
         state.report_count += 1
 
@@ -153,26 +222,30 @@ class AccuracyPolicy:
         triggered = (
             baseline_ready
             and hit_count >= self._settings.required_hits
-            and model_key not in self._in_flight
+            and family_key not in self._in_flight
         )
         if triggered:
             active_scope_keys = tuple(
                 sorted(
-                    key for (candidate_model, key) in self._scopes if candidate_model == model_key
+                    key
+                    for candidate_family, key in self._active_versions
+                    if candidate_family == family_key
                 )
             )
-            for (candidate_model, _key), candidate in self._scopes.items():
-                if candidate_model == model_key:
+            for (candidate_family, _key), candidate in self._scopes.items():
+                if candidate_family == family_key:
                     candidate.hits.clear()
-            self._in_flight.add(model_key)
+            self._in_flight.add(family_key)
             self._intents.append(
                 RetrainIntent(
-                    model_key=model_key,
+                    family_key=family_key,
                     triggering_scope_key=scope_key,
                     active_scope_keys=active_scope_keys,
-                    triggering_scope=self._scope_references[(model_key, scope_key)],
+                    triggering_scope=self._scope_references[(family_key, scope_key)],
                     active_scopes=tuple(
-                        self._scope_references[(model_key, key)] for key in active_scope_keys
+                        self._scope_references[(family_key, key)]
+                        for key in active_scope_keys
+                        if (family_key, key) in self._scope_references
                     ),
                     created_at=now,
                 )
@@ -187,19 +260,42 @@ class AccuracyPolicy:
             z_score=z_score,
         )
 
-    def complete_retrain(self, model_key: ModelKey) -> None:
+    def complete_retrain(self, family_key: FamilyKey) -> None:
         with self._lock:
-            self._in_flight.discard(model_key)
+            self._in_flight.discard(family_key)
 
-    def advance_generation(self, model_key: ModelKey, generation: int) -> None:
+    def begin_generation(
+        self,
+        family_key: FamilyKey,
+        previous_version: ModelVersionKey,
+        current_version: ModelVersionKey,
+        expected_scope_keys: tuple[str, ...],
+    ) -> None:
         with self._lock:
-            if generation <= self._generation.get(model_key, 0):
-                return
-            self._generation[model_key] = generation
-            self._in_flight.discard(model_key)
-            for key in [key for key in self._scopes if key[0] == model_key]:
-                self._scopes.pop(key, None)
-                self._scope_references.pop(key, None)
+            self._adoptions[family_key] = FamilyAdoptionState(
+                previous_version=previous_version,
+                current_version=current_version,
+                expected_scope_keys=set(expected_scope_keys),
+                adopted_scope_keys=set(),
+            )
+
+    def active_scope_keys(self, family_key: FamilyKey) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    scope_key
+                    for candidate, scope_key in self._active_versions
+                    if candidate == family_key
+                )
+            )
+
+    def scope_reference(
+        self,
+        family_key: FamilyKey,
+        scope_key: str,
+    ) -> ScopeReference | None:
+        with self._lock:
+            return self._scope_references.get((family_key, scope_key))
 
     def intents(self) -> tuple[RetrainIntent, ...]:
         with self._lock:
@@ -217,7 +313,9 @@ class AccuracyPolicy:
                 "scope_count": len(self._scopes),
                 "in_flight": tuple(sorted(self._in_flight)),
                 "intent_count": len(self._intents),
-                "liveness_reports": self._liveness_reports,
+                "insufficient_reports": self._insufficient_reports,
+                "rejected_version_reports": self._rejected_version_reports,
+                "adoption_count": len(self._adoptions),
             }
 
     def _gc(self, now: datetime) -> None:
@@ -229,15 +327,28 @@ class AccuracyPolicy:
         ]:
             self._scopes.pop(key, None)
             self._scope_references.pop(key, None)
+            self._active_versions.pop(key, None)
 
     @staticmethod
+    def registration_scope_key(registration: MLModelMonitorRegistration) -> str:
+        value = {
+            "consumerId": registration.consumer_id,
+            "mLEvent": registration.ml_event,
+            "mLEventFilter": registration.ml_event_filter or {},
+            "tgtUe": registration.target_ue,
+        }
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    @classmethod
     def scope_key(
+        cls,
         subscription: MLModelMonitorSubscription,
         registration: MLModelMonitorRegistration | None = None,
     ) -> str:
+        if registration is not None:
+            return cls.registration_scope_key(registration)
         value = {
-            "consumerId": registration.consumer_id if registration is not None else "",
-            "modelIds": subscription.model_ids,
+            "consumerId": "",
             "mLEvent": subscription.ml_event,
             "mLEventFilter": subscription.ml_event_filter or {},
             "tgtUe": subscription.target_ue,

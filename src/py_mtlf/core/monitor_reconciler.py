@@ -109,17 +109,13 @@ class MonitorSubscriptionReconciler:
                     break
         return PreparedMonitorRestore(
             subscription_ids=restored,
-            orphan_subscription_ids=frozenset(
-                candidate.subscription_id for candidate in available
-            ),
+            orphan_subscription_ids=frozenset(candidate.subscription_id for candidate in available),
         )
 
     def commit_restore(self, prepared: PreparedMonitorRestore) -> None:
         with self._condition:
             self._subscription_ids = dict(prepared.subscription_ids)
-            self._orphan_subscription_ids = set(
-                prepared.orphan_subscription_ids
-            )
+            self._orphan_subscription_ids = set(prepared.orphan_subscription_ids)
 
     def finalize_restore(self) -> None:
         with self._condition:
@@ -172,10 +168,7 @@ class MonitorSubscriptionReconciler:
     def _next_action(self) -> tuple[str, str] | None:
         if self._orphan_subscription_ids:
             return "delete_orphan", min(self._orphan_subscription_ids)
-        desired = {
-            resource.registration_id
-            for resource in self._registrations.snapshot()
-        }
+        desired = {resource.registration_id for resource in self._registrations.snapshot()}
         for registration_id in sorted(desired):
             if registration_id not in self._subscription_ids:
                 return "create", registration_id
@@ -208,9 +201,9 @@ class MonitorSubscriptionReconciler:
         accepted = MLModelMonitorSubscription.model_validate(response.json())
         if not self._same_scope(representation, accepted):
             raise RuntimeError("monitor subscription response changed the requested scope")
-        subscription_id = urlsplit(
-            response.headers.get("Location", "")
-        ).path.rstrip("/").rsplit("/", 1)[-1]
+        subscription_id = (
+            urlsplit(response.headers.get("Location", "")).path.rstrip("/").rsplit("/", 1)[-1]
+        )
         if not subscription_id:
             raise RuntimeError("monitor subscription create response has no resource identity")
         with self._condition:
@@ -223,9 +216,10 @@ class MonitorSubscriptionReconciler:
                 )
                 logger.info(
                     "ML Model Monitor subscription active subscription_id=%s "
-                    "registration_id=%s",
+                    "registration_id=%s correlation_id=%s",
                     subscription_id,
                     registration_id,
+                    accepted.notification_id,
                 )
                 return
         self._delete_remote(subscription_id)
@@ -240,8 +234,7 @@ class MonitorSubscriptionReconciler:
         with self._condition:
             self._subscription_ids.pop(registration_id, None)
         logger.info(
-            "ML Model Monitor subscription removed subscription_id=%s "
-            "registration_id=%s",
+            "ML Model Monitor subscription removed subscription_id=%s registration_id=%s",
             subscription_id,
             registration_id,
         )

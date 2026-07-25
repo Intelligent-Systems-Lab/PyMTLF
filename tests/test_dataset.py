@@ -31,6 +31,23 @@ from py_mtlf.wire.ml_model_monitor import (
 )
 
 
+class CatalogStub:
+    provider_namespace = "local-mtlf"
+    family_key = ("local-mtlf", "ue-communication-default")
+    version_key = ("local-mtlf", 1)
+
+    def version_key_for_id(self, model_id):
+        return self.provider_namespace, model_id
+
+    def family_for_version(self, version_key):
+        return self.family_key if version_key == self.version_key else None
+
+    def current(self, family_key):
+        if family_key != self.family_key:
+            return None
+        return type("Current", (), {"version_key": self.version_key})()
+
+
 def monitor(group: str) -> MLModelMonitorSubscription:
     return MLModelMonitorSubscription(
         modelIds=[1],
@@ -70,7 +87,7 @@ def retrain_intent():
             decision_window_size=1,
             required_hits=1,
         ),
-        "local-mtlf",
+        CatalogStub(),
     )
     for group in ("group-a", "group-b"):
         policy.observe(monitor(group), report(group, 0.1), registration(group))
@@ -160,6 +177,7 @@ def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
         stopTime=datetime(2026, 7, 24, 1, tzinfo=UTC),
     )
     job = DatasetJob("job-1", intent, window, "mongodb")
+    coordinator._jobs[job.job_id] = job
     job.resources = coordinator._resolve(intent, projection.snapshot())
     for resource in job.resources:
         record = NadrfDataStoreRecord(
@@ -190,6 +208,46 @@ def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
     assert len(job.snapshot.records) == 2
     assert set(job.snapshot.scope_record_counts.values()) == {1}
     coordinator._client.close()
+
+
+def test_ready_snapshot_can_only_be_claimed_once_and_records_terminal_outcome():
+    policy, intent = retrain_intent()
+    projection = SyncProjection()
+    projection.replace(sync_snapshot())
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        projection,
+        policy,
+        Mock(close=Mock()),
+    )
+    window = TimeWindow(
+        startTime=datetime(2026, 7, 24, tzinfo=UTC),
+        stopTime=datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+    job = DatasetJob("job-1", intent, window, "mongodb")
+    coordinator._jobs[job.job_id] = job
+    job.resources = coordinator._resolve(intent, projection.snapshot())
+    for resource in job.resources:
+        coordinator._append_record(
+            job,
+            resource,
+            NadrfDataStoreRecord(
+                dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
+                dataNotif=DataNotification(upfEventNotifs=[{"sample": resource.supi}]),
+            ),
+            "mongodb",
+            window.start_time,
+            resource.supi,
+        )
+    coordinator._complete(job)
+
+    claimed = coordinator.claim_ready(job.job_id)
+
+    assert claimed is not None
+    assert coordinator.claim_ready(job.job_id) is None
+    coordinator.finish_claim(job.job_id, success=True)
+    assert job.state == DatasetJobState.COMPLETED
+    coordinator.shutdown()
 
 
 def test_adrf_fetch_uses_instruction_uri_and_bounded_same_origin_redirect():
@@ -433,6 +491,7 @@ def test_mongo_skips_malformed_document_and_keeps_valid_records(mongo_client):
 
     records, malformed = coordinator._read_mongo_once(job)
 
+    assert mongo_client.call_args.kwargs["tz_aware"] is True
     assert malformed == 1
     assert len(records) == 1
     assert records[0][3] == "good"

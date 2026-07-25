@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
+from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.monitor_reconciler import PreparedMonitorRestore
 from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistration,
@@ -29,6 +30,23 @@ def monitor_subscription() -> MLModelMonitorSubscription:
         mLEventFilter={},
         tgtUe={"intGroupIds": ["group-a"]},
     )
+
+
+class CatalogStub:
+    provider_namespace = "local-mtlf"
+    family_key = ("local-mtlf", "ue-communication-default")
+    version_key = ("local-mtlf", 1)
+
+    def version_key_for_id(self, model_id):
+        return self.provider_namespace, model_id
+
+    def family_for_version(self, version_key):
+        return self.family_key if version_key == self.version_key else None
+
+    def current(self, family_key):
+        if family_key != self.family_key:
+            return None
+        return type("Current", (), {"version_key": self.version_key})()
 
 
 def test_registration_resource_uses_standard_create_and_delete_semantics(settings):
@@ -78,6 +96,7 @@ def test_orphan_monitor_notification_does_not_update_accuracy_policy(settings):
 
 def test_notification_correlates_subscription_and_updates_policy(settings):
     app = create_app(settings)
+    app.state.accuracy_policy = AccuracyPolicy(settings.accuracy_policy, CatalogStub())
     registration = app.state.monitor_registrations.create(
         MLModelMonitorRegistration.model_validate(registration_body())
     )
@@ -141,5 +160,5 @@ def test_notification_correlates_subscription_and_updates_policy(settings):
     assert sufficient.status_code == 204
     assert insufficient.status_code == 204
     assert app.state.accuracy_policy.snapshot()["scope_count"] == 1
-    assert app.state.accuracy_policy.snapshot()["liveness_reports"] == 1
+    assert app.state.accuracy_policy.snapshot()["insufficient_reports"] == 1
     assert unknown.status_code == 404
