@@ -36,6 +36,18 @@ class StorageSettings(FrozenSettings):
         return value
 
 
+class RuntimeSettings(FrozenSettings):
+    mode: str = "local"
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"local", "fl_server", "fl_client"}:
+            raise ValueError("runtime.mode must be 'local', 'fl_server', or 'fl_client'")
+        return value
+
+
 def _validate_http_base_url(value: str, field_name: str) -> str:
     value = value.strip().rstrip("/")
     parsed = urlsplit(value)
@@ -71,6 +83,41 @@ class ArtifactSettings(FrozenSettings):
         if self.max_single_file_bytes > self.max_extracted_bytes:
             raise ValueError("max_single_file_bytes must not exceed max_extracted_bytes")
         return self
+
+
+class ArtifactDownloadSettings(FrozenSettings):
+    allowed_origins: tuple[str, ...] = ()
+    timeout_seconds: float = Field(default=300, gt=0, le=3600)
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def validate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(
+            _validate_http_base_url(value, "federated_learning.artifact_download.allowed_origins")
+            for value in values
+        )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("artifact download allowed origins must be unique")
+        return normalized
+
+
+class FederatedLearningSettings(FrozenSettings):
+    workspace_root: Path = Path("data/fl-workspaces")
+    workspace_ttl_seconds: int = Field(default=3600, gt=0)
+    public_base_url: str = "http://127.0.0.1:9092"
+    artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
+
+    @field_validator("workspace_root", mode="before")
+    @classmethod
+    def workspace_must_not_be_blank(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("federated_learning.workspace_root must not be blank")
+        return value
+
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: str) -> str:
+        return _validate_http_base_url(value, "federated_learning.public_base_url")
 
 
 class SeedModelSettings(FrozenSettings):
@@ -274,8 +321,10 @@ class LogSettings(FrozenSettings):
 
 class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
+    runtime: RuntimeSettings = RuntimeSettings()
     storage: StorageSettings = StorageSettings()
     artifact: ArtifactSettings = ArtifactSettings()
+    federated_learning: FederatedLearningSettings = FederatedLearningSettings()
     model_provision: ModelProvisionSettings = ModelProvisionSettings()
     model_monitor: ModelMonitorSettings = ModelMonitorSettings()
     accuracy_policy: AccuracyPolicySettings = AccuracyPolicySettings()

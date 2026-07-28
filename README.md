@@ -47,5 +47,22 @@ The default listener is `127.0.0.1:9092`. Runtime state is stored below
 `seed_models/`; PyAnLF is only a provisioned artifact consumer and does not
 provide the initial model source.
 
+`runtime.mode` defines the containing NWDAF role:
+
+- `local` keeps the existing single-NWDAF provision, monitor, dataset, and
+  bounded local-training lifecycle.
+- `fl_server` exposes provision and monitor behavior but does not start the
+  local trainer. It is the foundation for the later federated server
+  coordinator.
+- `fl_client` exposes health, sync, artifact, and ADRF foundations only. It
+  does not mount provision or monitor routes and does not start a placeholder
+  training service.
+
+Every mode validates that `federated_learning.workspace_root` is writable at
+startup. Readiness includes `runtimeMode`; the workspace TTL, public artifact
+base URL, allowed download origins, and download timeout are configuration
+foundations for later training rounds. No Model Training HTTP route or FedAvg
+worker is implemented in this stage.
+
 See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
 standard-shaped operations PyMTLF sends through the containing Go NWDAF.

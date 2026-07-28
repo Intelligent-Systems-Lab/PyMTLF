@@ -27,6 +27,7 @@ def readiness(request: Request) -> JSONResponse:
         "status": "ready" if ready else "not_ready",
         "artifacts": artifact_status,
         "processInstanceId": state.process_instance_id,
+        "runtimeMode": state.mode,
     }
     return JSONResponse(
         payload,

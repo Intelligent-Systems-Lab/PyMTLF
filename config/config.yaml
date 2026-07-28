@@ -1,6 +1,8 @@
 server:
   binding_host: "127.0.0.1"
   port: 9092
+runtime:
+  mode: "local"
 storage:
   artifact_root: "data/artifacts"
 artifact:
@@ -9,6 +11,14 @@ artifact:
   max_extracted_bytes: 1073741824
   max_single_file_bytes: 536870912
   max_entries: 32
+federated_learning:
+  workspace_root: "data/fl-workspaces"
+  workspace_ttl_seconds: 3600
+  public_base_url: "http://127.0.0.1:9092"
+  artifact_download:
+    allowed_origins:
+      - "http://127.0.0.1:9092"
+    timeout_seconds: 300
 model_provision:
   provider_namespace: "local-mtlf"
   seed_models:

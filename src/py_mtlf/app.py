@@ -1,7 +1,9 @@
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, status
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RuntimeState:
     process_instance_id: str
+    mode: str
     artifact_status: str = "starting"
     accepting_requests: bool = False
 
@@ -64,7 +67,7 @@ def create_app(
         provision_store,
         seed_catalog,
     )
-    runtime = RuntimeState(process_instance_id=str(uuid4()))
+    runtime = RuntimeState(process_instance_id=str(uuid4()), mode=settings.runtime.mode)
     sync_projection = SyncProjection(state_lock)
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
@@ -95,22 +98,27 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         del app
-        logger.info("MTLF backend startup begin")
+        logger.info("MTLF backend startup begin mode=%s", settings.runtime.mode)
         try:
+            _prepare_workspace(settings.federated_learning.workspace_root)
             artifact_repository.open()
             seed_catalog.open()
-            provision_notifications.open()
-            monitor_reconciler.open()
-            training_coordinator.open()
+            if settings.runtime.mode in {"local", "fl_server"}:
+                provision_notifications.open()
+                monitor_reconciler.open()
+            if settings.runtime.mode == "local":
+                training_coordinator.open()
             runtime.artifact_status = "ready"
             runtime.accepting_requests = True
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
-            training_coordinator.shutdown()
+            if settings.runtime.mode == "local":
+                training_coordinator.shutdown()
             dataset_coordinator.shutdown()
-            monitor_reconciler.shutdown()
-            provision_notifications.shutdown()
+            if settings.runtime.mode in {"local", "fl_server"}:
+                monitor_reconciler.shutdown()
+                provision_notifications.shutdown()
             runtime.accepting_requests = False
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
@@ -133,10 +141,11 @@ def create_app(
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
-    app.include_router(ml_model_provision.router)
-    app.include_router(ml_model_monitor.router)
     app.include_router(sync.router)
     app.include_router(adrf.router)
+    if settings.runtime.mode in {"local", "fl_server"}:
+        app.include_router(ml_model_provision.router)
+        app.include_router(ml_model_monitor.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -168,3 +177,17 @@ def create_app(
         )
 
     return app
+
+
+def _prepare_workspace(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    probe = root / f".write-probe-{uuid4()}"
+    try:
+        with probe.open("x", encoding="utf-8") as stream:
+            stream.write("ready")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        raise RuntimeError(f"federated learning workspace is not writable: {root}") from error
+    finally:
+        probe.unlink(missing_ok=True)

@@ -14,6 +14,18 @@ The implementation is authoritative:
 
 FastAPI exposes `/docs`, `/redoc`, and `/openapi.json` while running.
 
+Route availability depends on `runtime.mode`:
+
+| Mode | Provision/Monitor routes | Local trainer | Training routes |
+| --- | --- | --- | --- |
+| `local` | yes | yes | none |
+| `fl_server` | yes | no | none |
+| `fl_client` | no | no | none |
+
+Health, sync, artifact, and ADRF foundation routes remain available in all
+three modes. The mode split does not advertise or emulate a Model Training
+service before that service exists.
+
 ## Endpoint Summary
 
 | Caller | Method and path | Purpose | Success |
@@ -37,8 +49,8 @@ in `Location`.
 
 ## Health And Sync
 
-`GET /health/ready` returns the current `processInstanceId` and artifact
-status. A configured seed catalog is validated during startup. A missing
+`GET /health/ready` returns the current `processInstanceId`, `runtimeMode`, and
+artifact status. A configured seed catalog is validated during startup. A missing
 artifact, invalid archive, or manifest identity mismatch prevents readiness
 instead of producing a fake model URL.
 

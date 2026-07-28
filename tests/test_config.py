@@ -6,7 +6,9 @@ from pydantic import ValidationError
 from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
+    FederatedLearningSettings,
     ModelProvisionSettings,
+    RuntimeSettings,
     SeedModelSettings,
     Settings,
     StorageSettings,
@@ -106,3 +108,28 @@ def test_adrf_configured_endpoint_is_normalized():
     )
 
     assert settings.configured_endpoint == "http://adrf.example:9888"
+
+
+@pytest.mark.parametrize("mode", ["local", "fl_server", "fl_client"])
+def test_runtime_accepts_supported_modes(mode):
+    assert RuntimeSettings(mode=mode.upper()).mode == mode
+
+
+def test_runtime_rejects_unknown_mode():
+    with pytest.raises(ValidationError, match="runtime.mode"):
+        RuntimeSettings(mode="coordinator")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"workspace_root": ""},
+        {"workspace_ttl_seconds": 0},
+        {"public_base_url": "relative"},
+        {"artifact_download": {"timeout_seconds": 0}},
+        {"artifact_download": {"allowed_origins": ["http://peer.example", "http://peer.example/"]}},
+    ],
+)
+def test_federated_learning_settings_fail_fast(payload):
+    with pytest.raises(ValidationError):
+        FederatedLearningSettings.model_validate(payload)

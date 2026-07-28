@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from py_mtlf.config import ArtifactSettings, Settings, StorageSettings
+from py_mtlf.config import (
+    ArtifactSettings,
+    FederatedLearningSettings,
+    Settings,
+    StorageSettings,
+)
 
 
 def build_bundle(
@@ -69,6 +74,9 @@ def settings(tmp_path: Path) -> Settings:
             artifact_root=tmp_path / "artifacts",
         ),
         artifact=ArtifactSettings(public_base_url="http://127.0.0.1:9092"),
+        federated_learning=FederatedLearningSettings(
+            workspace_root=tmp_path / "fl-workspaces",
+        ),
     )
 
 
