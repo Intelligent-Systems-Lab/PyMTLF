@@ -1,22 +1,34 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-
-class StandardModel(BaseModel):
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
-
-class ReportingInformation(StandardModel):
-    immediate_report: bool = Field(default=False, alias="immRep")
+from py_mtlf.wire.reporting import ReportingInformation, StandardModel
 
 
 class MLEventSubscription(StandardModel):
     ml_event: str = Field(min_length=1, alias="mLEvent")
     ml_event_filter: dict[str, JsonValue] = Field(alias="mLEventFilter")
     target_ue: dict[str, JsonValue] | None = Field(default=None, alias="tgtUe")
+    target_period: dict[str, JsonValue] | None = Field(default=None, alias="mLTargetPeriod")
+    expiry_time: datetime | None = Field(default=None, alias="expiryTime")
+    time_model_needed: datetime | None = Field(default=None, alias="timeModelNeeded")
+    report_condition: dict[str, JsonValue] | None = Field(default=None, alias="mlEvRepCon")
     model_interoperability: str = Field(default="", alias="modelInterInfo")
+    nf_consumer_info: str | None = Field(
+        default=None,
+        alias="nfConsumerInfo",
+        pattern=r"^[0-9]{6}$",
+    )
+    model_provision_extension: dict[str, JsonValue] | None = Field(
+        default=None,
+        alias="modelProvExt",
+    )
     use_case_context: str = Field(default="", alias="useCaseCxt")
+    inference_data: dict[str, JsonValue] | None = Field(
+        default=None,
+        alias="inferDataForModel",
+    )
     model_id: int | None = Field(default=None, alias="modelId", ge=0)
 
 
@@ -36,8 +48,16 @@ class MLModelAddress(StandardModel):
 class MLEventNotification(StandardModel):
     event: str = Field(min_length=1)
     notification_correlation_id: str | None = Field(default=None, alias="notifCorreId")
+    model_file: str | None = Field(default=None, alias="mlFile")
     model_file_address: MLModelAddress | None = Field(default=None, alias="mLFileAddr")
     model_adrf: dict[str, JsonValue] | None = Field(default=None, alias="mLModelAdrf")
+    validity_period: dict[str, JsonValue] | None = Field(default=None, alias="validityPeriod")
+    spatial_validity: dict[str, JsonValue] | None = Field(default=None, alias="spatialValidity")
+    additional_model_information: list[dict[str, JsonValue]] | None = Field(
+        default=None,
+        alias="addModelInfo",
+        min_length=1,
+    )
     model_unique_id: int | None = Field(default=None, alias="modelUniqueId", ge=0)
     use_case_context: str | None = Field(default=None, alias="useCaseCxt")
     ml_event_filter: dict[str, JsonValue] | None = Field(default=None, alias="mLEventFilter")

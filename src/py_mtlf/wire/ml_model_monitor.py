@@ -4,6 +4,7 @@ from uuid import UUID
 from pydantic import AnyHttpUrl, Field, JsonValue, field_validator, model_validator
 
 from py_mtlf.wire.ml_model import StandardModel
+from py_mtlf.wire.reporting import ReportingInformation
 
 
 class MLModelMonitorRegistration(StandardModel):
@@ -26,10 +27,7 @@ class MLModelMonitorRegistration(StandardModel):
         return self
 
 
-class MonitorReportingRequirement(StandardModel):
-    notification_method: str = Field(default="PERIODIC", alias="notifMethod")
-    repetition_period: int = Field(default=90, alias="repPeriod", gt=0)
-    immediate_report: bool = Field(default=False, alias="immRep")
+MonitorReportingRequirement = ReportingInformation
 
 
 class MLModelMonitorSubscription(StandardModel):
@@ -38,7 +36,7 @@ class MLModelMonitorSubscription(StandardModel):
     notification_id: str = Field(min_length=1, alias="notifCorrId")
     model_metric: str | None = Field(default=None, alias="modelMetric")
     accuracy_threshold: int | None = Field(default=None, alias="accuThreshold", ge=0)
-    event_report_request: MonitorReportingRequirement | None = Field(
+    event_report_request: ReportingInformation | None = Field(
         default=None,
         alias="eventReportReq",
     )
