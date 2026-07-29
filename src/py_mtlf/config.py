@@ -195,6 +195,7 @@ class ModelMonitorSettings(FrozenSettings):
     callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
     report_period_seconds: int = Field(default=90, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    discovery_timeout_seconds: float = Field(default=30, gt=0, le=300)
     retry_interval_seconds: float = Field(default=1, gt=0, le=300)
     retry_max_interval_seconds: float = Field(default=30, gt=0, le=600)
 

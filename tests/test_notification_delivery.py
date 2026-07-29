@@ -62,6 +62,7 @@ def seeded_state(settings, bundle_path):
                 ],
                 "notifUri": "http://go.internal/model-update",
                 "notifCorreId": "corr-1",
+                "suppFeats": "8",
             }
         )
     )

@@ -46,6 +46,7 @@ def _subscription(*, immediate: bool) -> dict[str, object]:
         "notifUri": "http://go.internal/provision-callback",
         "notifCorreId": "corr-1",
         "eventReq": {"immRep": immediate},
+        "suppFeats": "8",
         "futureTopLevel": True,
     }
 

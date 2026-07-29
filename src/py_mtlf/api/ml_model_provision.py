@@ -4,6 +4,12 @@ from fastapi.responses import JSONResponse, Response
 from py_mtlf.api.problems import problem_response
 from py_mtlf.core.provision_store import ProvisionResource
 from py_mtlf.core.seed_catalog import ModelCatalog
+from py_mtlf.wire.features import (
+    MODEL_PROVISION_EXT_FEATURE,
+    feature_intersection,
+    feature_mask,
+    includes_feature,
+)
 from py_mtlf.wire.ml_model import MLModelProvisionSubscription
 
 router = APIRouter(
@@ -18,8 +24,15 @@ def _representation(
     *,
     include_immediate_report: bool,
 ) -> MLModelProvisionSubscription:
-    update: dict[str, object] = {}
-    if include_immediate_report:
+    negotiated = feature_intersection(
+        resource.representation.supported_features,
+        feature_mask(MODEL_PROVISION_EXT_FEATURE),
+    )
+    update: dict[str, object] = {"supported_features": negotiated}
+    if include_immediate_report and includes_feature(
+        negotiated,
+        MODEL_PROVISION_EXT_FEATURE,
+    ):
         notifications = catalog.notifications(
             resource.family_keys,
             resource.representation.notification_correlation_id,

@@ -14,6 +14,21 @@ from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistration,
     MLModelMonitorSubscription,
 )
+from py_mtlf.wire.private import SelectedTarget
+
+
+def resolver() -> Mock:
+    return Mock(
+        resolve=Mock(
+            return_value=SelectedTarget(
+                nfInstanceId="11111111-1111-4111-8111-111111111111",
+                nfServiceInstanceId="monitor-a",
+                serviceName="nnwdaf-mlmodelmonitor",
+                apiRoot="http://nwdaf-a.example",
+                selectionSource="NRF",
+            )
+        )
+    )
 
 
 def monitor_subscription() -> MLModelMonitorSubscription:
@@ -41,6 +56,7 @@ def test_restore_marks_unowned_subscription_for_retryable_cleanup(settings):
         projection,
         registrations,
         subscriptions,
+        resolver(),
         state_lock,
     )
 
@@ -80,6 +96,7 @@ def test_restore_does_not_reassign_old_subscription_to_new_same_scope_owner(sett
         projection,
         registrations,
         subscriptions,
+        resolver(),
         state_lock,
     )
 
@@ -108,6 +125,7 @@ def test_create_publishes_owner_identity_and_records_owned_projection(settings):
         projection,
         registrations,
         subscriptions,
+        resolver(),
         state_lock,
     )
     accepted = reconciler._subscription_for(registration)
@@ -123,7 +141,11 @@ def test_create_publishes_owner_identity_and_records_owned_projection(settings):
 
     request = reconciler._request.call_args
     assert request.kwargs["headers"] == {
-        "X-NWDAF-Monitor-Registration-Id": registration.registration_id
+        "X-NWDAF-Monitor-Registration-Id": registration.registration_id,
+        "X-NWDAF-Target-Nf-Instance-Id": "11111111-1111-4111-8111-111111111111",
+        "X-NWDAF-Target-Nf-Service-Instance-Id": "monitor-a",
+        "X-NWDAF-Target-Api-Root": "http://nwdaf-a.example",
+        "X-NWDAF-Target-Selection-Source": "NRF",
     }
     restored = subscriptions.snapshot()
     assert len(restored) == 1

@@ -9,6 +9,7 @@ import httpx
 from py_mtlf.config import NotificationSettings
 from py_mtlf.core.provision_store import ProvisionResource, ProvisionResourceStore
 from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog, ModelVersionKey
+from py_mtlf.wire.features import MODEL_PROVISION_EXT_FEATURE, includes_feature
 from py_mtlf.wire.ml_model import MLModelProvisionNotification
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ class ProvisionNotificationDispatcher:
             )
 
     def enqueue(self, resource: ProvisionResource) -> None:
+        if not includes_feature(
+            resource.representation.supported_features,
+            MODEL_PROVISION_EXT_FEATURE,
+        ):
+            return
         models = []
         for key in resource.family_keys:
             current = self._catalog.current(key) if key is not None else None

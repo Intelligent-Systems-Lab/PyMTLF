@@ -22,6 +22,7 @@ from py_mtlf.core.monitor_store import (
     MonitorSubscriptionProjectionStore,
 )
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
+from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.core.sync_projection import SyncProjection
@@ -71,11 +72,16 @@ def create_app(
     sync_projection = SyncProjection(state_lock)
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
+    nwdaf_monitor_resolver = NwdafMonitorResolver(
+        settings.model_monitor,
+        sync_projection,
+    )
     monitor_reconciler = MonitorSubscriptionReconciler(
         settings.model_monitor,
         sync_projection,
         monitor_registrations,
         monitor_subscriptions,
+        nwdaf_monitor_resolver,
         state_lock,
     )
     adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
@@ -119,6 +125,7 @@ def create_app(
             if settings.runtime.mode in {"local", "fl_server"}:
                 monitor_reconciler.shutdown()
                 provision_notifications.shutdown()
+            nwdaf_monitor_resolver.close()
             runtime.accepting_requests = False
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
@@ -135,6 +142,7 @@ def create_app(
     app.state.monitor_registrations = monitor_registrations
     app.state.monitor_subscriptions = monitor_subscriptions
     app.state.monitor_reconciler = monitor_reconciler
+    app.state.nwdaf_monitor_resolver = nwdaf_monitor_resolver
     app.state.accuracy_policy = accuracy_policy
     app.state.dataset_coordinator = dataset_coordinator
     app.state.training_coordinator = training_coordinator

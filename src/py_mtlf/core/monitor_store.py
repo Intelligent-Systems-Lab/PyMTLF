@@ -8,6 +8,7 @@ from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorSubscription,
     MLModelMonitorSubscriptionSnapshot,
 )
+from py_mtlf.wire.private import SelectedTarget
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class MonitorSubscriptionProjection:
     subscription_id: str
     owner_registration_id: str
     representation: MLModelMonitorSubscription
+    selected_target: SelectedTarget | None = None
 
 
 class MonitorSubscriptionProjectionStore:
@@ -136,6 +138,7 @@ class MonitorSubscriptionProjectionStore:
                 subscription_id=snapshot.subscription_id,
                 owner_registration_id=snapshot.owner_registration_id,
                 representation=snapshot.representation.model_copy(deep=True),
+                selected_target=snapshot.selected_target,
             )
             for snapshot in snapshots
         }
@@ -154,12 +157,14 @@ class MonitorSubscriptionProjectionStore:
         subscription_id: str,
         owner_registration_id: str,
         representation: MLModelMonitorSubscription,
+        selected_target: SelectedTarget | None = None,
     ) -> None:
         with self._lock:
             self._resources[subscription_id] = MonitorSubscriptionProjection(
                 subscription_id=subscription_id,
                 owner_registration_id=owner_registration_id,
                 representation=representation.model_copy(deep=True),
+                selected_target=selected_target,
             )
 
     def delete(self, subscription_id: str) -> None:
@@ -186,4 +191,5 @@ class MonitorSubscriptionProjectionStore:
             subscription_id=resource.subscription_id,
             owner_registration_id=resource.owner_registration_id,
             representation=resource.representation.model_copy(deep=True),
+            selected_target=resource.selected_target,
         )

@@ -36,6 +36,7 @@ model_monitor:
   callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
   report_period_seconds: 90
   request_timeout_seconds: 30
+  discovery_timeout_seconds: 30
   retry_interval_seconds: 1
   retry_max_interval_seconds: 30
 accuracy_policy:
