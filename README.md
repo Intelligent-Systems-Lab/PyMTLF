@@ -21,7 +21,8 @@ uv run python tools/import_seed_model.py \
   --config config/config.yaml \
   --source seed_models/initial \
   --provider-namespace local-mtlf \
-  --model-id 1
+  --model-id 1 \
+  --model-interoperability 001122
 ```
 
 The version-controlled source bundle is owned by this repository under

@@ -20,7 +20,14 @@ logger = logging.getLogger(__name__)
 def create_monitor_registration(
     payload: MLModelMonitorRegistration,
     request: Request,
-) -> JSONResponse:
+) -> Response:
+    if payload.consumer_set_id:
+        return problem_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "consumerSetId resolution is not supported by this MTLF backend",
+            cause="SERVICE_NOT_AVAILABLE",
+        )
     resource = request.app.state.monitor_registrations.create(payload)
     request.app.state.model_catalog.observe_external_model_ids({payload.model_id})
     request.app.state.accuracy_policy.record_registration(payload)
@@ -52,18 +59,14 @@ def delete_monitor_registration(
     request: Request,
 ) -> Response:
     resource = request.app.state.monitor_registrations.get(registration_id)
-    if resource is None or not request.app.state.monitor_registrations.delete(
-        registration_id
-    ):
+    if resource is None or not request.app.state.monitor_registrations.delete(registration_id):
         return problem_response(
             status.HTTP_404_NOT_FOUND,
             "Not Found",
             f"ML Model Monitor registration {registration_id} was not found",
             cause="RESOURCE_NOT_FOUND",
         )
-    request.app.state.accuracy_policy.remove_registration(
-        resource.representation
-    )
+    request.app.state.accuracy_policy.remove_registration(resource.representation)
     request.app.state.monitor_reconciler.refresh()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -122,3 +125,5 @@ def _dispatch_retrain_intents(state, decisions) -> None:
         return
     if state.runtime.mode == "local":
         state.dataset_coordinator.accept_policy_intents()
+    elif state.runtime.mode == "fl_server":
+        state.fl_server.accept_policy_intents()

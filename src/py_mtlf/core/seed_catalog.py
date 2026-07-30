@@ -102,10 +102,13 @@ class ModelCatalog:
             self._version_index = versions
             self._reserved_ids.clear()
             self._tombstoned_ids.clear()
-            self._next_model_id = max(
-                (key[1] for key in versions),
-                default=-1,
-            ) + 1
+            self._next_model_id = (
+                max(
+                    (key[1] for key in versions),
+                    default=-1,
+                )
+                + 1
+            )
 
     def family_key_for_id(self, family_id: str) -> FamilyKey:
         return self._settings.provider_namespace, family_id
@@ -125,7 +128,7 @@ class ModelCatalog:
             descriptor = model.descriptor
             if descriptor.event != demand.ml_event:
                 continue
-            if descriptor.model_interoperability and (
+            if demand.model_interoperability and (
                 descriptor.model_interoperability != demand.model_interoperability
             ):
                 continue
@@ -167,9 +170,7 @@ class ModelCatalog:
 
     def snapshot(self) -> tuple[CatalogModel, ...]:
         with self._lock:
-            return tuple(
-                self._current_by_family[key] for key in sorted(self._current_by_family)
-            )
+            return tuple(self._current_by_family[key] for key in sorted(self._current_by_family))
 
     def notifications(
         self,
@@ -277,6 +278,12 @@ class ModelCatalog:
             raise InvalidArtifactError("model descriptor identity does not match artifact manifest")
         if manifest.get("analytics_event") != descriptor.event:
             raise InvalidArtifactError("model descriptor event does not match artifact manifest")
+        if descriptor.model_interoperability and (
+            manifest.get("model_interoperability") != descriptor.model_interoperability
+        ):
+            raise InvalidArtifactError(
+                "model descriptor interoperability does not match artifact manifest"
+            )
 
     @staticmethod
     def _canonical_equal(left: object, right: object) -> bool:

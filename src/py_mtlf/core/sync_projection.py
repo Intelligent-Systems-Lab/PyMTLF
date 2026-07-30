@@ -20,24 +20,19 @@ class SyncProjection:
             ),
             (
                 "mlModelProvisionSubscriptions.subscriptionId",
-                [
-                    item.subscription_id
-                    for item in snapshot.ml_model_provision_subscriptions
-                ],
+                [item.subscription_id for item in snapshot.ml_model_provision_subscriptions],
             ),
             (
                 "mlModelMonitorRegistrations.registrationId",
-                [
-                    item.registration_id
-                    for item in snapshot.ml_model_monitor_registrations
-                ],
+                [item.registration_id for item in snapshot.ml_model_monitor_registrations],
             ),
             (
                 "mlModelMonitorSubscriptions.subscriptionId",
-                [
-                    item.subscription_id
-                    for item in snapshot.ml_model_monitor_subscriptions
-                ],
+                [item.subscription_id for item in snapshot.ml_model_monitor_subscriptions],
+            ),
+            (
+                "mlModelTrainingSubscriptions.subscriptionId",
+                [item.subscription_id for item in snapshot.ml_model_training_subscriptions],
             ),
         )
         for name, identities in identity_lists:

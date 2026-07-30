@@ -103,9 +103,7 @@ class AccuracyPolicy:
                 ml_event=registration.ml_event,
                 ml_event_filter=dict(registration.ml_event_filter or {}),
                 target_ue=(
-                    dict(registration.target_ue)
-                    if registration.target_ue is not None
-                    else None
+                    dict(registration.target_ue) if registration.target_ue is not None else None
                 ),
             )
             if previous != version_key:
@@ -156,11 +154,7 @@ class AccuracyPolicy:
                 family_key = self._catalog.family_for_version(version_key)
                 current = self._catalog.current(family_key)
                 scope_key = self.scope_key(subscription, registration)
-                if (
-                    family_key is None
-                    or current is None
-                    or current.version_key != version_key
-                ):
+                if family_key is None or current is None or current.version_key != version_key:
                     self._rejected_version_reports += 1
                     decisions.append(PolicyDecision(evaluated=False))
                     continue

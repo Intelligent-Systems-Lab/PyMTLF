@@ -50,7 +50,7 @@ def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_p
         assert "/internal/v1/artifacts/{artifact_key}" in paths
         assert "/internal/v1/ml-model-provision/subscriptions" not in paths
         assert "/internal/v1/ml-model-monitor/registrations" not in paths
-        assert not any("ml-model-training" in path for path in paths)
+        assert "/internal/v1/ml-model-training/subscriptions" in paths
     assert workspace.is_dir()
 
 
@@ -58,6 +58,7 @@ def test_only_local_mode_dispatches_current_dataset_training_path():
     triggered = [PolicyDecision(evaluated=True, triggered=True)]
     local_dataset = Mock()
     server_dataset = Mock()
+    fl_server = Mock()
 
     _dispatch_retrain_intents(
         SimpleNamespace(
@@ -70,9 +71,11 @@ def test_only_local_mode_dispatches_current_dataset_training_path():
         SimpleNamespace(
             runtime=SimpleNamespace(mode="fl_server"),
             dataset_coordinator=server_dataset,
+            fl_server=fl_server,
         ),
         triggered,
     )
 
     local_dataset.accept_policy_intents.assert_called_once_with()
     server_dataset.accept_policy_intents.assert_not_called()
+    fl_server.accept_policy_intents.assert_called_once_with()

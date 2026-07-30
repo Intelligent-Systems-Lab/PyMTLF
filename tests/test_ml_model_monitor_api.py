@@ -66,6 +66,23 @@ def test_registration_resource_uses_standard_create_and_delete_semantics(setting
     assert missing.headers["content-type"].startswith("application/problem+json")
 
 
+def test_consumer_set_registration_is_rejected_before_resource_creation(settings):
+    app = create_app(settings)
+    body = registration_body()
+    del body["consumerId"]
+    body["consumerSetId"] = "monitoring-consumers"
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/ml-model-monitor/registrations",
+            json=body,
+        )
+
+    assert response.status_code == 503
+    assert response.json()["cause"] == "SERVICE_NOT_AVAILABLE"
+    assert app.state.monitor_registrations.snapshot() == ()
+
+
 def test_orphan_monitor_notification_does_not_update_accuracy_policy(settings):
     app = create_app(settings)
     orphan = monitor_subscription()

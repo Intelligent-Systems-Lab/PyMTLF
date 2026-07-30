@@ -15,6 +15,8 @@ federated_learning:
   workspace_root: "data/fl-workspaces"
   workspace_ttl_seconds: 3600
   public_base_url: "http://127.0.0.1:9092"
+  model_interoperability_ids:
+    - "001122"
   artifact_download:
     allowed_origins:
       - "http://127.0.0.1:9092"
@@ -27,6 +29,7 @@ model_provision:
       artifact_key: "5b11c450bc11d0d41474ad5a720d473e59ba2e9c41f2a321b83384e12593db7f"
       event: "UE_COMMUNICATION"
       event_filter: {}
+      model_interoperability: "001122"
 notification:
   request_timeout_seconds: 5
   max_attempts: 3

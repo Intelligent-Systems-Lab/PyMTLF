@@ -56,9 +56,7 @@ class MonitorRegistrationStore:
     ) -> dict[str, MonitorRegistrationResource]:
         registration_ids = [snapshot.registration_id for snapshot in snapshots]
         if len(registration_ids) != len(set(registration_ids)):
-            raise ValueError(
-                "mlModelMonitorRegistrations contains duplicate registrationId"
-            )
+            raise ValueError("mlModelMonitorRegistrations contains duplicate registrationId")
         restored = {
             snapshot.registration_id: MonitorRegistrationResource(
                 registration_id=snapshot.registration_id,
@@ -130,9 +128,7 @@ class MonitorSubscriptionProjectionStore:
     ) -> dict[str, MonitorSubscriptionProjection]:
         subscription_ids = [snapshot.subscription_id for snapshot in snapshots]
         if len(subscription_ids) != len(set(subscription_ids)):
-            raise ValueError(
-                "mlModelMonitorSubscriptions contains duplicate subscriptionId"
-            )
+            raise ValueError("mlModelMonitorSubscriptions contains duplicate subscriptionId")
         restored = {
             snapshot.subscription_id: MonitorSubscriptionProjection(
                 subscription_id=snapshot.subscription_id,

@@ -37,9 +37,9 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
         ) from error
 
     with request.app.state.state_lock:
+        initial_process_sync = request.app.state.sync_projection.snapshot() is None
         restored_model_ids = {
-            resource.representation.model_id
-            for resource in prepared_registrations.values()
+            resource.representation.model_id for resource in prepared_registrations.values()
         }
         restored_model_ids.update(
             model_id
@@ -53,13 +53,26 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
         request.app.state.monitor_subscriptions.commit_from_sync(prepared_subscriptions)
         request.app.state.monitor_reconciler.commit_restore(prepared_monitor_restore)
         for resource in prepared_registrations.values():
-            request.app.state.accuracy_policy.record_registration(
-                resource.representation
-            )
+            request.app.state.accuracy_policy.record_registration(resource.representation)
 
     for resource in restored:
         request.app.state.provision_notifications.enqueue(resource)
     request.app.state.monitor_reconciler.finalize_restore()
+    if initial_process_sync and request.app.state.runtime.mode == "fl_client":
+        for resource in payload.ml_model_training_subscriptions:
+            if resource.direction == "INBOUND":
+                request.app.state.fl_client.restore_after_restart(
+                    resource.subscription_id,
+                    resource.representation,
+                )
+    elif initial_process_sync and request.app.state.runtime.mode == "fl_server":
+        request.app.state.fl_server.discard_restored_routes(
+            tuple(
+                resource.subscription_id
+                for resource in payload.ml_model_training_subscriptions
+                if resource.direction == "OUTBOUND"
+            )
+        )
     logger.info(
         "Backend snapshot accepted training_data_source=%s",
         payload.training_data_source,

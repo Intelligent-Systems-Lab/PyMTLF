@@ -51,9 +51,7 @@ def test_exact_monitor_discovery_selects_requested_nwdaf_and_caches():
                         "nfInstanceId": "22222222-2222-4222-8222-222222222222",
                         "nfStatus": "REGISTERED",
                         "nwdafInfo": {
-                            "mlAnalyticsList": [
-                                {"mlAnalyticsIds": ["UE_COMMUNICATION"]}
-                            ]
+                            "mlAnalyticsList": [{"mlAnalyticsIds": ["UE_COMMUNICATION"]}]
                         },
                         "nfServices": [
                             {
@@ -68,9 +66,7 @@ def test_exact_monitor_discovery_selects_requested_nwdaf_and_caches():
                         "nfInstanceId": TARGET_ID,
                         "nfStatus": "REGISTERED",
                         "nwdafInfo": {
-                            "mlAnalyticsList": [
-                                {"mlAnalyticsIds": ["UE_COMMUNICATION"]}
-                            ]
+                            "mlAnalyticsList": [{"mlAnalyticsIds": ["UE_COMMUNICATION"]}]
                         },
                         "nfServices": [
                             {

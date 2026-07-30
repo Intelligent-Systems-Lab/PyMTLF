@@ -45,6 +45,50 @@ def test_seed_catalog_validates_manifest_and_generic_applicability(settings, bun
     assert catalog.resolve(group_a).artifact == artifact
 
 
+def test_seed_catalog_treats_omitted_interoperability_as_no_filter(
+    settings,
+    bundle_path,
+):
+    repository = ArtifactRepository(settings.storage.artifact_root, settings.artifact)
+    repository.open()
+    artifact = repository.publish(bundle_path)
+    catalog = SeedCatalog(
+        ModelProvisionSettings(
+            provider_namespace="local",
+            seed_models=(
+                SeedModelSettings(
+                    family_id="ue-communication-default",
+                    model_id=1,
+                    artifact_key=artifact.key,
+                    event="UE_COMMUNICATION",
+                    model_interoperability="001122",
+                ),
+            ),
+        ),
+        repository,
+    )
+    catalog.open()
+
+    without_filter = MLEventSubscription(
+        mLEvent="UE_COMMUNICATION",
+        mLEventFilter={},
+    )
+    matching_filter = MLEventSubscription(
+        mLEvent="UE_COMMUNICATION",
+        mLEventFilter={},
+        modelInterInfo="001122",
+    )
+    mismatching_filter = MLEventSubscription(
+        mLEvent="UE_COMMUNICATION",
+        mLEventFilter={},
+        modelInterInfo="334455",
+    )
+
+    assert catalog.resolve(without_filter) is not None
+    assert catalog.resolve(matching_filter) is not None
+    assert catalog.resolve(mismatching_filter) is None
+
+
 def test_seed_catalog_rejects_descriptor_manifest_identity_mismatch(settings, bundle_path):
     repository = ArtifactRepository(settings.storage.artifact_root, settings.artifact)
     repository.open()

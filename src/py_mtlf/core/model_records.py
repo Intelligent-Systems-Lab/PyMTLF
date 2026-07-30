@@ -68,9 +68,7 @@ class CompletedRevision(DurableRecord):
     created_at: AwareDatetime
     ml_corre_id: str | None = Field(default=None, min_length=1)
     participants: tuple[ParticipantSampleCount, ...] = ()
-    validation_summary: CatalogValidationSummary = Field(
-        default_factory=CatalogValidationSummary
-    )
+    validation_summary: CatalogValidationSummary = Field(default_factory=CatalogValidationSummary)
     adrf_reference: AdrfReference | None = None
 
     @model_validator(mode="after")

@@ -227,9 +227,7 @@ def test_deleting_retired_registration_does_not_remove_adopted_scope():
 
     policy.remove_registration(old)
 
-    assert policy.active_scope_keys(catalog.family_key) == (
-        policy.registration_scope_key(new),
-    )
+    assert policy.active_scope_keys(catalog.family_key) == (policy.registration_scope_key(new),)
 
     policy.remove_registration(new)
     assert policy.active_scope_keys(catalog.family_key) == ()

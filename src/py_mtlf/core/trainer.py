@@ -29,6 +29,7 @@ class LoadedBundle:
     model: torch.nn.Module
     scaler: StandardScaler
     model_source: bytes
+    scaler_source: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class TrustedBundleLoader:
             self._extract(artifact.path, root)
             manifest = self._manifest(root / "config.json")
             model_source = (root / "model.py").read_bytes()
+            scaler_source = (root / "scaler.pkl").read_bytes()
             model_class = self._model_class(model_source, root / "model.py")
             model = self._instantiate(model_class, manifest)
             self._load_weights(model, root / "model.npy")
@@ -86,6 +88,7 @@ class TrustedBundleLoader:
             model=model,
             scaler=scaler,
             model_source=model_source,
+            scaler_source=scaler_source,
         )
 
     @staticmethod

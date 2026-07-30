@@ -162,6 +162,11 @@ def test_training_fl_conditional_requirements_report_paths() -> None:
         {"notifCorreId": "corr", "termTrainReq": "OTHERS"},
         {
             "notifCorreId": "corr",
+            "mlCorreId": "fl-process-001",
+            "statusReport": {"trainInDataInfo": {"samplRatio": 100}},
+        },
+        {
+            "notifCorreId": "corr",
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",

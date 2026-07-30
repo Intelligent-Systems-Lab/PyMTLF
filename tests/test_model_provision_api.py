@@ -92,12 +92,8 @@ def test_non_immediate_create_enqueues_notification_and_crud_is_serial(settings,
             f"/internal/v1/ml-model-provision/subscriptions/{resource_id}",
             json=replacement,
         )
-        deleted = client.delete(
-            f"/internal/v1/ml-model-provision/subscriptions/{resource_id}"
-        )
-        missing = client.delete(
-            f"/internal/v1/ml-model-provision/subscriptions/{resource_id}"
-        )
+        deleted = client.delete(f"/internal/v1/ml-model-provision/subscriptions/{resource_id}")
+        missing = client.delete(f"/internal/v1/ml-model-provision/subscriptions/{resource_id}")
 
     assert created.status_code == 201
     assert "mLEventNotifs" not in created.json()
@@ -133,9 +129,7 @@ def test_consumer_supplied_model_notification_is_not_stored_or_echoed(settings):
         {
             "event": "NF_LOAD",
             "notifCorreId": "corr-1",
-            "mLFileAddr": {
-                "mLModelUrl": "http://consumer.example/untrusted-model"
-            },
+            "mLFileAddr": {"mLModelUrl": "http://consumer.example/untrusted-model"},
             "modelUniqueId": 999,
         }
     ]

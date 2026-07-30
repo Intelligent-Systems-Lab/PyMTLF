@@ -101,6 +101,8 @@ class DatasetJob:
         default_factory=lambda: threading.Condition(threading.RLock())
     )
     last_progress: float = field(default_factory=time.monotonic)
+    policy_owned: bool = True
+    completion_handler: Callable[["DatasetJob"], None] | None = None
 
 
 class DatasetCoordinator:
@@ -153,6 +155,36 @@ class DatasetCoordinator:
             with self._lock:
                 self._futures.add(future)
             future.add_done_callback(self._discard_future)
+
+    def submit_external(
+        self,
+        intent: RetrainIntent,
+        time_window: TimeWindow,
+        completion_handler: Callable[[DatasetJob], None],
+    ) -> str:
+        if self._closing.is_set():
+            raise RuntimeError("dataset coordinator is shutting down")
+        job = DatasetJob(
+            str(uuid4()),
+            intent,
+            time_window,
+            "adrf",
+            policy_owned=False,
+            completion_handler=completion_handler,
+        )
+        with self._lock:
+            self._jobs[job.job_id] = job
+        future = self._executor.submit(self._run_job, job)
+        with self._lock:
+            self._futures.add(future)
+        future.add_done_callback(self._discard_future)
+        return job.job_id
+
+    def validate_external_scope(self, intent: RetrainIntent) -> None:
+        sync = self._projection.snapshot()
+        if sync is None:
+            raise RuntimeError("backend sync is unavailable")
+        self._resolve(intent, sync)
 
     def shutdown(self) -> None:
         self._closing.set()
@@ -269,8 +301,16 @@ class DatasetCoordinator:
             logger.warning("Dataset retrieval failed job_id=%s error=%s", job.job_id, error)
         finally:
             self._cleanup(job)
-            if job.state == DatasetJobState.FAILED:
+            if job.policy_owned and job.state == DatasetJobState.FAILED:
                 self._policy.complete_retrain(job.intent.family_key)
+            if job.completion_handler is not None:
+                try:
+                    job.completion_handler(job)
+                except Exception:
+                    logger.exception(
+                        "External dataset completion handler failed job_id=%s",
+                        job.job_id,
+                    )
 
     def _discard_future(self, future: Future) -> None:
         with self._lock:
@@ -332,7 +372,9 @@ class DatasetCoordinator:
             target = event.get("tgtUe") or subscription.get("tgtUe")
             if scope.target_ue is not None and target != scope.target_ue:
                 continue
-            event_filter = event.get("eventFilter") or event.get("analyticsFilter") or {}
+            event_filter = event.get("eventFilter") or event.get("analyticsFilter")
+            if not isinstance(event_filter, dict):
+                event_filter = {key: event[key] for key in scope.ml_event_filter if key in event}
             if scope.ml_event_filter and event_filter != scope.ml_event_filter:
                 continue
             return True

@@ -106,6 +106,20 @@ class FederatedLearningSettings(FrozenSettings):
     workspace_ttl_seconds: int = Field(default=3600, gt=0)
     public_base_url: str = "http://127.0.0.1:9092"
     artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
+    callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
+    request_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    preparation_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+    round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+    callback_deadline_margin_seconds: int = Field(default=5, ge=1, le=300)
+    max_delay_extensions: int = Field(default=1, ge=0, le=10)
+    max_delay_extension_seconds: int = Field(default=300, ge=0, le=86400)
+    round_count: int = Field(default=2, ge=1, le=100)
+    callback_queue_size: int = Field(default=256, gt=0, le=100000)
+    max_concurrent_client_jobs: int = Field(default=2, gt=0, le=32)
+    max_active_server_processes: int = Field(default=1, gt=0, le=32)
+    cleanup_max_attempts: int = Field(default=3, gt=0, le=20)
+    cleanup_retry_backoff_seconds: float = Field(default=0.2, ge=0, le=60)
+    model_interoperability_ids: tuple[str, ...] = ()
 
     @field_validator("workspace_root", mode="before")
     @classmethod
@@ -118,6 +132,41 @@ class FederatedLearningSettings(FrozenSettings):
     @classmethod
     def validate_public_base_url(cls, value: str) -> str:
         return _validate_http_base_url(value, "federated_learning.public_base_url")
+
+    @field_validator("callback_uri")
+    @classmethod
+    def validate_callback_uri(cls, value: str) -> str:
+        value = value.strip()
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("federated_learning.callback_uri must be an absolute HTTP(S) URI")
+        return value
+
+    @field_validator("model_interoperability_ids")
+    @classmethod
+    def validate_model_interoperability_ids(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("model_interoperability_ids must not contain blank values")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("model_interoperability_ids must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_deadline_margin(self) -> "FederatedLearningSettings":
+        if self.callback_deadline_margin_seconds >= min(
+            self.preparation_timeout_seconds,
+            self.round_timeout_seconds,
+        ):
+            raise ValueError("callback deadline margin must be shorter than FL timeouts")
+        if self.callback_queue_size < self.max_concurrent_client_jobs:
+            raise ValueError(
+                "callback_queue_size must not be smaller than max_concurrent_client_jobs"
+            )
+        return self
 
 
 class SeedModelSettings(FrozenSettings):

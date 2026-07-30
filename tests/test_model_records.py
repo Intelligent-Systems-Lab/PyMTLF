@@ -120,9 +120,7 @@ def test_store_accepted_journal_requires_record_locators() -> None:
         "mlCorreId": "fl-process-001",
         "reservedModelId": 2,
         "previousModelId": 1,
-        "participantsAndSampleCounts": [
-            {"participantNfInstanceId": CLIENT_A, "sampleCount": 20}
-        ],
+        "participantsAndSampleCounts": [{"participantNfInstanceId": CLIENT_A, "sampleCount": 20}],
         "validationSummary": {"globalGateAccepted": True},
         "candidatePath": "/durable/publication/candidate.tar.gz",
         "candidateDigest": DIGEST_A,

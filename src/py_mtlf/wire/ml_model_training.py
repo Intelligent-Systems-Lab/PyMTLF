@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import AnyHttpUrl, Field, JsonValue, model_validator
 
 from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription
+from py_mtlf.wire.private import SelectedTarget
 from py_mtlf.wire.reporting import ReportingInformation, StandardModel
 
 
@@ -119,13 +120,17 @@ class NwdafMLModelTrainNotif(StandardModel):
     def validate_result_combination(self) -> "NwdafMLModelTrainNotif":
         has_delay = self.delay_event_notification is not None
         has_models = bool(self.ml_model_infos)
+        has_status = self.status_report is not None
         has_termination = bool(self.termination_request)
-        if not has_delay and not has_models and not has_termination:
+        if not has_delay and not has_models and not has_status and not has_termination:
             raise ValueError(
-                "at least one of delayEventNotif, mLModelInfos or termTrainReq is required"
+                "at least one of delayEventNotif, mLModelInfos, statusReport or "
+                "termTrainReq is required"
             )
-        if has_delay and (has_models or has_termination):
-            raise ValueError("delayEventNotif cannot coexist with mLModelInfos or termTrainReq")
+        if has_delay and (has_models or has_status or has_termination):
+            raise ValueError(
+                "delayEventNotif cannot coexist with mLModelInfos, statusReport or termTrainReq"
+            )
         return self
 
 
@@ -190,6 +195,16 @@ class NwdafMLModelTrainSubscPatch(StandardModel):
     skip_fl_indicator: bool | None = Field(default=None, alias="skipFlInd")
 
 
+class MLModelTrainingSubscriptionSnapshot(StandardModel):
+    subscription_id: str = Field(min_length=1, alias="subscriptionId")
+    representation: NwdafMLModelTrainSubsc
+    direction: str = ""
+    selected_target: "SelectedTarget | None" = Field(default=None, alias="selectedTarget")
+    peer_location: str = Field(default="", alias="peerLocation")
+    lifecycle_state: str = Field(default="", alias="lifecycleState")
+    process_generation: str = Field(default="", alias="processGeneration")
+
+
 @dataclass(frozen=True)
 class TrainingResourceIdentity:
     subscription_id: str
@@ -229,6 +244,13 @@ def validate_fl_subscription(
                 )
             )
     if value.ml_preparation_flag:
+        if not value.ml_model_training_infos:
+            violations.append(
+                InvalidParameter(
+                    "mLModelTrainInfos",
+                    "is required for training preparation",
+                )
+            )
         for index, info in enumerate(value.ml_model_training_infos or []):
             if info.data_availability_requirement is None:
                 violations.append(

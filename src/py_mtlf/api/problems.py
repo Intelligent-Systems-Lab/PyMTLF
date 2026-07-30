@@ -9,12 +9,14 @@ def problem_response(
     detail: str,
     *,
     cause: str = "",
+    invalid_params: list[dict[str, str]] | None = None,
 ) -> JSONResponse:
     problem = ProblemDetails(
         status=status_code,
         title=title,
         detail=detail,
         cause=cause,
+        invalidParams=invalid_params or [],
     )
     return JSONResponse(
         status_code=status_code,

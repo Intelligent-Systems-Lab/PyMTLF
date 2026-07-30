@@ -6,6 +6,7 @@ import torch
 from sklearn.preprocessing import StandardScaler
 
 from py_mtlf.config import TrainingSettings
+from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, wape_sums
 from py_mtlf.core.training_data import FEATURE_ORDER, ScopeTrainingData, TrainingDataset
 
@@ -153,3 +154,24 @@ def test_disabled_performance_gate_keeps_evaluation_but_accepts_regression(
     assert evaluation.aggregate_candidate.value > evaluation.aggregate_current.value
     assert evaluation.accepted
     assert evaluation.rejection_reasons == ()
+
+
+def test_fedavg_uses_exact_training_sample_counts():
+    base = bundle(TinyModel())
+    first = bundle(TinyModel())
+    second = bundle(TinyModel())
+    with torch.no_grad():
+        for value in base.model.parameters():
+            value.zero_()
+        for value in first.model.parameters():
+            value.fill_(1.0)
+        for value in second.model.parameters():
+            value.fill_(3.0)
+
+    aggregate = FederatedTrainer.aggregate(
+        base,
+        ((first, 1), (second, 3)),
+    )
+
+    for value in aggregate.parameters():
+        assert torch.allclose(value, torch.full_like(value, 2.5))

@@ -9,6 +9,7 @@ from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistrationSnapshot,
     MLModelMonitorSubscriptionSnapshot,
 )
+from py_mtlf.wire.ml_model_training import MLModelTrainingSubscriptionSnapshot
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -118,6 +119,10 @@ class BackendSyncRequest(DomainModel):
     ml_model_monitor_subscriptions: list[MLModelMonitorSubscriptionSnapshot] = Field(
         default_factory=list,
         alias="mlModelMonitorSubscriptions",
+    )
+    ml_model_training_subscriptions: list[MLModelTrainingSubscriptionSnapshot] = Field(
+        default_factory=list,
+        alias="mlModelTrainingSubscriptions",
     )
 
 

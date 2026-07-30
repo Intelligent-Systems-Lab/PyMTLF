@@ -34,6 +34,7 @@ def _build_bundle(
     provider_namespace: str,
     model_id: int,
     event: str,
+    model_interoperability: str,
 ) -> None:
     config, components = _read_source(source)
     config.update(
@@ -44,13 +45,13 @@ def _build_bundle(
                 "model_unique_id": model_id,
             },
             "analytics_event": event,
+            "model_interoperability": model_interoperability,
             "runtime_compatibility": config.get(
                 "runtime_compatibility",
                 {"python": ">=3.12", "framework": "torch"},
             ),
             "file_digests": {
-                name: hashlib.sha256(content).hexdigest()
-                for name, content in components.items()
+                name: hashlib.sha256(content).hexdigest() for name, content in components.items()
             },
         }
     )
@@ -93,6 +94,7 @@ def main() -> None:
     parser.add_argument("--provider-namespace", required=True)
     parser.add_argument("--model-id", required=True, type=int)
     parser.add_argument("--event", default="UE_COMMUNICATION")
+    parser.add_argument("--model-interoperability", required=True)
     args = parser.parse_args()
 
     settings = load_settings(args.config)
@@ -109,6 +111,7 @@ def main() -> None:
             provider_namespace=args.provider_namespace,
             model_id=args.model_id,
             event=args.event,
+            model_interoperability=args.model_interoperability,
         )
         metadata = repository.publish(bundle)
     print(

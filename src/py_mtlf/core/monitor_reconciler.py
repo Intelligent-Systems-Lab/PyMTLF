@@ -119,9 +119,7 @@ class MonitorSubscriptionReconciler:
                         candidate.representation.notification_id
                     )
                     if candidate.selected_target is not None:
-                        selected_targets[registration.registration_id] = (
-                            candidate.selected_target
-                        )
+                        selected_targets[registration.registration_id] = candidate.selected_target
                     available.pop(index)
                     break
         return PreparedMonitorRestore(

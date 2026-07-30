@@ -39,9 +39,7 @@ class MLModelAddress(StandardModel):
 
     @model_validator(mode="after")
     def validate_address(self) -> "MLModelAddress":
-        if (self.model_url is None) == (
-            self.file_fqdn is None or not self.file_fqdn.strip()
-        ):
+        if (self.model_url is None) == (self.file_fqdn is None or not self.file_fqdn.strip()):
             raise ValueError("exactly one of mLModelUrl or mlFileFqdn is required")
         return self
 

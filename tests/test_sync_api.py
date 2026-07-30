@@ -1,9 +1,10 @@
+from unittest.mock import Mock
 from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
-from py_mtlf.config import ModelProvisionSettings, SeedModelSettings
+from py_mtlf.config import ModelProvisionSettings, RuntimeSettings, SeedModelSettings
 from py_mtlf.core.artifacts import ArtifactRepository
 
 
@@ -29,6 +30,56 @@ def test_sync_replaces_go_owned_projection(settings):
     snapshot = app.state.sync_projection.snapshot()
     assert snapshot is not None
     assert snapshot.training_data_source == "adrf"
+
+
+def test_training_restart_reconciliation_runs_only_on_first_process_sync(settings):
+    payload = {
+        "containingNwdaf": {
+            "nfInstanceId": "nwdaf-1",
+            "apiBaseUri": "http://127.0.0.1:8080",
+            "internalCallbackBaseUri": "http://127.0.0.1:8091",
+        },
+        "eventsSubscriptions": [],
+        "smfResources": [],
+        "trainingDataSource": "adrf",
+        "mlModelTrainingSubscriptions": [
+            {
+                "subscriptionId": "training-1",
+                "direction": "INBOUND",
+                "representation": {
+                    "mLEventSubscs": [
+                        {
+                            "mLEvent": "UE_COMMUNICATION",
+                            "mLEventFilter": {},
+                            "modelInterInfo": "bundle-v1",
+                        }
+                    ],
+                    "notifUri": "http://go.internal/training/callback",
+                    "notifCorreId": "prep-client-a",
+                    "mlCorreId": "fl-process-001",
+                    "mLPreFlag": True,
+                    "eventReq": {"notifMethod": "ON_EVENT_DETECTION"},
+                    "mLModelTrainInfos": [
+                        {
+                            "dataAvReq": {
+                                "inpEvents": [{"upfEvent": "USER_DATA_USAGE_TRENDS"}],
+                            },
+                            "timeAvReq": "PT5M",
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    configured = settings.model_copy(update={"runtime": RuntimeSettings(mode="fl_client")})
+    app = create_app(configured)
+    app.state.fl_client.restore_after_restart = Mock()
+
+    with TestClient(app) as client:
+        assert client.post("/internal/v1/sync", json=payload).status_code == 200
+        assert client.post("/internal/v1/sync", json=payload).status_code == 200
+
+    app.state.fl_client.restore_after_restart.assert_called_once()
 
 
 def test_sync_restores_provision_resources_and_reconciles_seed(

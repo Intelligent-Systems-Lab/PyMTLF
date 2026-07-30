@@ -22,9 +22,7 @@ async def get_artifact(artifact_key: str, request: Request) -> Response:
             retryable=False,
             correlation_id=artifact_key,
         )
-        return JSONResponse(
-            error.model_dump(mode="json"), status_code=status.HTTP_404_NOT_FOUND
-        )
+        return JSONResponse(error.model_dump(mode="json"), status_code=status.HTTP_404_NOT_FOUND)
     return FileResponse(
         metadata.path,
         media_type=metadata.media_type,
@@ -32,6 +30,44 @@ async def get_artifact(artifact_key: str, request: Request) -> Response:
             "ETag": f'"sha256:{metadata.key}"',
             "X-Artifact-SHA256": metadata.key,
             "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+        content_disposition_type="inline",
+    )
+
+
+@router.get(
+    "/fl-artifacts/{process_id}/{participant_id}/{round_indicator}/{role}/{digest}",
+    response_model=None,
+)
+async def get_fl_artifact(
+    process_id: str,
+    participant_id: str,
+    round_indicator: int,
+    role: str,
+    digest: str,
+    request: Request,
+) -> Response:
+    path = request.app.state.fl_workspace.resolve(
+        process_id, participant_id, round_indicator, role, digest
+    )
+    if path is None:
+        return JSONResponse(
+            PrivateError(
+                code="ARTIFACT_NOT_FOUND",
+                message="federated learning artifact was not found",
+                retryable=False,
+                correlation_id=digest,
+            ).model_dump(mode="json"),
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    return FileResponse(
+        path,
+        media_type="application/gzip",
+        headers={
+            "ETag": f'"sha256:{digest}"',
+            "X-Artifact-SHA256": digest,
+            "Cache-Control": "public, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
         },
         content_disposition_type="inline",

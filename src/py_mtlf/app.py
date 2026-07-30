@@ -10,12 +10,23 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from py_mtlf.api import adrf, artifacts, health, ml_model_monitor, ml_model_provision, sync
+from py_mtlf.api import (
+    adrf,
+    artifacts,
+    health,
+    ml_model_monitor,
+    ml_model_provision,
+    ml_model_training,
+    sync,
+)
 from py_mtlf.config import Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetCoordinator
+from py_mtlf.core.fl_client import FLClientService
+from py_mtlf.core.fl_server import FLClientResolver, FLServerOrchestrator
+from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.monitor_reconciler import MonitorSubscriptionReconciler
 from py_mtlf.core.monitor_store import (
     MonitorRegistrationStore,
@@ -100,6 +111,27 @@ def create_app(
         provision_notifications,
         accuracy_policy,
     )
+    fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
+    fl_client_resolver = FLClientResolver(
+        settings.federated_learning,
+        sync_projection,
+    )
+    fl_client = FLClientService(
+        settings.federated_learning,
+        settings.notification,
+        settings.training,
+        sync_projection,
+        dataset_coordinator,
+        fl_workspace,
+    )
+    fl_server = FLServerOrchestrator(
+        settings.federated_learning,
+        sync_projection,
+        accuracy_policy,
+        seed_catalog,
+        fl_workspace,
+        fl_client_resolver,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -107,6 +139,7 @@ def create_app(
         logger.info("MTLF backend startup begin mode=%s", settings.runtime.mode)
         try:
             _prepare_workspace(settings.federated_learning.workspace_root)
+            fl_workspace.open()
             artifact_repository.open()
             seed_catalog.open()
             if settings.runtime.mode in {"local", "fl_server"}:
@@ -121,6 +154,9 @@ def create_app(
         finally:
             if settings.runtime.mode == "local":
                 training_coordinator.shutdown()
+            fl_client.close()
+            fl_server.close()
+            fl_workspace.close()
             dataset_coordinator.shutdown()
             if settings.runtime.mode in {"local", "fl_server"}:
                 monitor_reconciler.shutdown()
@@ -146,6 +182,9 @@ def create_app(
     app.state.accuracy_policy = accuracy_policy
     app.state.dataset_coordinator = dataset_coordinator
     app.state.training_coordinator = training_coordinator
+    app.state.fl_workspace = fl_workspace
+    app.state.fl_client = fl_client
+    app.state.fl_server = fl_server
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
@@ -154,6 +193,8 @@ def create_app(
     if settings.runtime.mode in {"local", "fl_server"}:
         app.include_router(ml_model_provision.router)
         app.include_router(ml_model_monitor.router)
+    if settings.runtime.mode in {"fl_client", "fl_server"}:
+        app.include_router(ml_model_training.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(

@@ -66,9 +66,7 @@ class ProvisionNotificationDispatcher:
         for key in resource.family_keys:
             current = self._catalog.current(key) if key is not None else None
             if key is not None and current is not None:
-                models.append(
-                    (key, current.version_key, current.generation, current.artifact.key)
-                )
+                models.append((key, current.version_key, current.generation, current.artifact.key))
         if not models:
             return
         desired = DesiredDelivery(

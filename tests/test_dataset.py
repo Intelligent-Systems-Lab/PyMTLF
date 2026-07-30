@@ -8,7 +8,7 @@ from pymongo.errors import AutoReconnect
 
 from py_mtlf.app import create_app
 from py_mtlf.config import AccuracyPolicySettings, DatasetSettings
-from py_mtlf.core.accuracy_policy import AccuracyPolicy
+from py_mtlf.core.accuracy_policy import AccuracyPolicy, ScopeReference
 from py_mtlf.core.dataset import (
     AdrfRoute,
     DatasetCoordinator,
@@ -160,6 +160,42 @@ def test_scope_resolution_keeps_all_active_groups_and_peer_identity():
     )
     assert all(resource.identity.startswith("http://smf.example|") for resource in resources)
     coordinator._client.close()
+
+
+def test_training_scope_matches_standard_event_subscription_network_area():
+    tai = {
+        "plmnId": {"mcc": "466", "mnc": "92"},
+        "tac": "000001",
+    }
+    scope = ScopeReference(
+        scope_key="scope-a",
+        consumer_id="",
+        model_ids=(),
+        ml_event="UE_COMMUNICATION",
+        ml_event_filter={"networkArea": {"tais": [tai]}},
+        target_ue={"intGroupIds": ["group-a"]},
+    )
+    subscription = {
+        "eventSubscriptions": [
+            {
+                "event": "UE_COMMUNICATION",
+                "tgtUe": {"intGroupIds": ["group-a"]},
+                "networkArea": {"tais": [tai]},
+            }
+        ]
+    }
+
+    assert DatasetCoordinator._matches_scope(scope, subscription)
+
+    subscription["eventSubscriptions"][0]["networkArea"] = {
+        "tais": [
+            {
+                "plmnId": {"mcc": "466", "mnc": "92"},
+                "tac": "000002",
+            }
+        ]
+    }
+    assert not DatasetCoordinator._matches_scope(scope, subscription)
 
 
 def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
