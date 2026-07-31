@@ -1,9 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
 from py_mtlf.core.model_records import (
+    DurableModelState,
+    DurableModelStateRepository,
     ModelCatalogRecord,
     PendingPublication,
     migrate_seed_catalog,
@@ -24,6 +26,23 @@ def seed_revision(model_id: int, previous: int | None = None) -> dict[str, objec
         "artifactDigest": DIGEST_A,
         "createdAt": datetime.now(UTC),
     }
+
+
+def validation_evidence() -> list[dict[str, object]]:
+    now = datetime.now(UTC)
+    return [
+        {
+            "participant_nf_instance_id": CLIENT_A,
+            "scope_digest": DIGEST_A,
+            "evaluation_sample_count": 10,
+            "start_time": now,
+            "end_time": now + timedelta(seconds=1),
+            "base_model_weights_digest": DIGEST_A,
+            "candidate_weights_digest": DIGEST_A,
+            "base": {"absolute_error_sum": 1, "absolute_actual_sum": 10},
+            "candidate": {"absolute_error_sum": 1, "absolute_actual_sum": 10},
+        }
+    ]
 
 
 def test_seed_migration_builds_first_durable_revision() -> None:
@@ -122,6 +141,7 @@ def test_store_accepted_journal_requires_record_locators() -> None:
         "previousModelId": 1,
         "participantsAndSampleCounts": [{"participantNfInstanceId": CLIENT_A, "sampleCount": 20}],
         "validationSummary": {"globalGateAccepted": True},
+        "validationEvidence": validation_evidence(),
         "candidatePath": "/durable/publication/candidate.tar.gz",
         "candidateDigest": DIGEST_A,
         "finalBundlePath": "/durable/publication/final.tar.gz",
@@ -152,3 +172,26 @@ def test_store_accepted_journal_requires_record_locators() -> None:
             catalog.model_copy(update={"next_model_id": 2}),
             (publication,),
         )
+
+
+def test_durable_model_state_repository_atomically_survives_restart(tmp_path) -> None:
+    catalog = migrate_seed_catalog(
+        model_unique_id=3,
+        artifact_key=DIGEST_A,
+        created_at=datetime.now(UTC),
+    )
+    initial = DurableModelState(
+        schemaVersion="1.0",
+        providerNamespace="provider-a",
+        lastAllocatedModelId=3,
+        families={"family-a": catalog},
+    )
+    repository = DurableModelStateRepository(tmp_path)
+    assert repository.open(initial) == initial
+
+    repository.update(lambda current: current.model_copy(update={"last_allocated_model_id": 10}))
+
+    restored = DurableModelStateRepository(tmp_path).open(initial)
+    assert restored.last_allocated_model_id == 10
+    assert restored.families["family-a"].latest_model_id == 3
+    assert not tuple(tmp_path.glob(".model-state.*"))

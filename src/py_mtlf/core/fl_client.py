@@ -12,6 +12,7 @@ import httpx
 
 from py_mtlf.config import FederatedLearningSettings, NotificationSettings, TrainingSettings
 from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
+from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_workspace import (
@@ -21,7 +22,7 @@ from py_mtlf.core.fl_workspace import (
     weights_digest,
 )
 from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.core.trainer import TrustedBundleLoader
+from py_mtlf.core.trainer import LocalTrainer, TrustedBundleLoader, wape
 from py_mtlf.core.training_data import TrainingDatasetBuilder
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
@@ -49,6 +50,7 @@ class FLClientState(StrEnum):
     PREPARATION_RESULT_PENDING = "PREPARATION_RESULT_PENDING"
     PREPARED = "PREPARED"
     ROUND_RUNNING = "ROUND_RUNNING"
+    VALIDATION_RUNNING = "VALIDATION_RUNNING"
     RESULT_PENDING = "RESULT_PENDING"
     READY = "READY"
     FAILED = "FAILED"
@@ -73,6 +75,7 @@ class FLClientResource:
     prepared_training_sample_count: int = 0
     expected_model_contract_digest: str = ""
     expected_preprocessing_contract_digest: str = ""
+    preparation_base_artifact: ArtifactMetadata | None = None
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -195,6 +198,7 @@ class FLClientService:
             if resource.state in {
                 FLClientState.PREPARING,
                 FLClientState.ROUND_RUNNING,
+                FLClientState.VALIDATION_RUNNING,
                 FLClientState.RESULT_PENDING,
                 FLClientState.PREPARATION_RESULT_PENDING,
             }:
@@ -239,6 +243,7 @@ class FLClientService:
             if set(update) == {"mLTrainRepInfo"} and resource.state in {
                 FLClientState.PREPARING,
                 FLClientState.ROUND_RUNNING,
+                FLClientState.VALIDATION_RUNNING,
             }:
                 resource.representation = value
                 self._schedule_delay(resource)
@@ -259,6 +264,7 @@ class FLClientService:
             if resource.state in {
                 FLClientState.PREPARING,
                 FLClientState.ROUND_RUNNING,
+                FLClientState.VALIDATION_RUNNING,
                 FLClientState.RESULT_PENDING,
                 FLClientState.PREPARATION_RESULT_PENDING,
             }:
@@ -306,6 +312,9 @@ class FLClientService:
         if value.ml_preparation_flag:
             self._start_preparation(resource)
             return
+        if value.ml_accuracy_check_flag is not None or value.skip_fl_indicator is not None:
+            self._start_validation(resource)
+            return
         if value.ml_model_infos and value.round_indicator is not None:
             resource.state = FLClientState.ROUND_RUNNING
             self._schedule_delay(resource)
@@ -314,6 +323,35 @@ class FLClientService:
         resource.state = FLClientState.READY
         self._capacity.release()
         self._outbox_capacity.release()
+
+    def _start_validation(self, resource: FLClientResource) -> None:
+        value = resource.representation
+        violations: list[InvalidParameter] = []
+        if value.ml_accuracy_check_flag is not True:
+            violations.append(InvalidParameter("mLAccChkFlg", "must be true for final validation"))
+        if value.skip_fl_indicator is not True:
+            violations.append(InvalidParameter("skipFlInd", "must be true for final validation"))
+        if value.round_indicator is None:
+            violations.append(InvalidParameter("roundInd", "is required for final validation"))
+        if len(value.ml_model_infos or ()) != 1:
+            violations.append(
+                InvalidParameter(
+                    "mLModelInfos",
+                    "must provide exactly one final candidate for validation",
+                )
+            )
+        if resource.dataset_snapshot is None or resource.preparation_base_artifact is None:
+            violations.append(
+                InvalidParameter(
+                    "mLAccChkFlg",
+                    "requires the frozen preparation dataset and base model",
+                )
+            )
+        if violations:
+            raise RequirementsError(violations)
+        resource.state = FLClientState.VALIDATION_RUNNING
+        self._schedule_delay(resource)
+        self._submit(self._run_validation, resource.subscription_id, resource.revision)
 
     def _start_preparation(self, resource: FLClientResource) -> None:
         value = resource.representation
@@ -376,6 +414,11 @@ class FLClientService:
                 raise RuntimeError("FL preparation base model interoperability is incompatible")
             expected_model_contract = model_contract_digest(base.manifest)
             expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
+            with self._lock:
+                current = self._resources.get(subscription_id)
+                if current is None or current.revision != revision:
+                    return
+                current.preparation_base_artifact = artifact
             job_id = self._datasets.submit_external(
                 intent,
                 window,
@@ -573,6 +616,154 @@ class FLClientService:
         finally:
             self._capacity.release()
 
+    def _run_validation(self, subscription_id: str, revision: int) -> None:
+        try:
+            with self._lock:
+                resource = self._required(subscription_id)
+                if (
+                    resource.revision != revision
+                    or resource.dataset_snapshot is None
+                    or resource.preparation_base_artifact is None
+                ):
+                    raise RuntimeError("final validation has no frozen preparation inputs")
+                value = resource.representation.model_copy(deep=True)
+                snapshot = resource.dataset_snapshot
+                preparation_base_artifact = resource.preparation_base_artifact
+            model_info = value.ml_model_infos[0]
+            if model_info.model_file_address is None:
+                raise RuntimeError("final validation candidate must use mLFileAddr")
+            candidate_artifact = self._workspace.download(
+                str(model_info.model_file_address.model_url),
+                value.ml_correlation_id or subscription_id,
+                f"validation-{value.round_indicator}-candidate",
+            )
+            base = self._loader.load(preparation_base_artifact)
+            candidate = self._loader.load(candidate_artifact)
+            for bundle, label in ((base, "base"), (candidate, "candidate")):
+                if (
+                    model_contract_digest(bundle.manifest)
+                    != resource.expected_model_contract_digest
+                    or preprocessing_contract_digest(bundle.manifest)
+                    != resource.expected_preprocessing_contract_digest
+                ):
+                    raise RuntimeError(f"final validation {label} changed the prepared contract")
+            dataset = self._dataset_builder.build(snapshot, base.manifest)
+            training_sample_count = sum(
+                scope.training_sample_count for scope in dataset.training_scopes
+            )
+            if training_sample_count != resource.prepared_training_sample_count:
+                raise RuntimeError("final validation dataset changed after preparation")
+            base_error = base_actual = candidate_error = candidate_actual = 0.0
+            sample_count = 0
+            for scope in dataset.evaluation_scopes:
+                expected = scope.validation_targets
+                if expected is None:
+                    continue
+                base_metric = wape(
+                    expected,
+                    LocalTrainer._predict(base.model, base.scaler, scope, dataset),
+                )
+                candidate_metric = wape(
+                    expected,
+                    LocalTrainer._predict(
+                        candidate.model,
+                        candidate.scaler,
+                        scope,
+                        dataset,
+                    ),
+                )
+                base_error += base_metric.error_sum
+                base_actual += base_metric.actual_sum
+                candidate_error += candidate_metric.error_sum
+                candidate_actual += candidate_metric.actual_sum
+                sample_count += scope.validation_sample_count
+            if sample_count <= 0 or base_actual <= 0 or candidate_actual <= 0:
+                raise RuntimeError("final validation requires non-zero evaluation evidence")
+            participant_id = self._participant_id()
+            base_digest = weights_digest(base.model)
+            candidate_digest = weights_digest(candidate.model)
+            published = self._workspace.publish(
+                process_id=value.ml_correlation_id or subscription_id,
+                participant_id=participant_id,
+                round_indicator=value.round_indicator or 0,
+                role="ROUND_LOCAL",
+                base=candidate,
+                model=candidate.model,
+                metadata={
+                    "artifact_role": "ROUND_LOCAL",
+                    "result_type": "ACCURACY_CHECK",
+                    "fl_metadata": {
+                        "contract_version": "1.0",
+                        "ml_corre_id": value.ml_correlation_id,
+                        "model_contract_digest": model_contract_digest(candidate.manifest),
+                        "preprocessing_contract_digest": preprocessing_contract_digest(
+                            candidate.manifest
+                        ),
+                        "base_weights_digest": candidate_digest,
+                        "weights_digest": candidate_digest,
+                        "round_ind": value.round_indicator,
+                        "participant_nf_instance_id": participant_id,
+                        "scope_digest": resource.scope.scope_digest,
+                        "input_global_weights_digest": candidate_digest,
+                        "evaluation": {
+                            "evaluation_stage": "FINAL_VALIDATION",
+                            "evaluation_sample_count": sample_count,
+                            "start_time": snapshot.time_window.start_time.isoformat(),
+                            "end_time": snapshot.time_window.stop_time.isoformat(),
+                            "base_model_weights_digest": base_digest,
+                            "candidate_weights_digest": candidate_digest,
+                            "base": {
+                                "absolute_error_sum": base_error,
+                                "absolute_actual_sum": base_actual,
+                            },
+                            "candidate": {
+                                "absolute_error_sum": candidate_error,
+                                "absolute_actual_sum": candidate_actual,
+                            },
+                        },
+                    },
+                },
+            )
+            notification = NwdafMLModelTrainNotif(
+                notifCorreId=value.notification_correlation_id,
+                mlCorreId=value.ml_correlation_id,
+                roundInd=value.round_indicator,
+                mLModelInfos=[
+                    MLEventNotification(
+                        event=value.ml_event_subscriptions[0].ml_event,
+                        mLFileAddr=MLModelAddress(mLModelUrl=published.url),
+                    )
+                ],
+            )
+            with self._lock:
+                current = self._resources.get(subscription_id)
+                if current is None or current.revision != revision:
+                    return
+                current.state = FLClientState.RESULT_PENDING
+                self._cancel_delay(subscription_id)
+            self._enqueue_delivery(current, notification, FLClientState.READY)
+            logger.info(
+                "FL client final validation ready subscription_id=%s round=%s samples=%s",
+                subscription_id,
+                value.round_indicator,
+                sample_count,
+            )
+        except Exception as error:
+            logger.exception(
+                "FL client final validation failed subscription_id=%s",
+                subscription_id,
+            )
+            with self._lock:
+                resource = self._resources.get(subscription_id)
+                if resource is not None:
+                    resource.last_error = str(error)
+                    resource.state = FLClientState.FAILED
+                    self._cancel_delay(subscription_id)
+            if resource is not None:
+                self._enqueue_delivery(resource, _termination(resource), FLClientState.FAILED)
+        finally:
+            self._capacity.release()
+
     def _enqueue_delivery(
         self,
         resource: FLClientResource,
@@ -701,7 +892,12 @@ class FLClientService:
             if (
                 resource is None
                 or resource.revision != revision
-                or resource.state not in {FLClientState.PREPARING, FLClientState.ROUND_RUNNING}
+                or resource.state
+                not in {
+                    FLClientState.PREPARING,
+                    FLClientState.ROUND_RUNNING,
+                    FLClientState.VALIDATION_RUNNING,
+                }
             ):
                 return
             notification = NwdafMLModelTrainNotif(
@@ -709,7 +905,8 @@ class FLClientService:
                 mlCorreId=resource.representation.ml_correlation_id,
                 roundInd=(
                     resource.representation.round_indicator
-                    if resource.state == FLClientState.ROUND_RUNNING
+                    if resource.state
+                    in {FLClientState.ROUND_RUNNING, FLClientState.VALIDATION_RUNNING}
                     else None
                 ),
                 delayEventNotif=DelayEventNotif(

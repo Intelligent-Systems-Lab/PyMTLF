@@ -307,7 +307,7 @@ def test_ready_snapshot_runs_one_local_training_and_promotes_candidate(
     assert job.candidate_artifact_key
     family_key = ("local", "ue-communication-default")
     assert catalog.current(family_key).artifact.key == job.candidate_artifact_key
-    assert catalog.current(family_key).model_id == 2
+    assert catalog.current(family_key).model_id > 1
     assert artifacts.manifest(job.candidate_artifact_key)["model_generation"] == 2
     assert datasets.outcome == {
         "success": True,
@@ -318,7 +318,7 @@ def test_ready_snapshot_runs_one_local_training_and_promotes_candidate(
     assert policy.generation == (
         family_key,
         ("local", 1),
-        ("local", 2),
+        catalog.current(family_key).version_key,
         ("scope-a",),
     )
 

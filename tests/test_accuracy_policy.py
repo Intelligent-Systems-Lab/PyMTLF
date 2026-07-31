@@ -216,6 +216,23 @@ def test_new_generation_uses_registration_as_adoption_evidence():
     assert policy.snapshot()["adoption_count"] == 1
 
 
+def test_restored_generation_keeps_retrain_in_flight_until_cutover_completes():
+    catalog = CatalogStub()
+    policy = AccuracyPolicy(settings(), catalog)
+    family_key = catalog.family_key
+
+    policy.restore_generation(
+        family_key,
+        ("local-mtlf", 1),
+        ("local-mtlf", 2),
+        ("scope-a",),
+    )
+
+    assert family_key in policy.snapshot()["in_flight"]
+    policy.complete_retrain(family_key)
+    assert family_key not in policy.snapshot()["in_flight"]
+
+
 def test_deleting_retired_registration_does_not_remove_adopted_scope():
     catalog = CatalogStub()
     policy = AccuracyPolicy(settings(), catalog)

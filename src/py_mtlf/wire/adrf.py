@@ -78,3 +78,63 @@ class NadrfDataStoreRecord(SpecAlignedModel):
         if bool(self.data_notif.upf_event_notifs) == bool(self.data_notif.smf_event_notifs):
             raise ValueError("exactly one non-empty data notification alternative is required")
         return self
+
+
+class MLModelAddress(SpecAlignedModel):
+    model_url: str | None = Field(default=None, alias="mLModelUrl")
+    file_fqdn: str | None = Field(default=None, alias="mlFileFqdn")
+
+    @model_validator(mode="after")
+    def validate_address(self) -> "MLModelAddress":
+        if bool(self.model_url) == bool(self.file_fqdn):
+            raise ValueError("exactly one of mLModelUrl or mlFileFqdn is required")
+        return self
+
+
+class AllowedConsumer(SpecAlignedModel):
+    nf_instance_id: str | None = Field(default=None, alias="nfInstanceId")
+    nf_set_id: str | None = Field(default=None, alias="nfSetId")
+
+    @model_validator(mode="after")
+    def validate_owner(self) -> "AllowedConsumer":
+        if bool(self.nf_instance_id) == bool(self.nf_set_id):
+            raise ValueError("exactly one of nfInstanceId or nfSetId is required")
+        return self
+
+
+class MLModelInfo(SpecAlignedModel):
+    model_unique_id: int = Field(ge=0, alias="modelUniqueId")
+    model_file_address: MLModelAddress = Field(alias="mlFileAddr")
+    model_storage_size: int = Field(ge=0, alias="mlStorageSize")
+    allowed_consumers: list[AllowedConsumer] = Field(
+        default_factory=list,
+        alias="allowConsumerList",
+    )
+
+
+class ModelStoreResult(SpecAlignedModel):
+    model_unique_id: int = Field(ge=0, alias="modelUniqueId")
+    store_result: str = Field(min_length=1, alias="storeResult")
+
+
+class NadrfMLModelStoreRecord(SpecAlignedModel):
+    nf_instance_id: str | None = Field(default=None, alias="nfInstanceId")
+    nf_set_id: str | None = Field(default=None, alias="nfSetId")
+    ml_model_info: list[MLModelInfo] = Field(
+        default_factory=list,
+        min_length=1,
+        alias="mlModelInfo",
+    )
+    model_store_result: ModelStoreResult | None = Field(
+        default=None,
+        alias="modelStoreResult",
+    )
+    supported_features: str | None = Field(default=None, alias="suppFeat")
+
+    @model_validator(mode="after")
+    def validate_record(self) -> "NadrfMLModelStoreRecord":
+        if bool(self.nf_instance_id) == bool(self.nf_set_id):
+            raise ValueError("exactly one of nfInstanceId or nfSetId is required")
+        if len(self.ml_model_info) != 1:
+            raise ValueError("the current profile requires exactly one URL-backed model")
+        return self

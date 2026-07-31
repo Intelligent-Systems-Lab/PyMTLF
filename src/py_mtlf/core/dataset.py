@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -440,7 +440,7 @@ class DatasetCoordinator:
                 deadline = time.monotonic() + self._settings.watchdog_timeout_seconds
 
     def _fetch_one(self, job: DatasetJob, route: AdrfRoute, api_root: str, fetch_id: str) -> None:
-        url = self._fetch_url(route.fetch_uri, api_root, fetch_id)
+        url = self._fetch_url(api_root, fetch_id)
         last_status = 0
         last_error = ""
         for attempt in range(self._settings.max_retry_attempts):
@@ -491,23 +491,12 @@ class DatasetCoordinator:
             right_url.port,
         )
 
-    def _fetch_url(self, fetch_uri: str, api_root: str, fetch_id: str) -> str:
-        fetch_uri = fetch_uri.strip()
-        parsed = urlsplit(fetch_uri)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise RuntimeError("ADRF fetchUri is not an absolute HTTP(S) URI")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise RuntimeError("ADRF fetchUri contains unsupported URI components")
-        if not self._same_origin(fetch_uri, normalize_api_root(api_root)):
-            raise RuntimeError("ADRF fetchUri is not on the selected ADRF origin")
-        return urlunsplit(
-            (
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                urlencode({"fetch-correlation-ids": fetch_id}),
-                "",
-            )
+    @staticmethod
+    def _fetch_url(api_root: str, fetch_id: str) -> str:
+        return (
+            normalize_api_root(api_root)
+            + "/nadrf-datamanagement/v1/data-store-records?"
+            + urlencode({"fetch-correlation-ids": fetch_id})
         )
 
     def _get_with_same_origin_redirects(self, url: str, api_root: str) -> httpx.Response:

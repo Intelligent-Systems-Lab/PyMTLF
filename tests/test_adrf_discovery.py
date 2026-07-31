@@ -38,6 +38,7 @@ def test_configured_mode_bypasses_go_discovery():
         AdrfSettings(
             mode="configured",
             configured_endpoint="http://adrf.example:9888",
+            configured_nf_instance_id="adrf-a",
         ),
         projection(),
         client,

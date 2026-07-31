@@ -6,6 +6,7 @@ from py_mtlf.core.artifacts import (
     ArtifactRepository,
     InvalidArtifactError,
 )
+from py_mtlf.core.model_records import AdrfReference
 from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.wire.ml_model import MLEventSubscription
 
@@ -145,7 +146,7 @@ def test_catalog_promotes_candidate_with_new_model_identity(
     )
     candidate = repository.publish(candidate_path)
     family_key = ("local", "ue-communication-default")
-    version_key = catalog.reserve_next_version(family_key)
+    version_key = catalog.restore_reserved_version(family_key, 2)
 
     promoted = catalog.promote(
         family_key,
@@ -153,6 +154,11 @@ def test_catalog_promotes_candidate_with_new_model_identity(
         expected_artifact_key=seed.key,
         version_key=version_key,
         artifact=candidate,
+        adrf_reference=AdrfReference(
+            adrfInstanceId="00000000-0000-4000-8000-000000000010",
+            storeTransId="store-2",
+            resourceLocation="http://adrf.example/models/store-2",
+        ),
     )
 
     assert promoted.generation == 2

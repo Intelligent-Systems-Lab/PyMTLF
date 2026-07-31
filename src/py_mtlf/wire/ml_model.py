@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any
 
@@ -38,7 +40,7 @@ class MLModelAddress(StandardModel):
     file_fqdn: str | None = Field(default=None, alias="mlFileFqdn")
 
     @model_validator(mode="after")
-    def validate_address(self) -> "MLModelAddress":
+    def validate_address(self) -> MLModelAddress:
         if (self.model_url is None) == (self.file_fqdn is None or not self.file_fqdn.strip()):
             raise ValueError("exactly one of mLModelUrl or mlFileFqdn is required")
         return self
@@ -49,7 +51,7 @@ class MLEventNotification(StandardModel):
     notification_correlation_id: str | None = Field(default=None, alias="notifCorreId")
     model_file: str | None = Field(default=None, alias="mlFile")
     model_file_address: MLModelAddress | None = Field(default=None, alias="mLFileAddr")
-    model_adrf: dict[str, JsonValue] | None = Field(default=None, alias="mLModelAdrf")
+    model_adrf: MLModelAdrf | None = Field(default=None, alias="mLModelAdrf")
     validity_period: dict[str, JsonValue] | None = Field(default=None, alias="validityPeriod")
     spatial_validity: dict[str, JsonValue] | None = Field(default=None, alias="spatialValidity")
     additional_model_information: list[dict[str, JsonValue]] | None = Field(
@@ -63,10 +65,25 @@ class MLEventNotification(StandardModel):
     target_ue: dict[str, JsonValue] | None = Field(default=None, alias="tgtUe")
 
     @model_validator(mode="after")
-    def validate_delivery(self) -> "MLEventNotification":
+    def validate_delivery(self) -> MLEventNotification:
         if (self.model_file_address is None) == (self.model_adrf is None):
             raise ValueError("exactly one of mLFileAddr or mLModelAdrf is required")
         return self
+
+
+class MLModelAdrf(StandardModel):
+    adrf_id: str | None = Field(default=None, alias="adrfId")
+    adrf_set_id: str | None = Field(default=None, alias="adrfSetId")
+    storage_transaction_id: str | None = Field(default=None, alias="storTransId")
+
+    @model_validator(mode="after")
+    def validate_owner(self) -> MLModelAdrf:
+        if bool(self.adrf_id) == bool(self.adrf_set_id):
+            raise ValueError("exactly one of adrfId or adrfSetId is required")
+        return self
+
+
+MLEventNotification.model_rebuild()
 
 
 class MLModelProvisionSubscription(StandardModel):

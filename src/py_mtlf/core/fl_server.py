@@ -11,17 +11,27 @@ from uuid import uuid4
 
 import httpx
 
-from py_mtlf.config import FederatedLearningSettings
+from py_mtlf.config import FederatedLearningSettings, TrainingSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.federated_trainer import FederatedTrainer
-from py_mtlf.core.fl_artifacts import RoundLocalArtifact, validate_fl_artifact
+from py_mtlf.core.fl_artifacts import (
+    RoundLocalAccuracyCheckMetadata,
+    RoundLocalArtifact,
+    RoundLocalResultType,
+    ValidationSummary,
+    validate_fl_artifact,
+    wape,
+)
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     model_contract_digest,
     preprocessing_contract_digest,
     weights_digest,
 )
+from py_mtlf.core.model_records import ParticipantSampleCount
+from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
+from py_mtlf.core.publication import PublicationCoordinator, ValidatedCandidate
 from py_mtlf.core.seed_catalog import ModelCatalog
 from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
@@ -54,7 +64,14 @@ class FLServerState(StrEnum):
     ROUND_DISPATCH = "ROUND_DISPATCH"
     ROUND_WAITING = "ROUND_WAITING"
     AGGREGATING = "AGGREGATING"
+    FINAL_VALIDATION_DISPATCH = "FINAL_VALIDATION_DISPATCH"
+    FINAL_VALIDATION_WAITING = "FINAL_VALIDATION_WAITING"
+    FINAL_VALIDATION_EVALUATING = "FINAL_VALIDATION_EVALUATING"
+    VALIDATION_REJECTED = "VALIDATION_REJECTED"
     CANDIDATE_READY = "CANDIDATE_READY"
+    PUBLISHING = "PUBLISHING"
+    CUTOVER_PENDING = "CUTOVER_PENDING"
+    COMPLETE = "COMPLETE"
     FAILED = "FAILED"
 
 
@@ -79,6 +96,7 @@ class FLParticipant:
     expected_scope_digest: str = ""
     accepted_notification_digest: str = ""
     accepted_delay_notification_digest: str = ""
+    training_sample_count: int = 0
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -102,6 +120,11 @@ class FLProcess:
     failure: str = ""
     cleanup_failure: str = ""
     base_artifact_key: str = ""
+    validation_summaries: tuple[ValidationSummary, ...] = ()
+    gate_would_accept: bool | None = None
+    gate_rejection_reasons: tuple[str, ...] = ()
+    candidate_artifact: ArtifactMetadata | None = None
+    published_model_id: int | None = None
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -227,6 +250,9 @@ class FLServerOrchestrator:
         workspace: FLWorkspace,
         resolver: FLClientResolver,
         client: httpx.Client | None = None,
+        training_settings: TrainingSettings | None = None,
+        publication: PublicationCoordinator | None = None,
+        provision_notifications: ProvisionNotificationDispatcher | None = None,
     ) -> None:
         self._settings = settings
         self._projection = projection
@@ -234,6 +260,9 @@ class FLServerOrchestrator:
         self._catalog = catalog
         self._workspace = workspace
         self._resolver = resolver
+        self._training_settings = training_settings or TrainingSettings()
+        self._publication = publication
+        self._provision_notifications = provision_notifications
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds, follow_redirects=False
@@ -269,7 +298,14 @@ class FLServerOrchestrator:
             with self._lock:
                 self._processes[process.process_id] = process
                 active = sum(
-                    item.state not in {FLServerState.CANDIDATE_READY, FLServerState.FAILED}
+                    item.state
+                    not in {
+                        FLServerState.CANDIDATE_READY,
+                        FLServerState.VALIDATION_REJECTED,
+                        FLServerState.CUTOVER_PENDING,
+                        FLServerState.COMPLETE,
+                        FLServerState.FAILED,
+                    }
                     for item in self._processes.values()
                 )
                 if active > self._settings.max_active_server_processes:
@@ -326,6 +362,8 @@ class FLServerOrchestrator:
             active_round = process.state in {
                 FLServerState.ROUND_DISPATCH,
                 FLServerState.ROUND_WAITING,
+                FLServerState.FINAL_VALIDATION_DISPATCH,
+                FLServerState.FINAL_VALIDATION_WAITING,
             }
             if (
                 notification.status_report is not None
@@ -387,6 +425,36 @@ class FLServerOrchestrator:
     def processes(self) -> tuple[FLProcess, ...]:
         with self._lock:
             return tuple(self._processes.values())
+
+    def mark_scope_adopted(
+        self,
+        family_key: tuple[str, str],
+        model_id: int,
+        scope_key: str,
+    ) -> bool:
+        if self._publication is None:
+            return False
+        completed = self._publication.mark_scope_adopted(family_key, model_id, scope_key)
+        if not completed:
+            return False
+        with self._lock:
+            process = next(
+                (
+                    item
+                    for item in self._processes.values()
+                    if item.intent.family_key == family_key and item.published_model_id == model_id
+                ),
+                None,
+            )
+        if process is not None:
+            process.state = FLServerState.COMPLETE
+        self._policy.complete_retrain(family_key)
+        logger.info(
+            "Federated model cutover complete model_id=%s family=%s",
+            model_id,
+            family_key,
+        )
+        return True
 
     def _run(self, process: FLProcess) -> None:
         try:
@@ -486,10 +554,85 @@ class FLServerOrchestrator:
                 if process.failure:
                     raise RuntimeError(process.failure)
                 process.candidate_url = process.current_global_url
+            process.state = FLServerState.FINAL_VALIDATION_DISPATCH
+            validation_round = self._settings.round_count
+            for participant in process.participants:
+                participant.expected_round = validation_round
+                participant.notification = None
+                participant.accepted_notification_digest = ""
+                participant.accepted_delay_notification_digest = ""
+                participant.delay_extensions = 0
+                participant.requested_extension = 0
+                participant.granted_extension_seconds = 0
+                self._patch_validation(
+                    process,
+                    participant,
+                    validation_round,
+                    process.candidate_url,
+                )
+            process.state = FLServerState.FINAL_VALIDATION_WAITING
+            self._wait(
+                process,
+                lambda: all(item.notification is not None for item in process.participants),
+                self._settings.round_timeout_seconds,
+            )
+            process.state = FLServerState.FINAL_VALIDATION_EVALUATING
+            self._evaluate_final_validation(process, current.artifact, validation_round)
+            if self._training_settings.enforce_performance_gate and not process.gate_would_accept:
+                process.state = FLServerState.VALIDATION_REJECTED
+                logger.warning(
+                    "Federated candidate rejected process_id=%s reasons=%s",
+                    process.process_id,
+                    process.gate_rejection_reasons,
+                )
+            else:
                 process.state = FLServerState.CANDIDATE_READY
+                if self._publication is not None:
+                    if process.candidate_artifact is None:
+                        raise RuntimeError("validated candidate artifact was not retained")
+                    process.state = FLServerState.PUBLISHING
+                    current_model = self._publication.publish(
+                        ValidatedCandidate(
+                            process_id=process.process_id,
+                            family_key=process.intent.family_key,
+                            base_artifact=current.artifact,
+                            candidate_artifact=process.candidate_artifact,
+                            participants=tuple(
+                                ParticipantSampleCount(
+                                    participantNfInstanceId=(
+                                        participant.candidate.target.nf_instance_id
+                                    ),
+                                    sampleCount=participant.training_sample_count,
+                                )
+                                for participant in sorted(
+                                    process.participants,
+                                    key=lambda item: item.candidate.target.nf_instance_id,
+                                )
+                            ),
+                            validation_summaries=process.validation_summaries,
+                            required_scope_keys=process.intent.active_scope_keys,
+                            gate_would_accept=bool(process.gate_would_accept),
+                            gate_rejection_reasons=process.gate_rejection_reasons,
+                        )
+                    )
+                    process.published_model_id = current_model.model_id
+                    self._policy.begin_generation(
+                        process.intent.family_key,
+                        self._catalog.version_key_for_id(current.model_id),
+                        current_model.version_key,
+                        process.intent.active_scope_keys,
+                    )
+                    if self._provision_notifications is not None:
+                        self._provision_notifications.reconcile_family(process.intent.family_key)
+                    process.state = (
+                        FLServerState.CUTOVER_PENDING
+                        if process.intent.active_scope_keys
+                        else FLServerState.COMPLETE
+                    )
             logger.info(
-                "Federated candidate ready process_id=%s artifact=%s",
+                "Federated final validation complete process_id=%s state=%s artifact=%s",
                 process.process_id,
+                process.state,
                 process.candidate_url,
             )
         except Exception as error:
@@ -509,7 +652,8 @@ class FLServerOrchestrator:
             with self._lock:
                 for participant in process.participants:
                     self._correlations.pop(participant.notification_correlation_id, None)
-            self._policy.complete_retrain(process.intent.family_key)
+            if process.state is not FLServerState.CUTOVER_PENDING:
+                self._policy.complete_retrain(process.intent.family_key)
 
     def _create_preparation(
         self,
@@ -597,6 +741,35 @@ class FLServerOrchestrator:
         )
         if response.status_code not in {200, 204}:
             raise RuntimeError(f"participant round patch failed with {response.status_code}")
+
+    def _patch_validation(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+        round_indicator: int,
+        artifact_url: str,
+    ) -> None:
+        patch = NwdafMLModelTrainSubscPatch(
+            mLAccChkFlg=True,
+            skipFlInd=True,
+            roundInd=round_indicator,
+            mLModelInfos=[
+                MLEventNotification(
+                    event=participant.scope.ml_event,
+                    mLFileAddr=MLModelAddress(mLModelUrl=artifact_url),
+                )
+            ],
+            mLTrainRepInfo=MLTrainReportInfo(maxResTime=self._settings.round_timeout_seconds),
+        )
+        response = self._client.patch(
+            participant.resource_location,
+            headers={"Content-Type": "application/merge-patch+json"},
+            content=patch.model_dump_json(by_alias=True, exclude_none=True),
+        )
+        if response.status_code not in {200, 204}:
+            raise RuntimeError(
+                f"participant final validation patch failed with {response.status_code}"
+            )
 
     def _wait(self, process: FLProcess, predicate, timeout: int) -> None:
         deadline = time.monotonic() + timeout
@@ -711,6 +884,8 @@ class FLServerOrchestrator:
             contract = validate_fl_artifact(projection)
             if not isinstance(contract, RoundLocalArtifact):
                 raise RuntimeError("participant returned a non-local FL artifact")
+            if contract.result_type is not RoundLocalResultType.TRAINING:
+                raise RuntimeError("participant returned a non-training local artifact")
             metadata = contract.fl_metadata
             if (
                 metadata.ml_corre_id != process.process_id
@@ -724,6 +899,7 @@ class FLServerOrchestrator:
             ):
                 raise RuntimeError("participant local artifact identity does not match assignment")
             local_bundles.append((bundle, metadata.training_sample_count))
+            participant.training_sample_count = metadata.training_sample_count
             participant_metadata.append(
                 {
                     "participant_nf_instance_id": metadata.participant_nf_instance_id,
@@ -759,6 +935,134 @@ class FLServerOrchestrator:
             },
         )
         return published.url
+
+    def _evaluate_final_validation(
+        self,
+        process: FLProcess,
+        base_artifact: ArtifactMetadata,
+        round_indicator: int,
+    ) -> None:
+        candidate_artifact = self._workspace.download(
+            process.candidate_url,
+            process.process_id,
+            "final-validation-candidate",
+        )
+        base = self._loader.load(base_artifact)
+        candidate = self._loader.load(candidate_artifact)
+        process.candidate_artifact = candidate_artifact
+        base_digest = weights_digest(base.model)
+        candidate_digest = weights_digest(candidate.model)
+        expected_model_contract = model_contract_digest(base.manifest)
+        expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
+        if (
+            model_contract_digest(candidate.manifest) != expected_model_contract
+            or preprocessing_contract_digest(candidate.manifest) != expected_preprocessing_contract
+        ):
+            raise RuntimeError("final candidate changed the prepared model contract")
+
+        summaries: list[tuple[FLParticipant, ValidationSummary]] = []
+        for participant in process.participants:
+            notification = participant.notification
+            if notification is None or not notification.ml_model_infos:
+                raise RuntimeError("participant final validation result is missing")
+            address = notification.ml_model_infos[0].model_file_address
+            if address is None or address.model_url is None:
+                raise RuntimeError("participant final validation result has no model URL")
+            artifact = self._workspace.download(
+                str(address.model_url),
+                process.process_id,
+                f"validation-{participant.candidate.target.nf_instance_id}",
+            )
+            bundle = self._loader.load(artifact)
+            contract = validate_fl_artifact(_artifact_projection(bundle.manifest))
+            if (
+                not isinstance(contract, RoundLocalArtifact)
+                or contract.result_type is not RoundLocalResultType.ACCURACY_CHECK
+                or not isinstance(contract.fl_metadata, RoundLocalAccuracyCheckMetadata)
+            ):
+                raise RuntimeError("participant returned a non-validation local artifact")
+            metadata = contract.fl_metadata
+            evaluation = metadata.evaluation
+            if (
+                metadata.ml_corre_id != process.process_id
+                or metadata.round_ind != round_indicator
+                or metadata.participant_nf_instance_id
+                != participant.candidate.target.nf_instance_id
+                or metadata.scope_digest != participant.expected_scope_digest
+                or metadata.input_global_weights_digest != candidate_digest
+                or metadata.weights_digest != candidate_digest
+                or weights_digest(bundle.model) != candidate_digest
+                or metadata.model_contract_digest != expected_model_contract
+                or metadata.preprocessing_contract_digest != expected_preprocessing_contract
+                or evaluation.base_model_weights_digest != base_digest
+                or evaluation.candidate_weights_digest != candidate_digest
+            ):
+                raise RuntimeError(
+                    "participant final validation identity does not match assignment"
+                )
+            if (
+                evaluation.base.absolute_actual_sum <= 0
+                or evaluation.candidate.absolute_actual_sum <= 0
+            ):
+                raise RuntimeError("participant final validation has a zero denominator")
+            summaries.append(
+                (
+                    participant,
+                    ValidationSummary(
+                        participant_nf_instance_id=metadata.participant_nf_instance_id,
+                        scope_digest=metadata.scope_digest,
+                        evaluation_sample_count=evaluation.evaluation_sample_count,
+                        start_time=evaluation.start_time,
+                        end_time=evaluation.end_time,
+                        base_model_weights_digest=evaluation.base_model_weights_digest,
+                        candidate_weights_digest=evaluation.candidate_weights_digest,
+                        base=evaluation.base,
+                        candidate=evaluation.candidate,
+                    ),
+                )
+            )
+        summaries.sort(key=lambda item: item[1].participant_nf_instance_id)
+        base_error = sum(item.base.absolute_error_sum for _participant, item in summaries)
+        base_actual = sum(item.base.absolute_actual_sum for _participant, item in summaries)
+        candidate_error = sum(item.candidate.absolute_error_sum for _participant, item in summaries)
+        candidate_actual = sum(
+            item.candidate.absolute_actual_sum for _participant, item in summaries
+        )
+        aggregate_base = base_error / base_actual
+        aggregate_candidate = candidate_error / candidate_actual
+        reasons: list[str] = []
+        triggering = next(
+            (
+                summary
+                for participant, summary in summaries
+                if participant.scope.scope_key == process.intent.triggering_scope_key
+            ),
+            None,
+        )
+        if triggering is None:
+            raise RuntimeError("triggering scope has no final validation evidence")
+        if wape(triggering.candidate) >= wape(triggering.base):
+            reasons.append("triggering_scope_not_improved")
+        if aggregate_candidate >= aggregate_base:
+            reasons.append("aggregate_not_improved")
+        for participant, summary in summaries:
+            if participant.scope.scope_key == process.intent.triggering_scope_key:
+                continue
+            regression = (wape(summary.candidate) or 0.0) - (wape(summary.base) or 0.0)
+            if regression > self._training_settings.max_scope_wape_regression:
+                reasons.append(f"scope_regression_exceeded:{summary.scope_digest}")
+        process.validation_summaries = tuple(item for _participant, item in summaries)
+        process.gate_would_accept = not reasons
+        process.gate_rejection_reasons = tuple(reasons)
+        logger.info(
+            "Federated final validation evaluated process_id=%s "
+            "base_wape=%s candidate_wape=%s gate_would_accept=%s enforced=%s",
+            process.process_id,
+            aggregate_base,
+            aggregate_candidate,
+            process.gate_would_accept,
+            self._training_settings.enforce_performance_gate,
+        )
 
     def _go_base(self) -> str:
         snapshot = self._projection.snapshot()

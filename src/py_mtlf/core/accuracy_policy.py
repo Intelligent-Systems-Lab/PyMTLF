@@ -273,6 +273,24 @@ class AccuracyPolicy:
                 adopted_scope_keys=set(),
             )
 
+    def restore_generation(
+        self,
+        family_key: FamilyKey,
+        previous_version: ModelVersionKey,
+        current_version: ModelVersionKey,
+        expected_scope_keys: tuple[str, ...],
+    ) -> None:
+        """Restore a durable cutover and keep new retraining suppressed."""
+
+        self.begin_generation(
+            family_key,
+            previous_version,
+            current_version,
+            expected_scope_keys,
+        )
+        with self._lock:
+            self._in_flight.add(family_key)
+
     def active_scope_keys(self, family_key: FamilyKey) -> tuple[str, ...]:
         with self._lock:
             return tuple(

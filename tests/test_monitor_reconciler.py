@@ -151,3 +151,50 @@ def test_create_publishes_owner_identity_and_records_owned_projection(settings):
     assert len(restored) == 1
     assert restored[0].owner_registration_id == registration.registration_id
     assert reconciler.owns(registration.registration_id, "monitor-a")
+
+
+def test_newer_model_subscription_retires_old_same_scope_before_deregistration(
+    settings,
+):
+    state_lock = threading.RLock()
+    projection = SyncProjection(state_lock)
+    registrations = MonitorRegistrationStore(state_lock)
+    subscriptions = MonitorSubscriptionProjectionStore(state_lock)
+    old = registrations.create(
+        MLModelMonitorRegistration(
+            consumerId="11111111-1111-4111-8111-111111111111",
+            modelId=100,
+            mLEvent="UE_COMMUNICATION",
+            mLEventFilter={"areaOfInterest": {"tais": [{"plmnId": {"mcc": "001"}}]}},
+        )
+    )
+    reconciler = MonitorSubscriptionReconciler(
+        settings.model_monitor,
+        projection,
+        registrations,
+        subscriptions,
+        resolver(),
+        state_lock,
+    )
+
+    def request(method: str, path: str, **_kwargs) -> httpx.Response:
+        if method == "DELETE":
+            return httpx.Response(status_code=204)
+        registration = old if not reconciler.owns(old.registration_id, "monitor-old") else new
+        accepted = reconciler._subscription_for(registration)
+        suffix = "old" if registration is old else "new"
+        return httpx.Response(
+            status_code=201,
+            headers={"Location": f"http://go.internal/subscriptions/monitor-{suffix}"},
+            json=accepted.model_dump(by_alias=True, exclude_none=True, mode="json"),
+        )
+
+    reconciler._request = Mock(side_effect=request)
+    reconciler._create(old.registration_id)
+    new = registrations.create(old.representation.model_copy(update={"model_id": 200}))
+    reconciler._create(new.registration_id)
+
+    assert reconciler._next_action() == ("delete", old.registration_id)
+    reconciler._delete(old.registration_id)
+    assert reconciler._next_action() is None
+    assert reconciler.owns(new.registration_id, "monitor-new")

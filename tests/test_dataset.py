@@ -286,7 +286,7 @@ def test_ready_snapshot_can_only_be_claimed_once_and_records_terminal_outcome():
     coordinator.shutdown()
 
 
-def test_adrf_fetch_uses_instruction_uri_and_bounded_same_origin_redirect():
+def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():
     policy, intent = retrain_intent()
     projection = SyncProjection()
     projection.replace(sync_snapshot())
@@ -348,15 +348,32 @@ def test_adrf_fetch_uses_instruction_uri_and_bounded_same_origin_redirect():
     client.close()
 
 
-def test_adrf_fetch_rejects_cross_origin_instruction():
+def test_adrf_fetch_does_not_dereference_nonstandard_instruction_uri():
     policy, intent = retrain_intent()
     projection = SyncProjection()
     projection.replace(sync_snapshot())
+    requests: list[str] = []
+    resource = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert resource is not None
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "dataSub": [{"smfDataSub": resource.smf_data_sub}],
+                "dataNotif": {"upfEventNotifs": [{"sample": resource.supi}]},
+            },
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
     coordinator = DatasetCoordinator(
         DatasetSettings(),
         projection,
         policy,
         Mock(close=Mock()),
+        client=client,
     )
     resource = coordinator._resolve(intent, projection.snapshot())[0]
     route = AdrfRoute(
@@ -374,13 +391,14 @@ def test_adrf_fetch_rejects_cross_origin_instruction():
         "adrf",
     )
 
-    try:
-        coordinator._fetch_one(job, route, "http://adrf.example", "fetch-1")
-    except RuntimeError as error:
-        assert "selected ADRF origin" in str(error)
-    else:
-        raise AssertionError("cross-origin fetchUri was accepted")
-    coordinator._client.close()
+    coordinator._fetch_one(job, route, "http://adrf.example", "fetch-1")
+
+    assert requests == [
+        "http://adrf.example/nadrf-datamanagement/v1/data-store-records"
+        "?fetch-correlation-ids=fetch-1"
+    ]
+    assert len(job.records) == 1
+    client.close()
 
 
 def test_adrf_fetch_retries_transport_failure():

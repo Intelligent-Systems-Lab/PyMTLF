@@ -6,6 +6,7 @@ import httpx
 
 from py_mtlf.config import AdrfSettings
 from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.wire.private import SelectedTarget
 
 
 def normalize_api_root(value: str) -> str:
@@ -41,20 +42,44 @@ class AdrfResolver:
         self._client = client or httpx.Client(timeout=settings.discovery_timeout_seconds)
         self._owns_client = client is None
         self._lock = threading.RLock()
-        self._cached: str | None = None
-        self._expires_at = 0.0
+        self._cached: dict[str, tuple[SelectedTarget | None, float]] = {}
 
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
 
     def resolve(self) -> str | None:
+        target = self._resolve_service("nadrf-datamanagement", "data-storage-ind")
+        return target.api_root if target is not None else None
+
+    def resolve_model(self) -> SelectedTarget | None:
+        return self._resolve_service("nadrf-mlmodelmanagement", "ml-model-storage-ind")
+
+    def invalidate(self, service_name: str | None = None) -> None:
+        with self._lock:
+            if service_name is None:
+                self._cached.clear()
+            else:
+                self._cached.pop(service_name, None)
+
+    def _resolve_service(
+        self,
+        service_name: str,
+        capability_indicator: str,
+    ) -> SelectedTarget | None:
         if self._settings.mode == "configured":
-            return self._settings.configured_endpoint
+            return SelectedTarget(
+                nfInstanceId=self._settings.configured_nf_instance_id,
+                nfServiceInstanceId=f"configured-{service_name}",
+                serviceName=service_name,
+                apiRoot=self._settings.configured_endpoint,
+                selectionSource="CONFIG",
+            )
         now = time.monotonic()
         with self._lock:
-            if self._cached is not None and now < self._expires_at:
-                return self._cached
+            cached = self._cached.get(service_name)
+            if cached is not None and now < cached[1]:
+                return cached[0]
         snapshot = self._projection.snapshot()
         if snapshot is None:
             return None
@@ -64,7 +89,8 @@ class AdrfResolver:
             params={
                 "target-nf-type": "ADRF",
                 "requester-nf-type": "NWDAF",
-                "service-names": "nadrf-datamanagement",
+                "service-names": service_name,
+                capability_indicator: "true",
             },
         )
         response.raise_for_status()
@@ -87,7 +113,7 @@ class AdrfResolver:
             )
             for service_id, service in services:
                 if (
-                    service.get("serviceName") != "nadrf-datamanagement"
+                    service.get("serviceName") != service_name
                     or service.get("nfServiceStatus") != "REGISTERED"
                 ):
                     continue
@@ -101,10 +127,22 @@ class AdrfResolver:
                         )
                     )
         candidates.sort()
-        selected = candidates[0][2] if candidates else None
+        selected = (
+            SelectedTarget(
+                nfInstanceId=candidates[0][0],
+                nfServiceInstanceId=(candidates[0][1] or f"{candidates[0][0]}:{service_name}"),
+                serviceName=service_name,
+                apiRoot=candidates[0][2],
+                selectionSource="NRF",
+            )
+            if candidates
+            else None
+        )
         with self._lock:
-            self._cached = selected
-            self._expires_at = now + validity if validity > 0 else now
+            self._cached[service_name] = (
+                selected,
+                now + validity if validity > 0 else now,
+            )
         return selected
 
     @staticmethod

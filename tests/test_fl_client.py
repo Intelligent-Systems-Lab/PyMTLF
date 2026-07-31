@@ -287,6 +287,67 @@ def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
         service.close()
 
 
+def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
+    service = FLClientService(
+        fl_settings(tmp_path),
+        NotificationSettings(),
+        TrainingSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+    )
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 1,
+        }
+    )
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=NwdafMLModelTrainSubsc.model_validate(payload),
+        state=FLClientState.READY,
+        scope=TrainingScopeDescriptor.from_training_request(
+            NwdafMLModelTrainSubsc.model_validate(payload),
+            0,
+        ),
+        dataset_snapshot=Mock(),
+        prepared_training_sample_count=10,
+        expected_model_contract_digest="a" * 64,
+        expected_preprocessing_contract_digest="b" * 64,
+        preparation_base_artifact=Mock(),
+    )
+    service._resources[resource.subscription_id] = resource
+    service._submit = Mock()
+    service._trainer = Mock()
+    try:
+        updated = service.patch(
+            resource.subscription_id,
+            NwdafMLModelTrainSubscPatch.model_validate(
+                {
+                    "mLAccChkFlg": True,
+                    "skipFlInd": True,
+                    "roundInd": 2,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://server.example/final-candidate.tar.gz"
+                            },
+                        }
+                    ],
+                }
+            ),
+        )
+
+        assert updated.state is FLClientState.VALIDATION_RUNNING
+        submitted = service._submit.call_args.args
+        assert submitted[0].__name__ == "_run_validation"
+        service._trainer.train.assert_not_called()
+    finally:
+        service.close()
+
+
 def test_round_termination_preserves_round_identity():
     resource = Mock()
     resource.representation.notification_correlation_id = "round-client-a"

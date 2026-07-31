@@ -9,6 +9,8 @@ import pytest
 from py_mtlf.config import (
     ArtifactSettings,
     FederatedLearningSettings,
+    ModelStateSettings,
+    PublicationSettings,
     Settings,
     StorageSettings,
 )
@@ -74,6 +76,8 @@ def settings(tmp_path: Path) -> Settings:
         storage=StorageSettings(
             artifact_root=tmp_path / "artifacts",
         ),
+        model_state=ModelStateSettings(directory=tmp_path / "model-state"),
+        publication=PublicationSettings(directory=tmp_path / "publications"),
         artifact=ArtifactSettings(public_base_url="http://127.0.0.1:9092"),
         federated_learning=FederatedLearningSettings(
             workspace_root=tmp_path / "fl-workspaces",

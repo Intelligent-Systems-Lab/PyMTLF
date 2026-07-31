@@ -215,6 +215,8 @@ class FLWorkspace:
             }
             if "result_type" in manifest:
                 projection["result_type"] = manifest["result_type"]
+            if "model_identity" in manifest:
+                projection["model_identity"] = manifest["model_identity"]
             validate_fl_artifact(projection)
             files = {
                 "config.json": json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),

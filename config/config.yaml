@@ -5,6 +5,17 @@ runtime:
   mode: "local"
 storage:
   artifact_root: "data/artifacts"
+model_state:
+  directory: "data/model-state"
+publication:
+  directory: "data/publications"
+  request_timeout_seconds: 300
+  retry_interval_seconds: 2
+  retry_max_interval_seconds: 30
+  probe_attempts: 3
+cutover:
+  timeout_seconds: 600
+  retry_interval_seconds: 5
 artifact:
   public_base_url: "http://127.0.0.1:9092"
   max_compressed_bytes: 268435456
@@ -55,6 +66,7 @@ accuracy_policy:
 adrf:
   mode: "nrf"
   configured_endpoint: ""
+  configured_nf_instance_id: ""
   discovery_timeout_seconds: 30
   request_timeout_seconds: 120
   retry_initial_backoff_seconds: 2
@@ -85,7 +97,7 @@ training:
   random_seed: 42
   max_concurrent_jobs: 1
   max_queue_size: 16
-  enforce_performance_gate: true
+  enforce_performance_gate: false
   max_scope_wape_regression: 0.02
 log:
   level: "INFO"

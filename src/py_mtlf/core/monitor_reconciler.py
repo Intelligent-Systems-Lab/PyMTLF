@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from time import monotonic
 from urllib.parse import urlsplit
@@ -18,6 +19,7 @@ from py_mtlf.core.monitor_store import (
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.wire.ml_model_monitor import (
+    MLModelMonitorRegistration,
     MLModelMonitorSubscription,
     MonitorReportingRequirement,
 )
@@ -32,6 +34,7 @@ class PreparedMonitorRestore:
     orphan_subscription_ids: frozenset[str]
     correlation_ids: dict[str, str] = field(default_factory=dict)
     selected_targets: dict[str, SelectedTarget] = field(default_factory=dict)
+    retired_registration_ids: frozenset[str] = frozenset()
 
 
 class MonitorSubscriptionReconciler:
@@ -43,17 +46,20 @@ class MonitorSubscriptionReconciler:
         subscriptions: MonitorSubscriptionProjectionStore,
         resolver: NwdafMonitorResolver,
         state_lock=None,
+        on_subscription_created: Callable[[MLModelMonitorRegistration], None] | None = None,
     ) -> None:
         self._settings = settings
         self._projection = projection
         self._registrations = registrations
         self._subscriptions = subscriptions
         self._resolver = resolver
+        self._on_subscription_created = on_subscription_created or (lambda _registration: None)
         self._condition = threading.Condition(state_lock or threading.RLock())
         self._subscription_ids: dict[str, str] = {}
         self._orphan_subscription_ids: set[str] = set()
         self._correlation_ids: dict[str, str] = {}
         self._selected_targets: dict[str, SelectedTarget] = {}
+        self._retired_registration_ids: set[str] = set()
         self._closing = False
         self._worker: threading.Thread | None = None
         self._session = httpx.Client()
@@ -122,11 +128,26 @@ class MonitorSubscriptionReconciler:
                         selected_targets[registration.registration_id] = candidate.selected_target
                     available.pop(index)
                     break
+        newest_by_scope: dict[str, MonitorRegistrationResource] = {}
+        retired: set[str] = set()
+        for registration in registrations:
+            scope_key = self._registration_scope_key(registration.representation)
+            newest = newest_by_scope.get(scope_key)
+            if (
+                newest is None
+                or registration.representation.model_id > newest.representation.model_id
+            ):
+                if newest is not None:
+                    retired.add(newest.registration_id)
+                newest_by_scope[scope_key] = registration
+            else:
+                retired.add(registration.registration_id)
         return PreparedMonitorRestore(
             subscription_ids=restored,
             orphan_subscription_ids=frozenset(candidate.subscription_id for candidate in available),
             correlation_ids=correlation_ids,
             selected_targets=selected_targets,
+            retired_registration_ids=frozenset(retired),
         )
 
     def commit_restore(self, prepared: PreparedMonitorRestore) -> None:
@@ -135,6 +156,7 @@ class MonitorSubscriptionReconciler:
             self._orphan_subscription_ids = set(prepared.orphan_subscription_ids)
             self._correlation_ids = dict(prepared.correlation_ids)
             self._selected_targets = dict(prepared.selected_targets)
+            self._retired_registration_ids = set(prepared.retired_registration_ids)
 
     def finalize_restore(self) -> None:
         with self._condition:
@@ -187,7 +209,13 @@ class MonitorSubscriptionReconciler:
     def _next_action(self) -> tuple[str, str] | None:
         if self._orphan_subscription_ids:
             return "delete_orphan", min(self._orphan_subscription_ids)
-        desired = {resource.registration_id for resource in self._registrations.snapshot()}
+        resources = self._registrations.snapshot()
+        available = {resource.registration_id for resource in resources}
+        self._retired_registration_ids.intersection_update(available)
+        for registration_id in sorted(self._retired_registration_ids):
+            if registration_id in self._subscription_ids:
+                return "delete", registration_id
+        desired = available - self._retired_registration_ids
         for registration_id in sorted(desired):
             if registration_id not in self._subscription_ids:
                 return "create", registration_id
@@ -252,6 +280,9 @@ class MonitorSubscriptionReconciler:
                     registration_id,
                     accepted.notification_id,
                 )
+                self._on_subscription_created(registration)
+                self._retire_older_scope_registrations(resource)
+                self._condition.notify_all()
                 return
         self._delete_remote(subscription_id)
 
@@ -271,6 +302,20 @@ class MonitorSubscriptionReconciler:
             subscription_id,
             registration_id,
         )
+
+    def _retire_older_scope_registrations(
+        self,
+        current: MonitorRegistrationResource,
+    ) -> None:
+        scope_key = self._registration_scope_key(current.representation)
+        current_model_id = current.representation.model_id
+        for candidate in self._registrations.snapshot():
+            if (
+                candidate.registration_id != current.registration_id
+                and candidate.representation.model_id < current_model_id
+                and self._registration_scope_key(candidate.representation) == scope_key
+            ):
+                self._retired_registration_ids.add(candidate.registration_id)
 
     def _delete_orphan(self, subscription_id: str) -> None:
         self._delete_remote(subscription_id)
@@ -347,4 +392,20 @@ class MonitorSubscriptionReconciler:
                 separators=(",", ":"),
             )
             for field in fields
+        )
+
+    @staticmethod
+    def _registration_scope_key(
+        registration: MLModelMonitorRegistration,
+    ) -> str:
+        return json.dumps(
+            {
+                "consumerId": registration.consumer_id,
+                "consumerSetId": registration.consumer_set_id,
+                "mLEvent": registration.ml_event,
+                "mLEventFilter": registration.ml_event_filter or {},
+                "tgtUe": registration.target_ue,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         )

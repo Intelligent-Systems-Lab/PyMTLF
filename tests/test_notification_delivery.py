@@ -10,6 +10,7 @@ from py_mtlf.config import (
     SeedModelSettings,
 )
 from py_mtlf.core.artifacts import ArtifactRepository
+from py_mtlf.core.model_records import AdrfReference
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.seed_catalog import ModelCatalog
@@ -129,13 +130,18 @@ def test_retry_coalesces_to_latest_promoted_artifact(
     assert first_started.wait(timeout=2)
 
     family_key = ("local", "ue-communication-default")
-    version_key = catalog.reserve_next_version(family_key)
+    version_key = catalog.restore_reserved_version(family_key, 2)
     promoted = catalog.promote(
         family_key,
         expected_generation=1,
         expected_artifact_key=seed.key,
         version_key=version_key,
         artifact=candidate,
+        adrf_reference=AdrfReference(
+            adrfInstanceId="00000000-0000-4000-8000-000000000010",
+            storeTransId="store-2",
+            resourceLocation="http://adrf.example/models/store-2",
+        ),
     )
     assert dispatcher.reconcile_family(family_key) == 1
     allow_first.set()
@@ -146,7 +152,10 @@ def test_retry_coalesces_to_latest_promoted_artifact(
     assert len(requests) == 2
     latest = requests[-1][0]["eventNotifs"][0]
     assert latest["modelUniqueId"] == 2
-    assert latest["mLFileAddr"]["mLModelUrl"] == candidate.url
+    assert latest["mLModelAdrf"] == {
+        "adrfId": "00000000-0000-4000-8000-000000000010",
+        "storTransId": "store-2",
+    }
     assert delivered == [(family_key,)]
 
 

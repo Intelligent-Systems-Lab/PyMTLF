@@ -174,7 +174,23 @@ For each accepted SMF collection resource it creates a Release 18-shaped
 retrieval subscription through Go, accepts complete callbacks on the endpoint
 listed above, and directly issues
 `GET /nadrf-datamanagement/v1/data-store-records?fetch-correlation-ids=...`.
-Go never receives dataset bytes. The workspace ADRF V0 terminal callback with
+The request carries the complete synchronized `dataSub` plus the requested
+`timePeriod`. The workspace ADRF V0 currently selects records using only
+`dataSub.smfDataSub.supi`, the time window, and the subscription snapshot
+cutoff; it does not structurally match `notifId`, `notifUri`, or the complete
+`eventSubs` value.
+
+One callback may contain multiple `fetchCorrIds`. The current interoperability
+profile fetches them sequentially, with one identifier in each collection GET,
+and expects one `NadrfDataStoreRecord` response. The Release 18 query parameter
+can represent multiple identifiers, so this is an ADRF V0 profile restriction
+rather than a standard cardinality restriction.
+
+The retrieval target is built from the selected ADRF API root; the callback's
+mandatory `fetchUri` is not dereferenced because TS 29.575 defines the
+`data-store-records` resource and notes that this URI is not needed by the
+consumer for ADRF retrieval. Go never receives dataset bytes. The workspace
+ADRF V0 terminal callback with
 an empty ID list is accepted only when `terminationReq=true`; it produces a
 zero-data result and does not relax the required-scope completeness rule.
 

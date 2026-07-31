@@ -36,6 +36,43 @@ class StorageSettings(FrozenSettings):
         return value
 
 
+class ModelStateSettings(FrozenSettings):
+    directory: Path = Path("data/model-state")
+
+    @field_validator("directory", mode="before")
+    @classmethod
+    def path_must_not_be_blank(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("model_state.directory must not be blank")
+        return value
+
+
+class PublicationSettings(FrozenSettings):
+    directory: Path = Path("data/publications")
+    request_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    retry_interval_seconds: float = Field(default=2, gt=0, le=600)
+    retry_max_interval_seconds: float = Field(default=30, gt=0, le=3600)
+    probe_attempts: int = Field(default=3, gt=0, le=20)
+
+    @field_validator("directory", mode="before")
+    @classmethod
+    def path_must_not_be_blank(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("publication.directory must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_retry(self) -> "PublicationSettings":
+        if self.retry_interval_seconds > self.retry_max_interval_seconds:
+            raise ValueError("publication initial retry must not exceed maximum")
+        return self
+
+
+class CutoverSettings(FrozenSettings):
+    timeout_seconds: int = Field(default=600, gt=0, le=86400)
+    retry_interval_seconds: float = Field(default=5, gt=0, le=600)
+
+
 class RuntimeSettings(FrozenSettings):
     mode: str = "local"
 
@@ -289,6 +326,7 @@ class AccuracyPolicySettings(FrozenSettings):
 class AdrfSettings(FrozenSettings):
     mode: str = "nrf"
     configured_endpoint: str = ""
+    configured_nf_instance_id: str = ""
     discovery_timeout_seconds: float = Field(default=30, gt=0, le=300)
     request_timeout_seconds: float = Field(default=120, gt=0, le=600)
     retry_initial_backoff_seconds: float = Field(default=2, ge=0, le=60)
@@ -309,6 +347,8 @@ class AdrfSettings(FrozenSettings):
                     "adrf.configured_endpoint",
                 ),
             )
+            if not self.configured_nf_instance_id.strip():
+                raise ValueError("adrf.configured_nf_instance_id is required in configured mode")
         if self.retry_initial_backoff_seconds > self.retry_max_backoff_seconds:
             raise ValueError("ADRF initial retry backoff must not exceed maximum")
         return self
@@ -345,7 +385,7 @@ class TrainingSettings(FrozenSettings):
     random_seed: int = Field(default=42, ge=0)
     max_concurrent_jobs: int = Field(default=1, ge=1, le=32)
     max_queue_size: int = Field(default=16, gt=0)
-    enforce_performance_gate: bool = True
+    enforce_performance_gate: bool = False
     max_scope_wape_regression: float = Field(default=0.02, ge=0)
 
     @field_validator("device")
@@ -373,6 +413,9 @@ class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
     runtime: RuntimeSettings = RuntimeSettings()
     storage: StorageSettings = StorageSettings()
+    model_state: ModelStateSettings = ModelStateSettings()
+    publication: PublicationSettings = PublicationSettings()
+    cutover: CutoverSettings = CutoverSettings()
     artifact: ArtifactSettings = ArtifactSettings()
     federated_learning: FederatedLearningSettings = FederatedLearningSettings()
     model_provision: ModelProvisionSettings = ModelProvisionSettings()

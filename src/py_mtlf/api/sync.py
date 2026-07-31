@@ -55,6 +55,21 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
         for resource in prepared_registrations.values():
             request.app.state.accuracy_policy.record_registration(resource.representation)
 
+    request.app.state.publication.resume()
+    for registration_id in prepared_monitor_restore.subscription_ids:
+        resource = prepared_registrations.get(registration_id)
+        if resource is None:
+            continue
+        registration = resource.representation
+        family_key = request.app.state.model_catalog.family_for_version(
+            request.app.state.model_catalog.version_key_for_id(registration.model_id)
+        )
+        if family_key is not None:
+            request.app.state.fl_server.mark_scope_adopted(
+                family_key,
+                registration.model_id,
+                request.app.state.accuracy_policy.registration_scope_key(registration),
+            )
     for resource in restored:
         request.app.state.provision_notifications.enqueue(resource)
     request.app.state.monitor_reconciler.finalize_restore()

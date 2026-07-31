@@ -3,6 +3,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,6 +28,13 @@ from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.fl_client import FLClientService
 from py_mtlf.core.fl_server import FLClientResolver, FLServerOrchestrator
 from py_mtlf.core.fl_workspace import FLWorkspace
+from py_mtlf.core.model_records import (
+    CompletedRevision,
+    DurableModelState,
+    DurableModelStateRepository,
+    ModelCatalogRecord,
+    RevisionOrigin,
+)
 from py_mtlf.core.monitor_reconciler import MonitorSubscriptionReconciler
 from py_mtlf.core.monitor_store import (
     MonitorRegistrationStore,
@@ -35,6 +43,7 @@ from py_mtlf.core.monitor_store import (
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
+from py_mtlf.core.publication import PublicationCoordinator
 from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.core.training_jobs import TrainingCoordinator
@@ -69,6 +78,7 @@ def create_app(
         artifact_repository,
         state_lock,
     )
+    model_state = DurableModelStateRepository(settings.model_state.directory, state_lock)
     accuracy_policy = AccuracyPolicy(
         settings.accuracy_policy,
         seed_catalog,
@@ -83,6 +93,46 @@ def create_app(
     sync_projection = SyncProjection(state_lock)
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
+    adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
+    fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
+
+    def resume_published_cutover(publication_record, model) -> None:
+        family_key = seed_catalog.family_key_for_id(publication_record.family_id)
+        if publication_record.previous_model_id is not None:
+            accuracy_policy.restore_generation(
+                family_key,
+                seed_catalog.version_key_for_id(publication_record.previous_model_id),
+                model.version_key,
+                publication_record.required_cutover_scopes,
+            )
+        provision_notifications.reconcile_family(family_key)
+        if not publication_record.required_cutover_scopes:
+            accuracy_policy.complete_retrain(family_key)
+
+    publication = PublicationCoordinator(
+        settings.publication,
+        model_state,
+        seed_catalog,
+        artifact_repository,
+        fl_workspace,
+        adrf_resolver,
+        sync_projection,
+        on_published=resume_published_cutover,
+    )
+    fl_server_holder: dict[str, FLServerOrchestrator] = {}
+
+    def monitor_subscription_created(registration) -> None:
+        family_key = seed_catalog.family_for_version(
+            seed_catalog.version_key_for_id(registration.model_id)
+        )
+        server = fl_server_holder.get("server")
+        if family_key is not None and server is not None:
+            server.mark_scope_adopted(
+                family_key,
+                registration.model_id,
+                AccuracyPolicy.registration_scope_key(registration),
+            )
+
     nwdaf_monitor_resolver = NwdafMonitorResolver(
         settings.model_monitor,
         sync_projection,
@@ -94,8 +144,8 @@ def create_app(
         monitor_subscriptions,
         nwdaf_monitor_resolver,
         state_lock,
+        on_subscription_created=monitor_subscription_created,
     )
-    adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
     dataset_coordinator = DatasetCoordinator(
         settings.dataset,
         sync_projection,
@@ -111,7 +161,6 @@ def create_app(
         provision_notifications,
         accuracy_policy,
     )
-    fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
     fl_client_resolver = FLClientResolver(
         settings.federated_learning,
         sync_projection,
@@ -131,7 +180,11 @@ def create_app(
         seed_catalog,
         fl_workspace,
         fl_client_resolver,
+        training_settings=settings.training,
+        publication=publication,
+        provision_notifications=provision_notifications,
     )
+    fl_server_holder["server"] = fl_server
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -142,6 +195,9 @@ def create_app(
             fl_workspace.open()
             artifact_repository.open()
             seed_catalog.open()
+            durable_state = model_state.open(_initial_model_state(seed_catalog))
+            seed_catalog.restore(durable_state)
+            publication.open()
             if settings.runtime.mode in {"local", "fl_server"}:
                 provision_notifications.open()
                 monitor_reconciler.open()
@@ -155,9 +211,11 @@ def create_app(
             if settings.runtime.mode == "local":
                 training_coordinator.shutdown()
             fl_client.close()
+            publication.close()
             fl_server.close()
             fl_workspace.close()
             dataset_coordinator.shutdown()
+            adrf_resolver.close()
             if settings.runtime.mode in {"local", "fl_server"}:
                 monitor_reconciler.shutdown()
                 provision_notifications.shutdown()
@@ -172,6 +230,7 @@ def create_app(
     app.state.artifacts = artifact_repository
     app.state.seed_catalog = seed_catalog
     app.state.model_catalog = seed_catalog
+    app.state.model_state = model_state
     app.state.provision_store = provision_store
     app.state.provision_notifications = provision_notifications
     app.state.sync_projection = sync_projection
@@ -185,6 +244,7 @@ def create_app(
     app.state.fl_workspace = fl_workspace
     app.state.fl_client = fl_client
     app.state.fl_server = fl_server
+    app.state.publication = publication
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
@@ -240,3 +300,38 @@ def _prepare_workspace(root: Path) -> None:
         raise RuntimeError(f"federated learning workspace is not writable: {root}") from error
     finally:
         probe.unlink(missing_ok=True)
+
+
+def _initial_model_state(catalog: SeedCatalog) -> DurableModelState:
+    families: dict[str, ModelCatalogRecord] = {}
+    allocated = 0
+    for model in catalog.snapshot():
+        manifest = catalog.artifact_manifest(model.artifact.key)
+        created_value = manifest.get("created_at")
+        try:
+            created_at = datetime.fromisoformat(str(created_value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            created_at = datetime.now(UTC)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        revision = CompletedRevision(
+            modelUniqueId=model.model_id,
+            origin=RevisionOrigin.SEED,
+            artifactKey=model.artifact.key,
+            artifactDigest=model.artifact.key,
+            createdAt=created_at,
+            generation=model.generation,
+        )
+        families[model.descriptor.family_id] = ModelCatalogRecord(
+            schemaVersion="1.0",
+            latestModelId=model.model_id,
+            nextModelId=model.model_id + 1,
+            revisions=(revision,),
+        )
+        allocated = max(allocated, model.model_id)
+    return DurableModelState(
+        schemaVersion="1.0",
+        providerNamespace=catalog.provider_namespace,
+        lastAllocatedModelId=allocated,
+        families=families,
+    )

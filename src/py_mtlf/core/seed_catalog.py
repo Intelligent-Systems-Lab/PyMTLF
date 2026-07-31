@@ -1,10 +1,17 @@
 import json
 import threading
+import time
 from dataclasses import dataclass
 
 from py_mtlf.config import ModelProvisionSettings, SeedModelSettings
 from py_mtlf.core.artifacts import ArtifactMetadata, ArtifactRepository, InvalidArtifactError
-from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription, MLModelAddress
+from py_mtlf.core.model_records import AdrfReference, DurableModelState, PublicationState
+from py_mtlf.wire.ml_model import (
+    MLEventNotification,
+    MLEventSubscription,
+    MLModelAddress,
+    MLModelAdrf,
+)
 
 FamilyKey = tuple[str, str]
 ModelVersionKey = tuple[str, int]
@@ -21,19 +28,26 @@ class CatalogModel:
     descriptor: SeedModelSettings
     artifact: ArtifactMetadata
     generation: int
+    adrf_reference: AdrfReference | None = None
 
     @property
     def model_id(self) -> int:
         return self.version_key[1]
 
     def event_notification(self, correlation_id: str) -> MLEventNotification:
-        values = {
+        values: dict[str, object] = {
             "event": self.descriptor.event,
-            "mLFileAddr": MLModelAddress(mLModelUrl=self.artifact.url),
             "modelUniqueId": self.model_id,
             "mLEventFilter": self.descriptor.event_filter,
             "tgtUe": self.descriptor.target_ue,
         }
+        if self.adrf_reference is None:
+            values["mLFileAddr"] = MLModelAddress(mLModelUrl=self.artifact.url)
+        else:
+            values["mLModelAdrf"] = MLModelAdrf(
+                adrfId=self.adrf_reference.adrf_instance_id,
+                storTransId=self.adrf_reference.store_trans_id,
+            )
         if correlation_id:
             values["notifCorreId"] = correlation_id
         if self.descriptor.use_case_context:
@@ -110,6 +124,59 @@ class ModelCatalog:
                 + 1
             )
 
+    def restore(self, state: DurableModelState) -> None:
+        if state.provider_namespace != self.provider_namespace:
+            raise StaleCatalogError("durable model provider namespace changed")
+        descriptors = {item.family_id: item for item in self._settings.seed_models}
+        if set(state.families) != set(descriptors):
+            raise StaleCatalogError("durable model families do not match configured families")
+        current: dict[FamilyKey, CatalogModel] = {}
+        versions: dict[ModelVersionKey, VersionIndexEntry] = {}
+        for family_id, record in state.families.items():
+            descriptor = descriptors[family_id]
+            family_key = self.family_key_for_id(family_id)
+            for revision in record.revisions:
+                metadata = self._artifacts.metadata(revision.artifact_key)
+                manifest = self._artifacts.manifest(revision.artifact_key)
+                self._validate_manifest(descriptor, revision.model_unique_id, manifest)
+                version_key = self.version_key_for_id(revision.model_unique_id)
+                is_current = revision.model_unique_id == record.latest_model_id
+                versions[version_key] = VersionIndexEntry(
+                    family_key=family_key,
+                    generation=revision.generation,
+                    artifact_key=metadata.key,
+                    current=is_current,
+                )
+                if is_current:
+                    current[family_key] = CatalogModel(
+                        family_key=family_key,
+                        version_key=version_key,
+                        descriptor=descriptor,
+                        artifact=metadata,
+                        generation=revision.generation,
+                        adrf_reference=revision.adrf_reference,
+                    )
+        reserved = {
+            item.reserved_model_id
+            for item in state.pending_publications
+            if item.state
+            not in {
+                PublicationState.CATALOG_COMMITTED,
+                PublicationState.CUTOVER_PENDING,
+                PublicationState.COMPLETE,
+                PublicationState.FAILED_TERMINAL,
+            }
+        }
+        with self._lock:
+            self._current_by_family = current
+            self._version_index = versions
+            self._reserved_ids = reserved
+            self._tombstoned_ids = set(state.tombstoned_model_ids)
+            self._next_model_id = max(
+                state.last_allocated_model_id + 1,
+                int(time.time() * 1000),
+            )
+
     def family_key_for_id(self, family_id: str) -> FamilyKey:
         return self._settings.provider_namespace, family_id
 
@@ -172,6 +239,9 @@ class ModelCatalog:
         with self._lock:
             return tuple(self._current_by_family[key] for key in sorted(self._current_by_family))
 
+    def artifact_manifest(self, artifact_key: str) -> dict[str, object]:
+        return self._artifacts.manifest(artifact_key)
+
     def notifications(
         self,
         family_keys: tuple[FamilyKey | None, ...],
@@ -189,6 +259,7 @@ class ModelCatalog:
         with self._lock:
             if family_key not in self._current_by_family:
                 raise StaleCatalogError("model family no longer exists in current catalog")
+            self._next_model_id = max(self._next_model_id, int(time.time() * 1000))
             while (
                 self._next_model_id in self._reserved_ids
                 or self._next_model_id in self._tombstoned_ids
@@ -199,6 +270,17 @@ class ModelCatalog:
             self._next_model_id += 1
             self._reserved_ids.add(model_id)
             return self.version_key_for_id(model_id)
+
+    def restore_reserved_version(self, family_key: FamilyKey, model_id: int) -> ModelVersionKey:
+        with self._lock:
+            if family_key not in self._current_by_family:
+                raise StaleCatalogError("model family no longer exists in current catalog")
+            version_key = self.version_key_for_id(model_id)
+            if version_key in self._version_index or model_id in self._tombstoned_ids:
+                raise StaleCatalogError("durable reserved model ID is already unavailable")
+            self._reserved_ids.add(model_id)
+            self._next_model_id = max(self._next_model_id, model_id + 1)
+            return version_key
 
     def observe_external_model_ids(self, model_ids: set[int]) -> None:
         """Reserve restored IDs without guessing which family owned unknown versions."""
@@ -217,6 +299,7 @@ class ModelCatalog:
         expected_artifact_key: str,
         version_key: ModelVersionKey,
         artifact: ArtifactMetadata,
+        adrf_reference: AdrfReference | None = None,
     ) -> CatalogModel:
         manifest = self._artifacts.manifest(artifact.key)
         with self._lock:
@@ -245,6 +328,7 @@ class ModelCatalog:
                 descriptor=current.descriptor,
                 artifact=artifact,
                 generation=expected_generation + 1,
+                adrf_reference=adrf_reference,
             )
             previous = self._version_index[current.version_key]
             self._version_index[current.version_key] = VersionIndexEntry(

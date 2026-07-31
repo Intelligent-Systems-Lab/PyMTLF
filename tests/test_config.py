@@ -105,6 +105,7 @@ def test_adrf_configured_endpoint_is_normalized():
     settings = AdrfSettings(
         mode="configured",
         configured_endpoint="http://adrf.example:9888/",
+        configured_nf_instance_id="00000000-0000-4000-8000-000000000010",
     )
 
     assert settings.configured_endpoint == "http://adrf.example:9888"
