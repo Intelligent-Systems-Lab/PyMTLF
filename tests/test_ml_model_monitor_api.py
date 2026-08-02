@@ -33,12 +33,11 @@ def monitor_subscription() -> MLModelMonitorSubscription:
 
 
 class CatalogStub:
-    provider_namespace = "local-mtlf"
-    family_key = ("local-mtlf", "ue-communication-default")
-    version_key = ("local-mtlf", 1)
+    family_key = "ue-communication-default"
+    version_key = 1
 
     def version_key_for_id(self, model_id):
-        return self.provider_namespace, model_id
+        return model_id
 
     def family_for_version(self, version_key):
         return self.family_key if version_key == self.version_key else None

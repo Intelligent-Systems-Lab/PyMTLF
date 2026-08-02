@@ -92,7 +92,6 @@ def test_sync_restores_provision_resources_and_reconciles_seed(
     seeded = settings.model_copy(
         update={
             "model_provision": ModelProvisionSettings(
-                provider_namespace="local",
                 seed_models=(
                     SeedModelSettings(
                         family_id="ue-communication-default",

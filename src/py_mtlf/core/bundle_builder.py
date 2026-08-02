@@ -40,10 +40,7 @@ class CandidateBundleBuilder:
         model_source_path.write_bytes(result.model_source)
 
         manifest = result.manifest
-        manifest["model_identity"] = {
-            "provider_id": model_version_key[0],
-            "model_unique_id": model_version_key[1],
-        }
+        manifest["model_identity"] = {"model_unique_id": model_version_key}
         manifest["model_generation"] = generation
         manifest["parent_artifact_key"] = parent_artifact_key
         manifest["created_at"] = snapshot.time_window.stop_time.isoformat()

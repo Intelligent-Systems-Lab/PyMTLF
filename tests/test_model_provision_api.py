@@ -19,7 +19,6 @@ def _seeded_app(settings, bundle_path):
     seeded = settings.model_copy(
         update={
             "model_provision": ModelProvisionSettings(
-                provider_namespace="local",
                 seed_models=(
                     SeedModelSettings(
                         family_id="ue-communication-default",

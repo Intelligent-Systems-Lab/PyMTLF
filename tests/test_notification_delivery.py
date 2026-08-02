@@ -38,7 +38,6 @@ def seeded_state(settings, bundle_path):
     seed = repository.publish(bundle_path)
     catalog = ModelCatalog(
         ModelProvisionSettings(
-            provider_namespace="local",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
@@ -85,7 +84,7 @@ def test_retry_coalesces_to_latest_promoted_artifact(
         candidate_path,
         mutate_manifest={
             "model_generation": 2,
-            "model_identity": {"provider_id": "local", "model_unique_id": 2},
+            "model_identity": {"model_unique_id": 2},
         },
     )
     candidate = repository.publish(candidate_path)
@@ -129,7 +128,7 @@ def test_retry_coalesces_to_latest_promoted_artifact(
     dispatcher.enqueue(resource)
     assert first_started.wait(timeout=2)
 
-    family_key = ("local", "ue-communication-default")
+    family_key = "ue-communication-default"
     version_key = catalog.restore_reserved_version(family_key, 2)
     promoted = catalog.promote(
         family_key,

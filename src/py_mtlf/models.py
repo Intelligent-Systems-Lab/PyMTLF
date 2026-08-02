@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from py_mtlf.wire.ml_model import MLModelProvisionSnapshot
 from py_mtlf.wire.ml_model_monitor import (
@@ -19,16 +19,7 @@ class DomainModel(BaseModel):
 
 
 class ModelIdentity(DomainModel):
-    provider_id: str = Field(min_length=1)
     model_unique_id: int = Field(ge=0, le=9223372036854775807)
-
-    @field_validator("provider_id")
-    @classmethod
-    def provider_id_must_not_be_blank(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("provider_id must not be blank")
-        return value
 
 
 class PrivateError(BaseModel):

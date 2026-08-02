@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import FittingSettings
 from py_mtlf.core.dataset import DatasetSnapshot
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ class _Bucket:
 
 
 class TrainingDatasetBuilder:
-    def __init__(self, settings: TrainingSettings) -> None:
+    def __init__(self, settings: FittingSettings) -> None:
         self._settings = settings
 
     def build(

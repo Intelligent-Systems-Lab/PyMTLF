@@ -262,7 +262,7 @@ def test_restart_reannounces_cutover_pending_publication():
     state = Mock()
     state.snapshot.return_value = SimpleNamespace(pending_publications=(cutover,))
     catalog = Mock()
-    catalog.family_key_for_id.return_value = ("local-mtlf", cutover.family_id)
+    catalog.family_key_for_id.return_value = cutover.family_id
     model = Mock(model_id=cutover.reserved_model_id)
     catalog.current.return_value = model
     announced = threading.Event()

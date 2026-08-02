@@ -1,0 +1,131 @@
+# FL Server-role PyMTLF profile. It owns completed models, accuracy policy,
+# federated process coordination, final validation, publication, and cutover.
+server:
+  # Interface to listen on. Use 0.0.0.0 only when peers must reach this process.
+  binding_host: "127.0.0.1"
+  # HTTP listen port for this PyMTLF process.
+  port: 9092
+
+runtime:
+  # Allowed values: "local", "fl_server", or "fl_client".
+  # This profile intentionally selects the FL Server role.
+  mode: "fl_server"
+
+storage:
+  # Immutable, content-addressed completed-model bundles.
+  artifact_root: "data/artifacts"
+model_state:
+  # Durable completed-model catalog and latest-model state.
+  directory: "data/model-state"
+publication:
+  # Restart-safe ADRF publication checkpoints.
+  directory: "data/publications"
+  request_timeout_seconds: 300
+  retry_interval_seconds: 2
+  retry_max_interval_seconds: 30
+  probe_attempts: 3
+cutover:
+  # Maximum time for AnLF consumers to adopt a newly published model.
+  timeout_seconds: 600
+  retry_interval_seconds: 5
+
+artifact:
+  # Origin from which completed model bundles are downloaded.
+  public_base_url: "http://127.0.0.1:9092"
+  max_compressed_bytes: 268435456
+  max_extracted_bytes: 1073741824
+  max_single_file_bytes: 536870912
+  max_entries: 32
+
+federated_learning:
+  # Temporary per-process and per-round artifacts; these are not completed models.
+  workspace_root: "data/fl-workspaces"
+  workspace_ttl_seconds: 3600
+  # Origin advertised for temporary global-model downloads by Clients.
+  public_base_url: "http://127.0.0.1:9092"
+  # Timeout for discovery, subscription, update, and cleanup HTTP requests.
+  request_timeout_seconds: 300
+  artifact_download:
+    # Trusted Client origins from which round-local bundles may be downloaded.
+    allowed_origins:
+      - "http://127.0.0.1:9093"
+      - "http://127.0.0.1:9094"
+    timeout_seconds: 300
+  server:
+    # Standard-shaped Model Training notification callback routed to this backend.
+    callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
+    # Initial preparation deadline offered to every selected Client.
+    preparation_timeout_seconds: 300
+    # Deadline offered for each fitting round and final validation round.
+    round_timeout_seconds: 300
+    # Number of FedAvg fitting rounds; final validation is an additional round.
+    round_count: 2
+    # Maximum federated retraining processes coordinated concurrently.
+    max_active_processes: 1
+    delay_policy:
+      # Maximum Client-requested deadline extensions accepted per operation.
+      max_extensions: 1
+      # Maximum seconds granted by one accepted extension.
+      max_extension_seconds: 300
+    cleanup:
+      # Total DELETE attempts for each remote Client training resource.
+      max_attempts: 3
+      retry_backoff_seconds: 0.2
+    final_validation:
+      # false logs validation results but still permits candidate promotion.
+      enforce_performance_gate: false
+      # Per-scope WAPE regression allowed when the gate is enabled.
+      max_scope_wape_regression: 0.02
+
+model_provision:
+  seed_models:
+    - family_id: "ue-communication-default"
+      model_id: 1
+      artifact_key: "5b11c450bc11d0d41474ad5a720d473e59ba2e9c41f2a321b83384e12593db7f"
+      event: "UE_COMMUNICATION"
+      event_filter: {}
+      target_ue: null
+      model_interoperability: "001122"
+      use_case_context: ""
+
+notification:
+  # Delivery policy for Model Provision notifications.
+  request_timeout_seconds: 5
+  max_attempts: 3
+  initial_backoff_seconds: 0.2
+  max_backoff_seconds: 2
+
+model_monitor:
+  # Callback receiving periodic accuracy reports from model consumers.
+  callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
+  report_period_seconds: 90
+  request_timeout_seconds: 30
+  discovery_timeout_seconds: 30
+  retry_interval_seconds: 1
+  retry_max_interval_seconds: 30
+
+accuracy_policy:
+  enabled: true
+  reference_buffer_size: 12
+  min_reference_samples: 5
+  min_std: 0.14
+  fixed_floor: 0.05
+  z_score_threshold: 1.3
+  decision_window_size: 5
+  required_hits: 3
+  scope_state_ttl_seconds: 600
+
+adrf:
+  # Allowed values: "nrf" or "configured".
+  # "nrf" asks Go to discover ADRF; "configured" uses the fixed target below.
+  mode: "nrf"
+  configured_endpoint: ""
+  configured_nf_instance_id: ""
+  discovery_timeout_seconds: 30
+  request_timeout_seconds: 120
+  retry_initial_backoff_seconds: 2
+  retry_max_backoff_seconds: 30
+
+log:
+  # Allowed values: "DEBUG", "INFO", "WARNING", "ERROR", or "CRITICAL".
+  level: "INFO"

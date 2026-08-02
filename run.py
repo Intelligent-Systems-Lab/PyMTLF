@@ -9,7 +9,7 @@ from py_mtlf.config import load_settings
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the internal MTLF backend")
-    parser.add_argument("--config", default="config/config.yaml")
+    parser.add_argument("--config", default="config/local.yaml")
     args = parser.parse_args()
 
     settings = load_settings(args.config)

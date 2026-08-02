@@ -1,0 +1,120 @@
+# FL Client-role PyMTLF profile. It prepares local ADRF data, performs local
+# fitting and validation, and reports temporary model bundles to the Server.
+server:
+  # Interface to listen on. Peers require a reachable address in real deployments.
+  binding_host: "127.0.0.1"
+  # Use a distinct port for each Client process.
+  port: 9093
+
+runtime:
+  # Allowed values: "local", "fl_server", or "fl_client".
+  # This profile intentionally selects the FL Client role.
+  mode: "fl_client"
+
+storage:
+  # Local immutable artifact cache used by backend infrastructure.
+  artifact_root: "data/artifacts"
+model_state:
+  directory: "data/model-state"
+publication:
+  directory: "data/publications"
+  request_timeout_seconds: 300
+  retry_interval_seconds: 2
+  retry_max_interval_seconds: 30
+  probe_attempts: 3
+cutover:
+  timeout_seconds: 600
+  retry_interval_seconds: 5
+
+artifact:
+  # Origin from which this Client serves temporary round-local bundles.
+  public_base_url: "http://127.0.0.1:9093"
+  max_compressed_bytes: 268435456
+  max_extracted_bytes: 1073741824
+  max_single_file_bytes: 536870912
+  max_entries: 32
+
+federated_learning:
+  # Temporary workspace for downloaded global and generated local artifacts.
+  workspace_root: "data/fl-workspaces"
+  workspace_ttl_seconds: 3600
+  # Origin advertised to the Server for round-local bundle downloads.
+  public_base_url: "http://127.0.0.1:9093"
+  # Timeout for outbound callback and supporting HTTP requests.
+  request_timeout_seconds: 300
+  artifact_download:
+    # Trusted FL Server origins from which global bundles may be downloaded.
+    allowed_origins:
+      - "http://127.0.0.1:9092"
+    timeout_seconds: 300
+  client:
+    # Send a delay request before the Server-provided deadline reaches this margin.
+    callback_deadline_margin_seconds: 5
+    # Bound for pending outbound result/delay callbacks, not inbound requests.
+    callback_queue_size: 256
+    # Maximum preparation, fitting, or validation jobs executed concurrently.
+    max_concurrent_jobs: 2
+    # Model bundle formats this Client can train and validate.
+    model_interoperability_ids:
+      - "001122"
+    fallback_deadlines:
+      # Used only when a request omits an explicit maximum response time.
+      preparation_timeout_seconds: 300
+      round_timeout_seconds: 300
+    training:
+      # Allowed values: "cpu" (the current implementation has no GPU backend).
+      device: "cpu"
+      # Samples processed before one optimizer update.
+      batch_size: 32
+      # Adam learning rate for each local fitting round.
+      learning_rate: 0.001
+      # Full local-dataset passes performed per fitting round.
+      epochs: 18
+      # Oldest fraction reserved for validation; newer data is fitted.
+      validation_ratio: 0.20
+      # Deterministic split, shuffle, and fitting seed.
+      random_seed: 42
+
+notification:
+  # Delivery policy for preparation, delay, round, and validation callbacks.
+  request_timeout_seconds: 5
+  max_attempts: 3
+  initial_backoff_seconds: 0.2
+  max_backoff_seconds: 2
+
+adrf:
+  # Allowed values: "nrf" or "configured".
+  # "nrf" asks Go to discover ADRF; "configured" uses the fixed target below.
+  mode: "nrf"
+  configured_endpoint: ""
+  configured_nf_instance_id: ""
+  discovery_timeout_seconds: 30
+  request_timeout_seconds: 120
+  retry_initial_backoff_seconds: 2
+  retry_max_backoff_seconds: 30
+
+dataset:
+  # Historical interval requested for training preparation.
+  retrieval_window_seconds: 1800
+  # No-callback timeout for an ADRF retrieval subscription.
+  watchdog_timeout_seconds: 120
+  # Timeout for one fetch instruction.
+  fetch_timeout_seconds: 120
+  max_redirects: 3
+  max_retry_attempts: 3
+  retry_initial_backoff_seconds: 1
+  retry_max_backoff_seconds: 30
+  # Bound for concurrently prepared datasets and records retained per job.
+  max_concurrent_jobs: 2
+  max_records_per_job: 100000
+  mongodb:
+    # Local fallback data source when ADRF is unavailable.
+    url: "mongodb://127.0.0.1:27017"
+    database: "free5gc"
+    collection: "nwdaf_raw_notifications"
+    connect_timeout_ms: 5000
+    read_timeout_ms: 30000
+
+log:
+  # Allowed values: "DEBUG", "INFO", "WARNING", "ERROR", or "CRITICAL".
+  level: "INFO"

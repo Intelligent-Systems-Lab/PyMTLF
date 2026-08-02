@@ -19,17 +19,15 @@ class Clock:
 
 
 class CatalogStub:
-    provider_namespace = "local-mtlf"
-
     def __init__(self) -> None:
-        self.family_key = ("local-mtlf", "ue-communication-default")
-        self.current_version = ("local-mtlf", 1)
+        self.family_key = "ue-communication-default"
+        self.current_version = 1
 
     def version_key_for_id(self, model_id):
-        return self.provider_namespace, model_id
+        return model_id
 
     def family_for_version(self, version_key):
-        return self.family_key if version_key[1] in {1, 2} else None
+        return self.family_key if version_key in {1, 2} else None
 
     def current(self, family_key):
         if family_key != self.family_key:
@@ -189,11 +187,11 @@ def test_new_generation_uses_registration_as_adoption_evidence():
     seed(policy, sub, reg)
     scope_key = policy.scope_key(sub, reg)
     family_key = catalog.family_key
-    catalog.current_version = ("local-mtlf", 2)
+    catalog.current_version = 2
     policy.begin_generation(
         family_key,
-        ("local-mtlf", 1),
-        ("local-mtlf", 2),
+        1,
+        2,
         (scope_key,),
     )
     old_report = policy.observe(
@@ -223,8 +221,8 @@ def test_restored_generation_keeps_retrain_in_flight_until_cutover_completes():
 
     policy.restore_generation(
         family_key,
-        ("local-mtlf", 1),
-        ("local-mtlf", 2),
+        1,
+        2,
         ("scope-a",),
     )
 
@@ -238,7 +236,7 @@ def test_deleting_retired_registration_does_not_remove_adopted_scope():
     policy = AccuracyPolicy(settings(), catalog)
     old = registration("group-a", model_id=1)
     policy.record_registration(old)
-    catalog.current_version = ("local-mtlf", 2)
+    catalog.current_version = 2
     new = registration("group-a", model_id=2)
     policy.record_registration(new)
 

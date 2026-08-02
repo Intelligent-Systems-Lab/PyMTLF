@@ -1,0 +1,217 @@
+# Local-role PyMTLF profile.
+# HTTP server used by the Go NWDAF backend routes and artifact downloads.
+server:
+  # Interface to listen on. 127.0.0.1 accepts only local connections.
+  binding_host: "127.0.0.1"
+  # HTTP listen port for this PyMTLF process.
+  port: 9092
+
+# Standalone MTLF runtime with bounded local retraining.
+runtime:
+  # Allowed values: "local", "fl_server", or "fl_client".
+  # This profile intentionally selects the local role.
+  mode: "local"
+
+# Immutable model bundles and durable model/publication state.
+storage:
+  # Root directory containing immutable, content-addressed model bundles.
+  artifact_root: "data/artifacts"
+model_state:
+  # Durable model catalog, latest-model pointer, and generation state.
+  directory: "data/model-state"
+publication:
+  # Durable checkpoints for ADRF publication and restart recovery.
+  directory: "data/publications"
+  # Seconds allowed for one ADRF publication or verification request.
+  request_timeout_seconds: 300
+  # Initial seconds between publication retries.
+  retry_interval_seconds: 2
+  # Maximum seconds between publication retries after backoff.
+  retry_max_interval_seconds: 30
+  # Number of probes used to confirm that ADRF can serve the stored model.
+  probe_attempts: 3
+cutover:
+  # Seconds to wait for model consumers to switch to the published model.
+  timeout_seconds: 600
+  # Seconds between cutover-state checks.
+  retry_interval_seconds: 5
+
+# Limits applied when serving or unpacking model bundle archives.
+artifact:
+  # Externally reachable origin used to construct formal model download URLs.
+  public_base_url: "http://127.0.0.1:9092"
+  # Maximum accepted compressed bundle size in bytes (256 MiB).
+  max_compressed_bytes: 268435456
+  # Maximum total extracted bundle size in bytes (1 GiB).
+  max_extracted_bytes: 1073741824
+  # Maximum extracted size of one file in bytes (512 MiB).
+  max_single_file_bytes: 536870912
+  # Maximum number of entries in one bundle archive.
+  max_entries: 32
+
+# Temporary FL artifact settings remain available because model publication
+# reuses the workspace abstraction. No server/client branch is enabled here.
+federated_learning:
+  # Root directory for temporary per-process and per-round FL artifacts.
+  workspace_root: "data/fl-workspaces"
+  # Seconds to retain completed temporary FL artifacts before cleanup.
+  workspace_ttl_seconds: 3600
+  # Externally reachable origin used for temporary FL artifact URLs.
+  public_base_url: "http://127.0.0.1:9092"
+  # Seconds allowed for one outbound Model Training HTTP request.
+  request_timeout_seconds: 300
+  artifact_download:
+    # Add every trusted peer PyMTLF origin that may serve FL model artifacts.
+    allowed_origins:
+      - "http://127.0.0.1:9092"
+    # Seconds allowed to download one remote FL artifact.
+    timeout_seconds: 300
+
+# Initial models owned and provisioned by this PyMTLF instance.
+model_provision:
+  # Initial completed models imported into the catalog at startup.
+  seed_models:
+    # Stable internal family name for revisions of the same model purpose.
+    - family_id: "ue-communication-default"
+      # Non-negative formal model identity; required to be unique within 5GC scope.
+      model_id: 1
+      # SHA-256 key of the bundle already present under storage.artifact_root.
+      artifact_key: "5b11c450bc11d0d41474ad5a720d473e59ba2e9c41f2a321b83384e12593db7f"
+      # Analytics event supported by this model.
+      event: "UE_COMMUNICATION"
+      # Standard-shaped Analytics Filter applicability; empty means no filter restriction.
+      event_filter: {}
+      # Standard-shaped Target UE applicability; null means no target restriction.
+      target_ue: null
+      # Model format/interoperability identifier required by consumers and FL peers.
+      model_interoperability: "001122"
+      # Optional project context distinguishing models with otherwise equal applicability.
+      use_case_context: ""
+
+# Delivery retry policy for outbound model-related notifications.
+notification:
+  # Seconds allowed for one outbound model notification.
+  request_timeout_seconds: 5
+  # Total delivery attempts, including the first attempt.
+  max_attempts: 3
+  # Seconds before the first notification retry.
+  initial_backoff_seconds: 0.2
+  # Maximum seconds between notification retries.
+  max_backoff_seconds: 2
+
+# Accuracy-monitor subscription and report handling.
+model_monitor:
+  # Callback on this PyMTLF that receives Model Accuracy Monitoring reports.
+  callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
+  # Requested seconds between periodic reports from the model consumer.
+  report_period_seconds: 90
+  # Seconds allowed for one monitor create, update, or delete request.
+  request_timeout_seconds: 30
+  # Seconds to wait for the required remote monitor route to become discoverable.
+  discovery_timeout_seconds: 30
+  # Initial seconds between monitor setup/recovery attempts.
+  retry_interval_seconds: 1
+  # Maximum seconds between monitor setup/recovery attempts.
+  retry_max_interval_seconds: 30
+
+# WAPE degradation policy. A retrain is triggered after required_hits within
+# decision_window_size once the reference buffer has enough stable samples.
+accuracy_policy:
+  # Enable WAPE degradation decisions and automatic retraining triggers.
+  enabled: true
+  # Maximum historical WAPE values retained as the reference distribution.
+  reference_buffer_size: 12
+  # Reference values required before a report can contribute to a trigger.
+  min_reference_samples: 5
+  # Minimum denominator used in z-score calculation to avoid oversensitivity.
+  min_std: 0.14
+  # Reports at or below this absolute WAPE value are never eligible trigger hits.
+  fixed_floor: 0.05
+  # A report must exceed this z-score against the reference distribution.
+  z_score_threshold: 1.3
+  # Number of latest eligible decisions retained for hit counting.
+  decision_window_size: 5
+  # Degradation hits required in the decision window to trigger retraining.
+  required_hits: 3
+  # Seconds to retain an inactive analytics scope's in-memory policy state.
+  scope_state_ttl_seconds: 600
+
+# nrf discovers ADRF through the Go NWDAF; configured uses the fixed values.
+adrf:
+  # Allowed values: "nrf" or "configured".
+  mode: "nrf"
+  # Fixed ADRF origin used only when mode is configured.
+  configured_endpoint: ""
+  # NF Instance ID associated with the fixed ADRF endpoint.
+  configured_nf_instance_id: ""
+  # Seconds to wait for an ADRF discovery response.
+  discovery_timeout_seconds: 30
+  # Seconds allowed for one ADRF data or model-management request.
+  request_timeout_seconds: 120
+  # Initial seconds between ADRF availability/recovery attempts.
+  retry_initial_backoff_seconds: 2
+  # Maximum seconds between ADRF availability/recovery attempts.
+  retry_max_backoff_seconds: 30
+
+# Training data retrieval. ADRF is preferred by the active distributed design;
+# MongoDB remains available to the local data-source path.
+dataset:
+  # Seconds of historical data requested before the retraining trigger time.
+  retrieval_window_seconds: 1800
+  # Seconds without a new ADRF callback before retrieval is considered complete/stalled.
+  watchdog_timeout_seconds: 120
+  # Seconds allowed to fetch one record referenced by a fetch instruction.
+  fetch_timeout_seconds: 120
+  # Maximum HTTP redirects followed while fetching one record.
+  max_redirects: 3
+  # Maximum attempts to retrieve a failed dataset record.
+  max_retry_attempts: 3
+  # Initial seconds between dataset-retrieval retries.
+  retry_initial_backoff_seconds: 1
+  # Maximum seconds between dataset-retrieval retries.
+  retry_max_backoff_seconds: 30
+  # Maximum dataset retrieval jobs executed concurrently.
+  max_concurrent_jobs: 2
+  # Safety limit on records accepted by one dataset job.
+  max_records_per_job: 100000
+  mongodb:
+    # MongoDB connection URI used by the local fallback data source.
+    url: "mongodb://127.0.0.1:27017"
+    # Database containing raw NWDAF training notifications.
+    database: "free5gc"
+    # Collection containing raw NWDAF training notifications.
+    collection: "nwdaf_raw_notifications"
+    # Milliseconds allowed to establish the MongoDB connection.
+    connect_timeout_ms: 5000
+    # Milliseconds allowed for a MongoDB read operation.
+    read_timeout_ms: 30000
+
+# Standalone local retraining policy.
+local_training:
+  # Enable local fitting; false rejects new training work.
+  enabled: true
+  # Allowed values: "cpu" (the current implementation has no GPU backend).
+  device: "cpu"
+  # Training samples processed before one optimizer update.
+  batch_size: 32
+  # Adam optimizer learning rate used for local fitting.
+  learning_rate: 0.001
+  # Full local-dataset passes per retraining job.
+  epochs: 18
+  # Fraction of each prepared dataset reserved for validation instead of fitting.
+  validation_ratio: 0.20
+  # Seed controlling deterministic split, shuffle, and model training behavior.
+  random_seed: 42
+  # Maximum standalone/local retraining jobs executed concurrently.
+  max_concurrent_jobs: 1
+  # Maximum standalone/local retraining jobs waiting in memory.
+  max_queue_size: 16
+  validation:
+    # false records validation but still permits promotion of a worse candidate.
+    enforce_performance_gate: false
+    # Maximum WAPE regression allowed on a non-triggering scope when the gate is enabled.
+    max_scope_wape_regression: 0.02
+
+log:
+  # Allowed values: "DEBUG", "INFO", "WARNING", "ERROR", or "CRITICAL".
+  level: "INFO"

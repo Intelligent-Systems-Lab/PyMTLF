@@ -163,7 +163,7 @@ class PublicationCoordinator:
         model_id: int,
         scope_key: str,
     ) -> bool:
-        family_id = family_key[1]
+        family_id = family_key
         completed = False
         matched = False
 
@@ -227,7 +227,7 @@ class PublicationCoordinator:
 
         def update(state: DurableModelState) -> DurableModelState:
             nonlocal created
-            family = state.families.get(candidate.family_key[1])
+            family = state.families.get(candidate.family_key)
             if family is None or family.latest_model_id != current.model_id:
                 raise RuntimeError("durable catalog base changed before version reservation")
             model_id = max(
@@ -242,7 +242,7 @@ class PublicationCoordinator:
                 mlCorreId=candidate.process_id,
                 reservedModelId=model_id,
                 previousModelId=current.model_id,
-                familyId=candidate.family_key[1],
+                familyId=candidate.family_key,
                 expectedGeneration=current.generation,
                 expectedArtifactDigest=current.artifact.key,
                 participantsAndSampleCounts=candidate.participants,
@@ -259,7 +259,7 @@ class PublicationCoordinator:
             )
             updated_family = family.model_copy(update={"next_model_id": model_id + 1})
             families = dict(state.families)
-            families[candidate.family_key[1]] = updated_family
+            families[candidate.family_key] = updated_family
             return state.model_copy(
                 update={
                     "families": families,
@@ -297,10 +297,7 @@ class PublicationCoordinator:
             model=candidate_bundle.model,
             metadata={
                 "artifact_role": "FINAL_MODEL",
-                "model_identity": {
-                    "provider_id": self._catalog.provider_namespace,
-                    "model_unique_id": publication.reserved_model_id,
-                },
+                "model_identity": {"model_unique_id": publication.reserved_model_id},
                 "model_generation": publication.expected_generation + 1,
                 "created_at": created_at.isoformat(),
                 "fl_metadata": {

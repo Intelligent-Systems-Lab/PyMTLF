@@ -138,46 +138,47 @@ class ArtifactDownloadSettings(FrozenSettings):
         return normalized
 
 
-class FederatedLearningSettings(FrozenSettings):
-    workspace_root: Path = Path("data/fl-workspaces")
-    workspace_ttl_seconds: int = Field(default=3600, gt=0)
-    public_base_url: str = "http://127.0.0.1:9092"
-    artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
-    callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
-    request_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+class FittingSettings(FrozenSettings):
+    device: str = "cpu"
+    batch_size: int = Field(default=32, gt=0)
+    learning_rate: float = Field(default=0.001, gt=0)
+    epochs: int = Field(default=18, gt=0)
+    validation_ratio: float = Field(default=0.20, gt=0, lt=1)
+    random_seed: int = Field(default=42, ge=0)
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "cpu":
+            raise ValueError("training.device must be 'cpu' in the current implementation")
+        return value
+
+
+class ValidationSettings(FrozenSettings):
+    enforce_performance_gate: bool = False
+    max_scope_wape_regression: float = Field(default=0.02, ge=0)
+
+
+class LocalTrainingSettings(FittingSettings):
+    enabled: bool = True
+    max_concurrent_jobs: int = Field(default=1, ge=1, le=32)
+    max_queue_size: int = Field(default=16, gt=0)
+    validation: ValidationSettings = ValidationSettings()
+
+
+class FallbackDeadlineSettings(FrozenSettings):
     preparation_timeout_seconds: int = Field(default=300, gt=0, le=86400)
     round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+
+
+class FLClientSettings(FrozenSettings):
     callback_deadline_margin_seconds: int = Field(default=5, ge=1, le=300)
-    max_delay_extensions: int = Field(default=1, ge=0, le=10)
-    max_delay_extension_seconds: int = Field(default=300, ge=0, le=86400)
-    round_count: int = Field(default=2, ge=1, le=100)
     callback_queue_size: int = Field(default=256, gt=0, le=100000)
-    max_concurrent_client_jobs: int = Field(default=2, gt=0, le=32)
-    max_active_server_processes: int = Field(default=1, gt=0, le=32)
-    cleanup_max_attempts: int = Field(default=3, gt=0, le=20)
-    cleanup_retry_backoff_seconds: float = Field(default=0.2, ge=0, le=60)
+    max_concurrent_jobs: int = Field(default=2, gt=0, le=32)
     model_interoperability_ids: tuple[str, ...] = ()
-
-    @field_validator("workspace_root", mode="before")
-    @classmethod
-    def workspace_must_not_be_blank(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip():
-            raise ValueError("federated_learning.workspace_root must not be blank")
-        return value
-
-    @field_validator("public_base_url")
-    @classmethod
-    def validate_public_base_url(cls, value: str) -> str:
-        return _validate_http_base_url(value, "federated_learning.public_base_url")
-
-    @field_validator("callback_uri")
-    @classmethod
-    def validate_callback_uri(cls, value: str) -> str:
-        value = value.strip()
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("federated_learning.callback_uri must be an absolute HTTP(S) URI")
-        return value
+    fallback_deadlines: FallbackDeadlineSettings = FallbackDeadlineSettings()
+    training: FittingSettings = FittingSettings()
 
     @field_validator("model_interoperability_ids")
     @classmethod
@@ -193,17 +194,70 @@ class FederatedLearningSettings(FrozenSettings):
         return normalized
 
     @model_validator(mode="after")
-    def validate_deadline_margin(self) -> "FederatedLearningSettings":
+    def validate_capacity_and_deadline_margin(self) -> "FLClientSettings":
         if self.callback_deadline_margin_seconds >= min(
-            self.preparation_timeout_seconds,
-            self.round_timeout_seconds,
+            self.fallback_deadlines.preparation_timeout_seconds,
+            self.fallback_deadlines.round_timeout_seconds,
         ):
             raise ValueError("callback deadline margin must be shorter than FL timeouts")
-        if self.callback_queue_size < self.max_concurrent_client_jobs:
-            raise ValueError(
-                "callback_queue_size must not be smaller than max_concurrent_client_jobs"
-            )
+        if self.callback_queue_size < self.max_concurrent_jobs:
+            raise ValueError("callback_queue_size must not be smaller than max_concurrent_jobs")
         return self
+
+
+class DelayPolicySettings(FrozenSettings):
+    max_extensions: int = Field(default=1, ge=0, le=10)
+    max_extension_seconds: int = Field(default=300, ge=0, le=86400)
+
+
+class CleanupSettings(FrozenSettings):
+    max_attempts: int = Field(default=3, gt=0, le=20)
+    retry_backoff_seconds: float = Field(default=0.2, ge=0, le=60)
+
+
+class FLServerSettings(FrozenSettings):
+    callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
+    preparation_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+    round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+    round_count: int = Field(default=2, ge=1, le=100)
+    max_active_processes: int = Field(default=1, gt=0, le=32)
+    delay_policy: DelayPolicySettings = DelayPolicySettings()
+    cleanup: CleanupSettings = CleanupSettings()
+    final_validation: ValidationSettings = ValidationSettings()
+
+    @field_validator("callback_uri")
+    @classmethod
+    def validate_callback_uri(cls, value: str) -> str:
+        value = value.strip()
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "federated_learning.server.callback_uri must be an absolute HTTP(S) URI"
+            )
+        return value
+
+
+class FederatedLearningSettings(FrozenSettings):
+    workspace_root: Path = Path("data/fl-workspaces")
+    workspace_ttl_seconds: int = Field(default=3600, gt=0)
+    public_base_url: str = "http://127.0.0.1:9092"
+    request_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
+    server: FLServerSettings | None = None
+    client: FLClientSettings | None = None
+
+    @field_validator("workspace_root", mode="before")
+    @classmethod
+    def workspace_must_not_be_blank(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("federated_learning.workspace_root must not be blank")
+        return value
+
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: str) -> str:
+        return _validate_http_base_url(value, "federated_learning.public_base_url")
+
 
 
 class SeedModelSettings(FrozenSettings):
@@ -239,16 +293,7 @@ class SeedModelSettings(FrozenSettings):
 
 
 class ModelProvisionSettings(FrozenSettings):
-    provider_namespace: str = "local-mtlf"
     seed_models: tuple[SeedModelSettings, ...] = ()
-
-    @field_validator("provider_namespace")
-    @classmethod
-    def validate_provider_namespace(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("model_provision.provider_namespace must not be blank")
-        return value
 
     @model_validator(mode="after")
     def validate_unique_models(self) -> "ModelProvisionSettings":
@@ -375,28 +420,6 @@ class DatasetSettings(FrozenSettings):
     mongodb: MongoDatasetSettings = MongoDatasetSettings()
 
 
-class TrainingSettings(FrozenSettings):
-    enabled: bool = True
-    device: str = "cpu"
-    batch_size: int = Field(default=32, gt=0)
-    learning_rate: float = Field(default=0.001, gt=0)
-    epochs: int = Field(default=18, gt=0)
-    validation_ratio: float = Field(default=0.20, gt=0, lt=1)
-    random_seed: int = Field(default=42, ge=0)
-    max_concurrent_jobs: int = Field(default=1, ge=1, le=32)
-    max_queue_size: int = Field(default=16, gt=0)
-    enforce_performance_gate: bool = False
-    max_scope_wape_regression: float = Field(default=0.02, ge=0)
-
-    @field_validator("device")
-    @classmethod
-    def validate_device(cls, value: str) -> str:
-        value = value.strip().lower()
-        if value != "cpu":
-            raise ValueError("training.device must be 'cpu' in the current implementation")
-        return value
-
-
 class LogSettings(FrozenSettings):
     level: str = "INFO"
 
@@ -423,9 +446,36 @@ class Settings(FrozenSettings):
     accuracy_policy: AccuracyPolicySettings = AccuracyPolicySettings()
     adrf: AdrfSettings = AdrfSettings()
     dataset: DatasetSettings = DatasetSettings()
-    training: TrainingSettings = TrainingSettings()
+    local_training: LocalTrainingSettings | None = None
     notification: NotificationSettings = NotificationSettings()
     log: LogSettings = LogSettings()
+
+    @model_validator(mode="after")
+    def validate_runtime_configuration(self) -> "Settings":
+        mode = self.runtime.mode
+        if mode == "local":
+            if (
+                self.federated_learning.server is not None
+                or self.federated_learning.client is not None
+            ):
+                raise ValueError("local mode must not configure FL server or client settings")
+            if self.local_training is None:
+                object.__setattr__(self, "local_training", LocalTrainingSettings())
+        elif mode == "fl_server":
+            if self.federated_learning.server is None:
+                raise ValueError("fl_server mode requires federated_learning.server")
+            if self.federated_learning.client is not None or self.local_training is not None:
+                raise ValueError(
+                    "fl_server mode must not configure client or local training settings"
+                )
+        elif mode == "fl_client":
+            if self.federated_learning.client is None:
+                raise ValueError("fl_client mode requires federated_learning.client")
+            if self.federated_learning.server is not None or self.local_training is not None:
+                raise ValueError(
+                    "fl_client mode must not configure server or local training settings"
+                )
+        return self
 
 
 def load_settings(path: str | Path) -> Settings:

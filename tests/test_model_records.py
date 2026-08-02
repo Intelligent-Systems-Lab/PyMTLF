@@ -181,8 +181,7 @@ def test_durable_model_state_repository_atomically_survives_restart(tmp_path) ->
         created_at=datetime.now(UTC),
     )
     initial = DurableModelState(
-        schemaVersion="1.0",
-        providerNamespace="provider-a",
+        schemaVersion="2.0",
         lastAllocatedModelId=3,
         families={"family-a": catalog},
     )

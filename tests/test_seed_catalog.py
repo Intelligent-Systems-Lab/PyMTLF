@@ -17,7 +17,6 @@ def test_seed_catalog_validates_manifest_and_generic_applicability(settings, bun
     artifact = repository.publish(bundle_path)
     catalog = SeedCatalog(
         ModelProvisionSettings(
-            provider_namespace="local",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
@@ -55,7 +54,6 @@ def test_seed_catalog_treats_omitted_interoperability_as_no_filter(
     artifact = repository.publish(bundle_path)
     catalog = SeedCatalog(
         ModelProvisionSettings(
-            provider_namespace="local",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
@@ -96,11 +94,10 @@ def test_seed_catalog_rejects_descriptor_manifest_identity_mismatch(settings, bu
     artifact = repository.publish(bundle_path)
     catalog = SeedCatalog(
         ModelProvisionSettings(
-            provider_namespace="different-provider",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
-                    model_id=1,
+                    model_id=2,
                     artifact_key=artifact.key,
                     event="UE_COMMUNICATION",
                 ),
@@ -123,7 +120,6 @@ def test_catalog_promotes_candidate_with_new_model_identity(
     seed = repository.publish(bundle_path)
     catalog = SeedCatalog(
         ModelProvisionSettings(
-            provider_namespace="local",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
@@ -141,11 +137,11 @@ def test_catalog_promotes_candidate_with_new_model_identity(
         candidate_path,
         mutate_manifest={
             "model_generation": 2,
-            "model_identity": {"provider_id": "local", "model_unique_id": 2},
+            "model_identity": {"model_unique_id": 2},
         },
     )
     candidate = repository.publish(candidate_path)
-    family_key = ("local", "ue-communication-default")
+    family_key = "ue-communication-default"
     version_key = catalog.restore_reserved_version(family_key, 2)
 
     promoted = catalog.promote(
@@ -163,6 +159,6 @@ def test_catalog_promotes_candidate_with_new_model_identity(
 
     assert promoted.generation == 2
     assert promoted.model_id == 2
-    assert catalog.family_for_version(("local", 1)) == family_key
-    assert catalog.family_for_version(("local", 2)) == family_key
+    assert catalog.family_for_version(1) == family_key
+    assert catalog.family_for_version(2) == family_key
     assert promoted.artifact.key == candidate.key

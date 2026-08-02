@@ -13,8 +13,8 @@ from py_mtlf.wire.ml_model import (
     MLModelAdrf,
 )
 
-FamilyKey = tuple[str, str]
-ModelVersionKey = tuple[str, int]
+FamilyKey = str
+ModelVersionKey = int
 
 
 class StaleCatalogError(RuntimeError):
@@ -32,7 +32,7 @@ class CatalogModel:
 
     @property
     def model_id(self) -> int:
-        return self.version_key[1]
+        return self.version_key
 
     def event_notification(self, correlation_id: str) -> MLEventNotification:
         values: dict[str, object] = {
@@ -84,10 +84,6 @@ class ModelCatalog:
         self._tombstoned_ids: set[int] = set()
         self._next_model_id = 0
 
-    @property
-    def provider_namespace(self) -> str:
-        return self._settings.provider_namespace
-
     def open(self) -> None:
         current: dict[FamilyKey, CatalogModel] = {}
         versions: dict[ModelVersionKey, VersionIndexEntry] = {}
@@ -118,15 +114,13 @@ class ModelCatalog:
             self._tombstoned_ids.clear()
             self._next_model_id = (
                 max(
-                    (key[1] for key in versions),
+                    versions,
                     default=-1,
                 )
                 + 1
             )
 
     def restore(self, state: DurableModelState) -> None:
-        if state.provider_namespace != self.provider_namespace:
-            raise StaleCatalogError("durable model provider namespace changed")
         descriptors = {item.family_id: item for item in self._settings.seed_models}
         if set(state.families) != set(descriptors):
             raise StaleCatalogError("durable model families do not match configured families")
@@ -178,10 +172,10 @@ class ModelCatalog:
             )
 
     def family_key_for_id(self, family_id: str) -> FamilyKey:
-        return self._settings.provider_namespace, family_id
+        return family_id
 
     def version_key_for_id(self, model_id: int) -> ModelVersionKey:
-        return self._settings.provider_namespace, model_id
+        return model_id
 
     def resolve(self, demand: MLEventSubscription) -> CatalogModel | None:
         with self._lock:
@@ -286,7 +280,7 @@ class ModelCatalog:
         """Reserve restored IDs without guessing which family owned unknown versions."""
 
         with self._lock:
-            known_ids = {key[1] for key in self._version_index}
+            known_ids = set(self._version_index)
             self._tombstoned_ids.update(model_ids - known_ids)
             if model_ids:
                 self._next_model_id = max(self._next_model_id, max(model_ids) + 1)
@@ -311,12 +305,9 @@ class ModelCatalog:
                 or current.artifact.key != expected_artifact_key
             ):
                 raise StaleCatalogError("catalog base model changed during training")
-            if (
-                version_key[0] != self.provider_namespace
-                or version_key[1] not in self._reserved_ids
-            ):
+            if version_key not in self._reserved_ids:
                 raise StaleCatalogError("candidate model version was not reserved by this catalog")
-            self._validate_manifest(current.descriptor, version_key[1], manifest)
+            self._validate_manifest(current.descriptor, version_key, manifest)
             declared_generation = manifest.get("model_generation")
             if declared_generation != expected_generation + 1:
                 raise InvalidArtifactError(
@@ -344,7 +335,7 @@ class ModelCatalog:
                 current=True,
             )
             self._current_by_family[family_key] = promoted
-            self._reserved_ids.discard(version_key[1])
+            self._reserved_ids.discard(version_key)
             return promoted
 
     def _validate_manifest(
@@ -354,10 +345,7 @@ class ModelCatalog:
         manifest: dict[str, object],
     ) -> None:
         identity = manifest.get("model_identity")
-        expected_identity = {
-            "provider_id": self._settings.provider_namespace,
-            "model_unique_id": model_id,
-        }
+        expected_identity = {"model_unique_id": model_id}
         if identity != expected_identity:
             raise InvalidArtifactError("model descriptor identity does not match artifact manifest")
         if manifest.get("analytics_event") != descriptor.event:

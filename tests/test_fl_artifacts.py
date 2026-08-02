@@ -236,7 +236,7 @@ def test_final_model_requires_identity_and_accepted_gate() -> None:
         {
             "bundle_schema_version": "1.0",
             "artifact_role": "FINAL_MODEL",
-            "model_identity": {"provider_id": "nwdaf-c", "model_unique_id": 5},
+            "model_identity": {"model_unique_id": 5},
             "fl_metadata": metadata,
             "file_digests": FILE_DIGESTS,
         }
@@ -250,7 +250,7 @@ def test_final_model_requires_identity_and_accepted_gate() -> None:
             {
                 "bundle_schema_version": "1.0",
                 "artifact_role": "FINAL_MODEL",
-                "model_identity": {"provider_id": "nwdaf-c", "model_unique_id": 5},
+                "model_identity": {"model_unique_id": 5},
                 "fl_metadata": metadata,
                 "file_digests": FILE_DIGESTS,
             }
@@ -263,7 +263,7 @@ def test_final_model_requires_identity_and_accepted_gate() -> None:
             {
                 "bundle_schema_version": "1.0",
                 "artifact_role": "FINAL_MODEL",
-                "model_identity": {"provider_id": "nwdaf-c", "model_unique_id": 5},
+                "model_identity": {"model_unique_id": 5},
                 "fl_metadata": metadata,
                 "file_digests": FILE_DIGESTS,
             }

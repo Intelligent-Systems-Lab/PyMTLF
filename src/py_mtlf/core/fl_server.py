@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import httpx
 
-from py_mtlf.config import FederatedLearningSettings, TrainingSettings
+from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.federated_trainer import FederatedTrainer
@@ -244,23 +244,23 @@ class FLServerOrchestrator:
     def __init__(
         self,
         settings: FederatedLearningSettings,
+        server_settings: FLServerSettings,
         projection: SyncProjection,
         policy: AccuracyPolicy,
         catalog: ModelCatalog,
         workspace: FLWorkspace,
         resolver: FLClientResolver,
         client: httpx.Client | None = None,
-        training_settings: TrainingSettings | None = None,
         publication: PublicationCoordinator | None = None,
         provision_notifications: ProvisionNotificationDispatcher | None = None,
     ) -> None:
         self._settings = settings
+        self._server_settings = server_settings
         self._projection = projection
         self._policy = policy
         self._catalog = catalog
         self._workspace = workspace
         self._resolver = resolver
-        self._training_settings = training_settings or TrainingSettings()
         self._publication = publication
         self._provision_notifications = provision_notifications
         self._loader = TrustedBundleLoader()
@@ -272,7 +272,7 @@ class FLServerOrchestrator:
         self._processes: dict[str, FLProcess] = {}
         self._correlations: dict[str, str] = {}
         self._executor = ThreadPoolExecutor(
-            max_workers=settings.max_active_server_processes,
+            max_workers=server_settings.max_active_processes,
             thread_name_prefix="fl-server",
         )
         self._futures: set[Future] = set()
@@ -308,7 +308,7 @@ class FLServerOrchestrator:
                     }
                     for item in self._processes.values()
                 )
-                if active > self._settings.max_active_server_processes:
+                if active > self._server_settings.max_active_processes:
                     process.state = FLServerState.FAILED
                     process.failure = "FL Server process capacity is exhausted"
                     self._policy.complete_retrain(intent.family_key)
@@ -505,7 +505,7 @@ class FLServerOrchestrator:
             self._wait(
                 process,
                 lambda: all(item.preparation_complete for item in process.participants),
-                self._settings.preparation_timeout_seconds,
+                self._server_settings.preparation_timeout_seconds,
             )
             logger.info(
                 "Federated preparation complete process_id=%s participants=%s",
@@ -517,7 +517,7 @@ class FLServerOrchestrator:
             if current is None or current.artifact.key != process.base_artifact_key:
                 raise RuntimeError("FL base model changed while participants were preparing")
             process.current_global_url = current.artifact.url
-            for round_indicator in range(self._settings.round_count):
+            for round_indicator in range(self._server_settings.round_count):
                 process.state = FLServerState.ROUND_DISPATCH
                 for participant in process.participants:
                     participant.expected_round = round_indicator
@@ -537,7 +537,7 @@ class FLServerOrchestrator:
                 self._wait(
                     process,
                     lambda: all(item.notification is not None for item in process.participants),
-                    self._settings.round_timeout_seconds,
+                    self._server_settings.round_timeout_seconds,
                 )
                 process.state = FLServerState.AGGREGATING
                 process.current_global_url = self._aggregate_round(
@@ -555,7 +555,7 @@ class FLServerOrchestrator:
                     raise RuntimeError(process.failure)
                 process.candidate_url = process.current_global_url
             process.state = FLServerState.FINAL_VALIDATION_DISPATCH
-            validation_round = self._settings.round_count
+            validation_round = self._server_settings.round_count
             for participant in process.participants:
                 participant.expected_round = validation_round
                 participant.notification = None
@@ -574,11 +574,14 @@ class FLServerOrchestrator:
             self._wait(
                 process,
                 lambda: all(item.notification is not None for item in process.participants),
-                self._settings.round_timeout_seconds,
+                self._server_settings.round_timeout_seconds,
             )
             process.state = FLServerState.FINAL_VALIDATION_EVALUATING
             self._evaluate_final_validation(process, current.artifact, validation_round)
-            if self._training_settings.enforce_performance_gate and not process.gate_would_accept:
+            if (
+                self._server_settings.final_validation.enforce_performance_gate
+                and not process.gate_would_accept
+            ):
                 process.state = FLServerState.VALIDATION_REJECTED
                 logger.warning(
                     "Federated candidate rejected process_id=%s reasons=%s",
@@ -671,7 +674,7 @@ class FLServerOrchestrator:
         )
         value = NwdafMLModelTrainSubsc(
             mLEventSubscs=[event],
-            notifUri=self._settings.callback_uri,
+            notifUri=self._server_settings.callback_uri,
             notifCorreId=participant.notification_correlation_id,
             mlCorreId=process.process_id,
             mLPreFlag=True,
@@ -695,10 +698,12 @@ class FLServerOrchestrator:
                             )
                         ],
                     ),
-                    timeAvReq=f"PT{self._settings.preparation_timeout_seconds}S",
+                    timeAvReq=f"PT{self._server_settings.preparation_timeout_seconds}S",
                 )
             ],
-            mLTrainRepInfo=MLTrainReportInfo(maxResTime=self._settings.preparation_timeout_seconds),
+            mLTrainRepInfo=MLTrainReportInfo(
+                maxResTime=self._server_settings.preparation_timeout_seconds
+            ),
         )
         go_base = self._go_base()
         response = self._client.post(
@@ -732,7 +737,9 @@ class FLServerOrchestrator:
                     mLFileAddr=MLModelAddress(mLModelUrl=artifact_url),
                 )
             ],
-            mLTrainRepInfo=MLTrainReportInfo(maxResTime=self._settings.round_timeout_seconds),
+            mLTrainRepInfo=MLTrainReportInfo(
+                maxResTime=self._server_settings.round_timeout_seconds
+            ),
         )
         response = self._client.patch(
             participant.resource_location,
@@ -759,7 +766,9 @@ class FLServerOrchestrator:
                     mLFileAddr=MLModelAddress(mLModelUrl=artifact_url),
                 )
             ],
-            mLTrainRepInfo=MLTrainReportInfo(maxResTime=self._settings.round_timeout_seconds),
+            mLTrainRepInfo=MLTrainReportInfo(
+                maxResTime=self._server_settings.round_timeout_seconds
+            ),
         )
         response = self._client.patch(
             participant.resource_location,
@@ -783,10 +792,13 @@ class FLServerOrchestrator:
                     return
                 for participant in process.participants:
                     if participant.requested_extension:
-                        if participant.delay_extensions >= self._settings.max_delay_extensions:
+                        if (
+                            participant.delay_extensions
+                            >= self._server_settings.delay_policy.max_extensions
+                        ):
                             raise RuntimeError("participant exceeded delay extension limit")
                         remaining_budget = (
-                            self._settings.max_delay_extension_seconds
+                            self._server_settings.delay_policy.max_extension_seconds
                             - participant.granted_extension_seconds
                         )
                         extension = min(
@@ -818,7 +830,7 @@ class FLServerOrchestrator:
         participant: FLParticipant,
     ) -> str:
         last_error = ""
-        for attempt in range(self._settings.cleanup_max_attempts):
+        for attempt in range(self._server_settings.cleanup.max_attempts):
             try:
                 response = self._client.delete(participant.resource_location)
                 if response.status_code in {204, 404}:
@@ -826,8 +838,8 @@ class FLServerOrchestrator:
                 last_error = f"cleanup returned {response.status_code}"
             except httpx.TransportError as error:
                 last_error = str(error)
-            if attempt + 1 < self._settings.cleanup_max_attempts:
-                time.sleep(self._settings.cleanup_retry_backoff_seconds)
+            if attempt + 1 < self._server_settings.cleanup.max_attempts:
+                time.sleep(self._server_settings.cleanup.retry_backoff_seconds)
         logger.warning(
             "FL participant cleanup failed process_id=%s nf=%s error=%s",
             process.process_id,
@@ -1049,7 +1061,7 @@ class FLServerOrchestrator:
             if participant.scope.scope_key == process.intent.triggering_scope_key:
                 continue
             regression = (wape(summary.candidate) or 0.0) - (wape(summary.base) or 0.0)
-            if regression > self._training_settings.max_scope_wape_regression:
+            if regression > self._server_settings.final_validation.max_scope_wape_regression:
                 reasons.append(f"scope_regression_exceeded:{summary.scope_digest}")
         process.validation_summaries = tuple(item for _participant, item in summaries)
         process.gate_would_accept = not reasons
@@ -1061,7 +1073,7 @@ class FLServerOrchestrator:
             aggregate_base,
             aggregate_candidate,
             process.gate_would_accept,
-            self._training_settings.enforce_performance_gate,
+            self._server_settings.final_validation.enforce_performance_gate,
         )
 
     def _go_base(self) -> str:
@@ -1084,7 +1096,7 @@ class FLServerOrchestrator:
         base = self._go_base()
         for subscription_id in subscription_ids:
             last_error = ""
-            for attempt in range(self._settings.cleanup_max_attempts):
+            for attempt in range(self._server_settings.cleanup.max_attempts):
                 try:
                     response = self._client.delete(
                         base + "/internal/v1/ml-model-training/subscriptions/" + subscription_id
@@ -1095,8 +1107,8 @@ class FLServerOrchestrator:
                     last_error = f"status {response.status_code}"
                 except httpx.TransportError as error:
                     last_error = str(error)
-                if attempt + 1 < self._settings.cleanup_max_attempts and self._closing.wait(
-                    self._settings.cleanup_retry_backoff_seconds
+                if attempt + 1 < self._server_settings.cleanup.max_attempts and self._closing.wait(
+                    self._server_settings.cleanup.retry_backoff_seconds
                 ):
                     break
             if last_error:

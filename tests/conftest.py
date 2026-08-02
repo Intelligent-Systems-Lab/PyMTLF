@@ -30,7 +30,7 @@ def build_bundle(
     }
     config = {
         "bundle_schema_version": "1.0",
-        "model_identity": {"provider_id": "local", "model_unique_id": 1},
+        "model_identity": {"model_unique_id": 1},
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "created_at": "2026-07-17T00:00:00Z",
@@ -81,7 +81,6 @@ def settings(tmp_path: Path) -> Settings:
         artifact=ArtifactSettings(public_base_url="http://127.0.0.1:9092"),
         federated_learning=FederatedLearningSettings(
             workspace_root=tmp_path / "fl-workspaces",
-            model_interoperability_ids=("001122",),
         ),
     )
 

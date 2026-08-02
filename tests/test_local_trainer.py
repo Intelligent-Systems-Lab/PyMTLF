@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import FittingSettings, ValidationSettings
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, wape_sums
 from py_mtlf.core.training_data import FEATURE_ORDER, ScopeTrainingData, TrainingDataset
@@ -77,10 +77,9 @@ def test_local_trainer_warm_starts_and_always_evaluates_candidate():
     candidate.model.load_state_dict(current.model.state_dict())
     before = {name: value.detach().clone() for name, value in candidate.model.state_dict().items()}
     result = LocalTrainer(
-        TrainingSettings(
+        FittingSettings(
             epochs=3,
             batch_size=8,
-            enforce_performance_gate=False,
         )
     ).train(current, candidate, training_dataset())
 
@@ -123,10 +122,11 @@ def test_per_scope_regression_rejects_candidate_even_when_aggregate_improves(
 
     monkeypatch.setattr(LocalTrainer, "_predict", staticmethod(predict))
     evaluation = LocalTrainer(
-        TrainingSettings(
+        FittingSettings(),
+        ValidationSettings(
             enforce_performance_gate=True,
             max_scope_wape_regression=0.02,
-        )
+        ),
     )._evaluate(current, candidate.model, candidate.scaler, dataset)
 
     assert evaluation.aggregate_candidate.value < evaluation.aggregate_current.value
@@ -147,9 +147,10 @@ def test_disabled_performance_gate_keeps_evaluation_but_accepts_regression(
         return scope.validation_targets + offset
 
     monkeypatch.setattr(LocalTrainer, "_predict", staticmethod(predict))
-    evaluation = LocalTrainer(TrainingSettings(enforce_performance_gate=False))._evaluate(
-        current, candidate.model, candidate.scaler, dataset
-    )
+    evaluation = LocalTrainer(
+        FittingSettings(),
+        ValidationSettings(enforce_performance_gate=False),
+    )._evaluate(current, candidate.model, candidate.scaler, dataset)
 
     assert evaluation.aggregate_candidate.value > evaluation.aggregate_current.value
     assert evaluation.accepted

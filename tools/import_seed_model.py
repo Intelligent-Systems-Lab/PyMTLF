@@ -31,7 +31,6 @@ def _build_bundle(
     source: Path,
     output: Path,
     *,
-    provider_namespace: str,
     model_id: int,
     event: str,
     model_interoperability: str,
@@ -40,10 +39,7 @@ def _build_bundle(
     config.update(
         {
             "bundle_schema_version": "1.0",
-            "model_identity": {
-                "provider_id": provider_namespace,
-                "model_unique_id": model_id,
-            },
+            "model_identity": {"model_unique_id": model_id},
             "analytics_event": event,
             "model_interoperability": model_interoperability,
             "runtime_compatibility": config.get(
@@ -91,7 +87,6 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--provider-namespace", required=True)
     parser.add_argument("--model-id", required=True, type=int)
     parser.add_argument("--event", default="UE_COMMUNICATION")
     parser.add_argument("--model-interoperability", required=True)
@@ -108,7 +103,6 @@ def main() -> None:
         _build_bundle(
             args.source,
             bundle,
-            provider_namespace=args.provider_namespace,
             model_id=args.model_id,
             event=args.event,
             model_interoperability=args.model_interoperability,
@@ -119,7 +113,6 @@ def main() -> None:
             {
                 "artifact_key": metadata.key,
                 "model_id": args.model_id,
-                "provider_namespace": args.provider_namespace,
                 "url": metadata.url,
             },
             sort_keys=True,

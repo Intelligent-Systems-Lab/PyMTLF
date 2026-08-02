@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import FittingSettings
 from py_mtlf.core.dataset import DatasetRecord, DatasetSnapshot
 from py_mtlf.core.training_data import FEATURE_ORDER, TrainingDataError, TrainingDatasetBuilder
 from py_mtlf.wire.adrf import TimeWindow
@@ -91,7 +91,7 @@ def snapshot(*, second_scope_observations: int = 400) -> DatasetSnapshot:
     ]
     return DatasetSnapshot(
         job_id="dataset-a",
-        family_key=("local-mtlf", "ue-communication-default"),
+        family_key="ue-communication-default",
         triggering_scope_key="scope-a",
         required_scope_keys=("scope-a", "scope-b"),
         time_window=TimeWindow(
@@ -118,7 +118,7 @@ def manifest() -> dict[str, object]:
 
 
 def test_builder_preserves_feature_aggregation_and_purged_chronological_split():
-    dataset = TrainingDatasetBuilder(TrainingSettings()).build(snapshot(), manifest())
+    dataset = TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
 
     scope = dataset.scopes[0]
     assert scope.observation_count == 400
@@ -142,7 +142,7 @@ def test_builder_preserves_feature_aggregation_and_purged_chronological_split():
 
 
 def test_non_triggering_scope_can_train_without_reference_validation():
-    dataset = TrainingDatasetBuilder(TrainingSettings()).build(
+    dataset = TrainingDatasetBuilder(FittingSettings()).build(
         snapshot(second_scope_observations=100),
         manifest(),
     )
@@ -167,4 +167,4 @@ def test_triggering_scope_requires_training_and_reference_validation():
     )
 
     with pytest.raises(TrainingDataError, match="triggering scope"):
-        TrainingDatasetBuilder(TrainingSettings()).build(insufficient, manifest())
+        TrainingDatasetBuilder(FittingSettings()).build(insufficient, manifest())

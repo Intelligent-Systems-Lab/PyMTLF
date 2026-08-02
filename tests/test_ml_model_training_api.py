@@ -1,23 +1,22 @@
 from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
-from py_mtlf.config import FederatedLearningSettings, RuntimeSettings
+from py_mtlf.config import FederatedLearningSettings, FLClientSettings, Settings
 
 
 def test_training_requirements_failure_identifies_invalid_parameters(
     settings,
     tmp_path,
 ):
-    configured = settings.model_copy(
-        update={
-            "runtime": RuntimeSettings(mode="fl_client"),
-            "federated_learning": FederatedLearningSettings(
-                workspace_root=tmp_path / "fl-client",
-                public_base_url=settings.artifact.public_base_url,
-                model_interoperability_ids=("001122",),
-            ),
-        }
+    payload = settings.model_dump(mode="python")
+    payload["runtime"] = {"mode": "fl_client"}
+    payload["local_training"] = None
+    payload["federated_learning"] = FederatedLearningSettings(
+        workspace_root=tmp_path / "fl-client",
+        public_base_url=settings.artifact.public_base_url,
+        client=FLClientSettings(model_interoperability_ids=("001122",)),
     )
+    configured = Settings.model_validate(payload)
     with TestClient(create_app(configured)) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",

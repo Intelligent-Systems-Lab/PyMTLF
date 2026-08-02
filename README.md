@@ -18,9 +18,8 @@ Before using the sample configuration, import the initial seed bundle:
 
 ```bash
 uv run python tools/import_seed_model.py \
-  --config config/config.yaml \
+  --config config/local.yaml \
   --source seed_models/initial \
-  --provider-namespace local-mtlf \
   --model-id 1 \
   --model-interoperability 001122
 ```
@@ -40,7 +39,7 @@ descriptor.
 uv sync --dev
 uv run pytest -q
 uv run ruff check .
-uv run python run.py --config config/config.yaml
+uv run python run.py --config config/local.yaml
 ```
 
 The default listener is `127.0.0.1:9092`. Runtime state is stored below
@@ -48,22 +47,23 @@ The default listener is `127.0.0.1:9092`. Runtime state is stored below
 `seed_models/`; PyAnLF is only a provisioned artifact consumer and does not
 provide the initial model source.
 
-`runtime.mode` defines the containing NWDAF role:
+Choose one annotated profile rather than combining unrelated role settings:
 
-- `local` keeps the existing single-NWDAF provision, monitor, dataset, and
-  bounded local-training lifecycle.
-- `fl_server` exposes provision and monitor behavior but does not start the
-  local trainer. It is the foundation for the later federated server
-  coordinator.
-- `fl_client` exposes health, sync, artifact, and ADRF foundations only. It
-  does not mount provision or monitor routes and does not start a placeholder
-  training service.
+- `config/local.yaml` keeps the single-NWDAF provision, monitor, dataset, and
+  bounded local-training lifecycle. Its fitting and validation settings are
+  under `local_training`.
+- `config/fl-server.yaml` owns model provision, accuracy monitoring, federated
+  process coordination, final validation, publication, and cutover. Server-only
+  controls are under `federated_learning.server`.
+- `config/fl-client.yaml` owns ADRF dataset preparation, local round fitting,
+  final validation work, and outbound callbacks. Client-only controls are under
+  `federated_learning.client`.
 
-Every mode validates that `federated_learning.workspace_root` is writable at
-startup. Readiness includes `runtimeMode`; the workspace TTL, public artifact
-base URL, allowed download origins, and download timeout are configuration
-foundations for later training rounds. No Model Training HTTP route or FedAvg
-worker is implemented in this stage.
+The loader rejects unknown keys and incompatible role branches. For example,
+`fl_server` requires `federated_learning.server` and rejects client or local
+training settings. Every role validates that
+`federated_learning.workspace_root` is writable at startup, and readiness
+includes `runtimeMode`.
 
 See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
 standard-shaped operations PyMTLF sends through the containing Go NWDAF.

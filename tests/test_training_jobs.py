@@ -13,9 +13,9 @@ import torch
 from sklearn.preprocessing import StandardScaler
 
 from py_mtlf.config import (
+    LocalTrainingSettings,
     ModelProvisionSettings,
     SeedModelSettings,
-    TrainingSettings,
 )
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetRecord, DatasetSnapshot
@@ -81,10 +81,7 @@ def make_seed_bundle(path: Path) -> None:
     }
     manifest = {
         "bundle_schema_version": "1.0",
-        "model_identity": {
-            "provider_id": "local",
-            "model_unique_id": 1,
-        },
+        "model_identity": {"model_unique_id": 1},
         "model_generation": 1,
         "analytics_event": "UE_COMMUNICATION",
         "created_at": "2026-07-25T00:00:00Z",
@@ -157,7 +154,7 @@ def snapshot(record_count: int) -> DatasetSnapshot:
         )
     return DatasetSnapshot(
         job_id="dataset-1",
-        family_key=("local", "ue-communication-default"),
+        family_key="ue-communication-default",
         triggering_scope_key="scope-a",
         required_scope_keys=("scope-a",),
         time_window=TimeWindow(startTime=start, stopTime=stop),
@@ -238,7 +235,6 @@ def coordinator_subject(settings, tmp_path, record_count):
     seed = artifacts.publish(seed_path)
     catalog = ModelCatalog(
         ModelProvisionSettings(
-            provider_namespace="local",
             seed_models=(
                 SeedModelSettings(
                     family_id="ue-communication-default",
@@ -269,10 +265,9 @@ def coordinator_subject(settings, tmp_path, record_count):
     policy = PolicyStub()
     notifications = NotificationStub()
     coordinator = TrainingCoordinator(
-        TrainingSettings(
+        LocalTrainingSettings(
             epochs=1,
             batch_size=16,
-            enforce_performance_gate=False,
         ),
         datasets,
         catalog,
@@ -305,7 +300,7 @@ def test_ready_snapshot_runs_one_local_training_and_promotes_candidate(
     assert job is not None
     assert job.promoted_generation == 2
     assert job.candidate_artifact_key
-    family_key = ("local", "ue-communication-default")
+    family_key = "ue-communication-default"
     assert catalog.current(family_key).artifact.key == job.candidate_artifact_key
     assert catalog.current(family_key).model_id > 1
     assert artifacts.manifest(job.candidate_artifact_key)["model_generation"] == 2
@@ -317,7 +312,7 @@ def test_ready_snapshot_runs_one_local_training_and_promotes_candidate(
     assert notifications.models == [family_key]
     assert policy.generation == (
         family_key,
-        ("local", 1),
+        1,
         catalog.current(family_key).version_key,
         ("scope-a",),
     )
@@ -330,7 +325,7 @@ def test_insufficient_triggering_scope_fails_and_releases_claim(
     coordinator, datasets, catalog, _artifacts, notifications, policy = coordinator_subject(
         settings, tmp_path, record_count=12
     )
-    original = catalog.current(("local", "ue-communication-default"))
+    original = catalog.current("ue-communication-default")
     coordinator.open()
     coordinator.submit("dataset-1")
     wait_until(
@@ -344,7 +339,7 @@ def test_insufficient_triggering_scope_fails_and_releases_claim(
     job = coordinator.job_for_dataset("dataset-1")
     assert job is not None
     assert "insufficient" in job.failure
-    assert catalog.current(("local", "ue-communication-default")) == original
+    assert catalog.current("ue-communication-default") == original
     assert datasets.outcome["success"] is False
     assert notifications.models == []
     assert policy.generation is None

@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import LocalTrainingSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.bundle_builder import CandidateBundleBuilder
@@ -46,7 +46,7 @@ class TrainingJob:
 class TrainingCoordinator:
     def __init__(
         self,
-        settings: TrainingSettings,
+        settings: LocalTrainingSettings,
         datasets: DatasetCoordinator,
         catalog: ModelCatalog,
         artifacts: ArtifactRepository,
@@ -62,7 +62,7 @@ class TrainingCoordinator:
         self._notifications = notifications
         self._policy = accuracy_policy
         self._builder = TrainingDatasetBuilder(settings)
-        self._trainer = LocalTrainer(settings)
+        self._trainer = LocalTrainer(settings, settings.validation)
         self._loader = TrustedBundleLoader()
         self._bundle_builder = CandidateBundleBuilder()
         self._queue: queue.Queue[str | None] = queue.Queue(maxsize=settings.max_queue_size)

@@ -7,6 +7,8 @@ from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
     FederatedLearningSettings,
+    FLClientSettings,
+    FLServerSettings,
     ModelProvisionSettings,
     RuntimeSettings,
     SeedModelSettings,
@@ -134,3 +136,49 @@ def test_runtime_rejects_unknown_mode():
 def test_federated_learning_settings_fail_fast(payload):
     with pytest.raises(ValidationError):
         FederatedLearningSettings.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("mode", "federated_learning", "local_training"),
+    [
+        ("fl_server", {}, None),
+        ("fl_client", {}, None),
+        ("local", {"server": FLServerSettings()}, {}),
+        ("fl_server", {"server": FLServerSettings(), "client": FLClientSettings()}, None),
+        ("fl_client", {"client": FLClientSettings()}, {}),
+    ],
+)
+def test_runtime_rejects_missing_or_conflicting_role_settings(
+    mode,
+    federated_learning,
+    local_training,
+):
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {
+                "runtime": {"mode": mode},
+                "federated_learning": federated_learning,
+                "local_training": local_training,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "mode"),
+    [
+        ("local.yaml", "local"),
+        ("fl-server.yaml", "fl_server"),
+        ("fl-client.yaml", "fl_client"),
+    ],
+)
+def test_tracked_role_profiles_are_valid(profile, mode):
+    path = Path(__file__).parents[1] / "config" / profile
+
+    assert load_settings(path).runtime.mode == mode
+
+
+def test_removed_flat_training_and_fl_role_keys_are_rejected():
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"training": {"epochs": 1}})
+    with pytest.raises(ValidationError):
+        FederatedLearningSettings.model_validate({"round_count": 2})

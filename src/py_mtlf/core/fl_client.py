@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import httpx
 
-from py_mtlf.config import FederatedLearningSettings, NotificationSettings, TrainingSettings
+from py_mtlf.config import FederatedLearningSettings, FLClientSettings, NotificationSettings
 from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
@@ -100,20 +100,21 @@ class FLClientService:
     def __init__(
         self,
         settings: FederatedLearningSettings,
+        client_settings: FLClientSettings,
         notification_settings: NotificationSettings,
-        training_settings: TrainingSettings,
         projection: SyncProjection,
         datasets: DatasetCoordinator,
         workspace: FLWorkspace,
         client: httpx.Client | None = None,
     ) -> None:
         self._settings = settings
+        self._client_settings = client_settings
         self._notification_settings = notification_settings
         self._projection = projection
         self._datasets = datasets
         self._workspace = workspace
-        self._trainer = FederatedTrainer(training_settings)
-        self._dataset_builder = TrainingDatasetBuilder(training_settings)
+        self._trainer = FederatedTrainer(client_settings.training)
+        self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds,
@@ -123,19 +124,19 @@ class FLClientService:
         self._lock = threading.RLock()
         self._resources: dict[str, FLClientResource] = {}
         self._executor = ThreadPoolExecutor(
-            max_workers=settings.max_concurrent_client_jobs,
+            max_workers=client_settings.max_concurrent_jobs,
             thread_name_prefix="fl-client",
         )
         self._outbox_executor = ThreadPoolExecutor(
-            max_workers=min(2, settings.max_concurrent_client_jobs),
+            max_workers=min(2, client_settings.max_concurrent_jobs),
             thread_name_prefix="fl-client-outbox",
         )
         self._futures: set[Future] = set()
         self._outbox_futures: set[Future] = set()
         self._outbox_keys: set[tuple[str, int]] = set()
         self._delay_timers: dict[str, threading.Timer] = {}
-        self._capacity = threading.BoundedSemaphore(settings.max_concurrent_client_jobs)
-        self._outbox_capacity = threading.BoundedSemaphore(settings.callback_queue_size)
+        self._capacity = threading.BoundedSemaphore(client_settings.max_concurrent_jobs)
+        self._outbox_capacity = threading.BoundedSemaphore(client_settings.callback_queue_size)
         self._closing = threading.Event()
 
     def close(self) -> None:
@@ -859,13 +860,13 @@ class FLClientService:
         maximum = report.maximum_response_time if report is not None else None
         if maximum is None:
             maximum = (
-                self._settings.preparation_timeout_seconds
+                self._client_settings.fallback_deadlines.preparation_timeout_seconds
                 if resource.state == FLClientState.PREPARING
-                else self._settings.round_timeout_seconds
+                else self._client_settings.fallback_deadlines.round_timeout_seconds
             )
         delay = max(
             0.001,
-            maximum - self._settings.callback_deadline_margin_seconds,
+            maximum - self._client_settings.callback_deadline_margin_seconds,
         )
         timer = threading.Timer(
             delay,
@@ -993,7 +994,9 @@ class FLClientService:
                         "only UE_COMMUNICATION training is supported",
                     )
                 )
-            if event.model_interoperability not in set(self._settings.model_interoperability_ids):
+            if event.model_interoperability not in set(
+                self._client_settings.model_interoperability_ids
+            ):
                 violations.append(
                     InvalidParameter(
                         f"mLEventSubscs[{index}].modelInterInfo",
@@ -1025,7 +1028,8 @@ class FLClientService:
         if (
             report is not None
             and report.maximum_response_time is not None
-            and report.maximum_response_time <= self._settings.callback_deadline_margin_seconds
+            and report.maximum_response_time
+            <= self._client_settings.callback_deadline_margin_seconds
         ):
             violations.append(
                 InvalidParameter(

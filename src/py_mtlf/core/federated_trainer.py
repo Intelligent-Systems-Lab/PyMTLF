@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import FittingSettings
 from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, TrainingError
 from py_mtlf.core.training_data import TrainingDataset
 
@@ -22,7 +22,7 @@ class FederatedTrainingResult:
 class FederatedTrainer:
     """Train full local weights while preserving the Server-provided scaler."""
 
-    def __init__(self, settings: TrainingSettings) -> None:
+    def __init__(self, settings: FittingSettings) -> None:
         self._settings = settings
 
     def train(

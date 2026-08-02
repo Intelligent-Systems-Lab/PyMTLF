@@ -6,8 +6,8 @@ import pytest
 
 from py_mtlf.config import (
     FederatedLearningSettings,
+    FLClientSettings,
     NotificationSettings,
-    TrainingSettings,
 )
 from py_mtlf.core.dataset import DatasetJobState
 from py_mtlf.core.fl_client import (
@@ -75,10 +75,11 @@ def preparation_payload() -> dict:
 
 
 def fl_settings(tmp_path) -> FederatedLearningSettings:
-    return FederatedLearningSettings(
-        workspace_root=tmp_path,
-        model_interoperability_ids=("001122",),
-    )
+    return FederatedLearningSettings(workspace_root=tmp_path)
+
+
+def client_settings() -> FLClientSettings:
+    return FLClientSettings(model_interoperability_ids=("001122",))
 
 
 def test_create_admits_before_async_adrf_preparation(tmp_path):
@@ -86,8 +87,8 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
     datasets.submit_external.return_value = "dataset-job-1"
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         datasets,
         Mock(),
@@ -111,8 +112,8 @@ def test_duplicate_notification_correlation_is_rejected(tmp_path):
     datasets.submit_external.return_value = "dataset-job-1"
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         datasets,
         Mock(),
@@ -156,8 +157,8 @@ def test_preparation_rejects_unsupported_contract_requirements(
         payload["mLModelTrainInfos"][0][field] = value
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         Mock(),
         Mock(),
@@ -173,8 +174,8 @@ def test_preparation_rejects_unsupported_contract_requirements(
 def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         Mock(),
         Mock(),
@@ -221,8 +222,8 @@ def test_preparation_rejects_base_bundle_with_different_interoperability(tmp_pat
     workspace = Mock()
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         datasets,
         workspace,
@@ -263,8 +264,8 @@ def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
     datasets.submit_external.return_value = "dataset-job-1"
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         datasets,
         Mock(),
@@ -290,8 +291,8 @@ def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
 def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         Mock(),
         Mock(),
@@ -370,12 +371,12 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
     ]
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(
             max_attempts=1,
             initial_backoff_seconds=0.001,
             max_backoff_seconds=0.001,
         ),
-        TrainingSettings(),
         Mock(),
         datasets,
         Mock(),
@@ -428,8 +429,8 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
     )
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         Mock(),
         Mock(),
@@ -487,8 +488,8 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
 def test_restart_terminal_resource_rejects_future_update(tmp_path):
     service = FLClientService(
         fl_settings(tmp_path),
+        client_settings(),
         NotificationSettings(),
-        TrainingSettings(),
         Mock(),
         Mock(),
         Mock(),

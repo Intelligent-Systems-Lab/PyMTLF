@@ -6,20 +6,28 @@ from fastapi.testclient import TestClient
 
 from py_mtlf.api.ml_model_monitor import _dispatch_retrain_intents
 from py_mtlf.app import create_app
-from py_mtlf.config import FederatedLearningSettings, RuntimeSettings
+from py_mtlf.config import (
+    FLClientSettings,
+    FLServerSettings,
+)
 from py_mtlf.core.accuracy_policy import PolicyDecision
 
 
 def with_mode(settings, mode: str, workspace: Path):
-    return settings.model_copy(
-        update={
-            "runtime": RuntimeSettings(mode=mode),
-            "federated_learning": FederatedLearningSettings(
-                workspace_root=workspace,
-                public_base_url=settings.artifact.public_base_url,
-            ),
-        }
-    )
+    payload = settings.model_dump(mode="python")
+    payload["runtime"] = {"mode": mode}
+    payload["local_training"] = None
+    payload["federated_learning"] = {
+        "workspace_root": workspace,
+        "public_base_url": settings.artifact.public_base_url,
+        "server": FLServerSettings() if mode == "fl_server" else None,
+        "client": (
+            FLClientSettings(model_interoperability_ids=("001122",))
+            if mode == "fl_client"
+            else None
+        ),
+    }
+    return settings.__class__.model_validate(payload)
 
 
 def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):

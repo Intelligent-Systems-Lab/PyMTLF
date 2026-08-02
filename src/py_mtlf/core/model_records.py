@@ -209,8 +209,7 @@ class PendingPublication(DurableRecord):
 
 
 class DurableModelState(DurableRecord):
-    schema_version: Literal["1.0"]
-    provider_namespace: str = Field(min_length=1)
+    schema_version: Literal["2.0"]
     last_allocated_model_id: int = Field(ge=0)
     families: dict[str, ModelCatalogRecord] = Field(default_factory=dict)
     pending_publications: tuple[PendingPublication, ...] = ()
@@ -226,7 +225,7 @@ class DurableModelState(DurableRecord):
             for revision in catalog.revisions
         ]
         if len(completed) != len(set(completed)):
-            raise ValueError("completed model IDs must be provider-wide unique")
+            raise ValueError("completed model IDs must be unique")
         pending = [item.reserved_model_id for item in self.pending_publications]
         if len(pending) != len(set(pending)):
             raise ValueError("pending model IDs must be provider-wide unique")
@@ -269,8 +268,6 @@ class DurableModelStateRepository:
                     )
                 except (OSError, ValueError) as error:
                     raise RuntimeError("durable model state cannot be loaded") from error
-                if state.provider_namespace != initial.provider_namespace:
-                    raise RuntimeError("durable model state provider namespace changed")
                 self._state = state
             else:
                 self._write(initial)

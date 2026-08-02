@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from py_mtlf.config import FederatedLearningSettings
+from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
@@ -191,6 +191,7 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
     process.participants = [participant]
     orchestrator = FLServerOrchestrator(
         FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
         Mock(),
         Mock(),
         Mock(),
@@ -271,6 +272,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
     workspace.download.return_value = Mock(key="6" * 64)
     orchestrator = FLServerOrchestrator(
         FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
         Mock(),
         Mock(),
         Mock(),

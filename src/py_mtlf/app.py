@@ -20,7 +20,7 @@ from py_mtlf.api import (
     ml_model_training,
     sync,
 )
-from py_mtlf.config import Settings
+from py_mtlf.config import FLClientSettings, FLServerSettings, LocalTrainingSettings, Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
@@ -95,6 +95,9 @@ def create_app(
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
     adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
     fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
+    local_training = settings.local_training or LocalTrainingSettings()
+    fl_client_settings = settings.federated_learning.client or FLClientSettings()
+    fl_server_settings = settings.federated_learning.server or FLServerSettings()
 
     def resume_published_cutover(publication_record, model) -> None:
         family_key = seed_catalog.family_key_for_id(publication_record.family_id)
@@ -153,7 +156,7 @@ def create_app(
         adrf_resolver,
     )
     training_coordinator = TrainingCoordinator(
-        settings.training,
+        local_training,
         dataset_coordinator,
         seed_catalog,
         artifact_repository,
@@ -167,20 +170,20 @@ def create_app(
     )
     fl_client = FLClientService(
         settings.federated_learning,
+        fl_client_settings,
         settings.notification,
-        settings.training,
         sync_projection,
         dataset_coordinator,
         fl_workspace,
     )
     fl_server = FLServerOrchestrator(
         settings.federated_learning,
+        fl_server_settings,
         sync_projection,
         accuracy_policy,
         seed_catalog,
         fl_workspace,
         fl_client_resolver,
-        training_settings=settings.training,
         publication=publication,
         provision_notifications=provision_notifications,
     )
@@ -330,8 +333,7 @@ def _initial_model_state(catalog: SeedCatalog) -> DurableModelState:
         )
         allocated = max(allocated, model.model_id)
     return DurableModelState(
-        schemaVersion="1.0",
-        providerNamespace=catalog.provider_namespace,
+        schemaVersion="2.0",
         lastAllocatedModelId=allocated,
         families=families,
     )

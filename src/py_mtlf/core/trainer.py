@@ -14,7 +14,7 @@ import torch
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-from py_mtlf.config import TrainingSettings
+from py_mtlf.config import FittingSettings, ValidationSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.training_data import ScopeTrainingData, TrainingDataError, TrainingDataset
 
@@ -172,8 +172,13 @@ class TrustedBundleLoader:
 
 
 class LocalTrainer:
-    def __init__(self, settings: TrainingSettings) -> None:
+    def __init__(
+        self,
+        settings: FittingSettings,
+        validation_settings: ValidationSettings | None = None,
+    ) -> None:
         self._settings = settings
+        self._validation_settings = validation_settings or ValidationSettings()
 
     def train(
         self,
@@ -328,7 +333,7 @@ class LocalTrainer:
         aggregate_current = wape_sums(current_error, current_actual)
         aggregate_candidate = wape_sums(candidate_error, candidate_actual)
         reasons = []
-        if self._settings.enforce_performance_gate:
+        if self._validation_settings.enforce_performance_gate:
             trigger = next(item for item in evaluations if item.triggering_scope)
             if trigger.candidate.value >= trigger.current.value:
                 reasons.append("triggering_scope_not_improved")
@@ -337,7 +342,7 @@ class LocalTrainer:
             for item in evaluations:
                 if (
                     not item.triggering_scope
-                    and item.delta > self._settings.max_scope_wape_regression
+                    and item.delta > self._validation_settings.max_scope_wape_regression
                 ):
                     reasons.append(f"scope_regression_exceeded:{item.scope_digest}")
         return CandidateEvaluation(
