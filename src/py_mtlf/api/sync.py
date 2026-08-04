@@ -89,8 +89,9 @@ def sync_backend(payload: BackendSyncRequest, request: Request) -> BackendSyncRe
             )
         )
     logger.info(
-        "Backend snapshot accepted training_data_source=%s",
+        "Backend snapshot accepted training_data_source=%s training_data_descriptors=%d",
         payload.training_data_source,
+        len(payload.training_data_descriptors),
     )
     return BackendSyncResponse(
         processInstanceId=request.app.state.runtime.process_instance_id,

@@ -48,8 +48,12 @@ class AdrfResolver:
         if self._owns_client:
             self._client.close()
 
-    def resolve(self) -> str | None:
-        target = self._resolve_service("nadrf-datamanagement", "data-storage-ind")
+    def resolve(self, required_nf_instance_id: str = "") -> str | None:
+        target = self._resolve_service(
+            "nadrf-datamanagement",
+            "data-storage-ind",
+            required_nf_instance_id,
+        )
         return target.api_root if target is not None else None
 
     def resolve_model(self) -> SelectedTarget | None:
@@ -60,14 +64,22 @@ class AdrfResolver:
             if service_name is None:
                 self._cached.clear()
             else:
-                self._cached.pop(service_name, None)
+                for key in tuple(self._cached):
+                    if key == service_name or key.startswith(service_name + "|"):
+                        self._cached.pop(key, None)
 
     def _resolve_service(
         self,
         service_name: str,
         capability_indicator: str,
+        required_nf_instance_id: str = "",
     ) -> SelectedTarget | None:
         if self._settings.mode == "configured":
+            if (
+                required_nf_instance_id
+                and required_nf_instance_id != self._settings.configured_nf_instance_id
+            ):
+                return None
             return SelectedTarget(
                 nfInstanceId=self._settings.configured_nf_instance_id,
                 nfServiceInstanceId=f"configured-{service_name}",
@@ -76,22 +88,26 @@ class AdrfResolver:
                 selectionSource="CONFIG",
             )
         now = time.monotonic()
+        cache_key = f"{service_name}|{required_nf_instance_id}"
         with self._lock:
-            cached = self._cached.get(service_name)
+            cached = self._cached.get(cache_key)
             if cached is not None and now < cached[1]:
                 return cached[0]
         snapshot = self._projection.snapshot()
         if snapshot is None:
             return None
         base = snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        params = {
+            "target-nf-type": "ADRF",
+            "requester-nf-type": "NWDAF",
+            "service-names": service_name,
+            capability_indicator: "true",
+        }
+        if required_nf_instance_id:
+            params["target-nf-instance-id"] = required_nf_instance_id
         response = self._client.get(
             f"{base}/internal/v1/nrf/nf-instances",
-            params={
-                "target-nf-type": "ADRF",
-                "requester-nf-type": "NWDAF",
-                "service-names": service_name,
-                capability_indicator: "true",
-            },
+            params=params,
         )
         response.raise_for_status()
         result = response.json()
@@ -102,6 +118,8 @@ class AdrfResolver:
         candidates: list[tuple[str, str, str]] = []
         for profile in instances:
             if profile.get("nfStatus") not in {"", None, "REGISTERED"}:
+                continue
+            if required_nf_instance_id and profile.get("nfInstanceId") != required_nf_instance_id:
                 continue
             services = [
                 (str(service.get("serviceInstanceId", "")), service)
@@ -139,7 +157,7 @@ class AdrfResolver:
             else None
         )
         with self._lock:
-            self._cached[service_name] = (
+            self._cached[cache_key] = (
                 selected,
                 now + validity if validity > 0 else now,
             )

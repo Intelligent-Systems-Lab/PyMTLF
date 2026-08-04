@@ -11,8 +11,8 @@ class TimeWindow(SpecAlignedModel):
 
     @model_validator(mode="after")
     def validate_order(self) -> "TimeWindow":
-        if self.start_time >= self.stop_time:
-            raise ValueError("timePeriod startTime must be before stopTime")
+        if self.start_time > self.stop_time:
+            raise ValueError("timePeriod startTime must not be after stopTime")
         return self
 
 

@@ -47,6 +47,9 @@ class ResolvedResource:
     scope_keys: tuple[str, ...]
     smf_data_sub: dict
     supi: str
+    adrf_instance_id: str = ""
+    available_start: datetime | None = None
+    available_stop: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +322,8 @@ class DatasetCoordinator:
     def _resolve(
         self, intent: RetrainIntent, sync: BackendSyncRequest
     ) -> tuple[ResolvedResource, ...]:
+        if sync.training_data_descriptors:
+            return self._resolve_descriptors(intent, sync)
         scope_to_subscriptions: dict[str, set[str]] = {}
         for scope in intent.active_scopes:
             matched = {
@@ -364,6 +369,74 @@ class DatasetCoordinator:
                 raise RuntimeError(f"scope {scope} has no usable SMF collection resource")
         return tuple(resolved)
 
+    def _resolve_descriptors(
+        self,
+        intent: RetrainIntent,
+        sync: BackendSyncRequest,
+    ) -> tuple[ResolvedResource, ...]:
+        now = self._clock().astimezone(UTC)
+        resolved: list[ResolvedResource] = []
+        for descriptor in sync.training_data_descriptors:
+            if descriptor.retain_until <= now:
+                continue
+            event = descriptor.ml_event_subscription
+            scopes = tuple(
+                sorted(
+                    scope.scope_key
+                    for scope in intent.active_scopes
+                    if scope.ml_event == event.ml_event
+                    and (scope.target_ue is None or scope.target_ue == event.target_ue)
+                    and (
+                        not scope.ml_event_filter
+                        or scope.ml_event_filter == (event.ml_event_filter or {})
+                    )
+                )
+            )
+            if not scopes:
+                continue
+            smf_data_sub = descriptor.stored_data_spec.data_spec.smf_data_sub.model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            )
+            resolved.append(
+                ResolvedResource(
+                    identity=descriptor.correlation_id,
+                    scope_keys=scopes,
+                    smf_data_sub=smf_data_sub,
+                    supi=descriptor.stored_data_spec.data_spec.smf_data_sub.supi,
+                    adrf_instance_id=descriptor.adrf_instance_id,
+                    available_start=descriptor.stored_data_spec.time_period.start_time,
+                    available_stop=descriptor.stored_data_spec.time_period.stop_time,
+                )
+            )
+        for scope in intent.active_scope_keys:
+            if not any(scope in resource.scope_keys for resource in resolved):
+                reference = next(
+                    item for item in intent.active_scopes if item.scope_key == scope
+                )
+                logger.warning(
+                    "No training-data descriptor matches scope=%s event=%s filter=%s "
+                    "target=%s candidates=%s",
+                    scope,
+                    reference.ml_event,
+                    reference.ml_event_filter,
+                    reference.target_ue,
+                    [
+                        {
+                            "correlationId": item.correlation_id,
+                            "state": item.state,
+                            "mLEvent": item.ml_event_subscription.ml_event,
+                            "mLEventFilter": item.ml_event_subscription.ml_event_filter,
+                            "tgtUe": item.ml_event_subscription.target_ue,
+                            "retainUntil": item.retain_until.isoformat(),
+                        }
+                        for item in sync.training_data_descriptors
+                    ],
+                )
+                raise RuntimeError(f"scope {scope} has no usable training-data descriptor")
+        return tuple(sorted(resolved, key=lambda item: item.identity))
+
     @staticmethod
     def _matches_scope(scope: ScopeReference, subscription: dict) -> bool:
         for event in subscription.get("eventSubscriptions") or []:
@@ -381,13 +454,33 @@ class DatasetCoordinator:
         return False
 
     def _retrieve_adrf(self, job: DatasetJob, sync: BackendSyncRequest) -> None:
-        api_root = self._resolver.resolve()
+        adrf_ids = {
+            resource.adrf_instance_id
+            for resource in job.resources
+            if resource.adrf_instance_id
+        }
+        if len(adrf_ids) > 1:
+            raise RuntimeError("one dataset job cannot span multiple ADRF instances")
+        api_root = self._resolver.resolve(next(iter(adrf_ids), ""))
         if not api_root:
             raise RuntimeError("ADRF could not be resolved")
         callback = sync.containing_nwdaf.api_base_uri.rstrip("/") + "/collector/retrieval-notify"
         go_base = sync.containing_nwdaf.internal_callback_base_uri.rstrip("/")
         create_url = go_base + "/internal/v1/adrf-data-management/data-retrieval-subscriptions"
         for resource in job.resources:
+            start_time = max(
+                job.time_window.start_time,
+                resource.available_start or job.time_window.start_time,
+            )
+            stop_time = min(
+                job.time_window.stop_time,
+                resource.available_stop or job.time_window.stop_time,
+            )
+            if start_time > stop_time:
+                raise RuntimeError(
+                    f"training-data descriptor {resource.identity} does not overlap "
+                    "the requested dataset window"
+                )
             correlation = str(uuid4())
             route = AdrfRoute(correlation, resource)
             with self._lock:
@@ -396,7 +489,7 @@ class DatasetCoordinator:
             payload = NadrfDataRetrievalSubscription(
                 notifCorrId=correlation,
                 notificationURI=callback,
-                timePeriod=job.time_window,
+                timePeriod=TimeWindow(startTime=start_time, stopTime=stop_time),
                 dataSub=DataSubscription(smfDataSub=resource.smf_data_sub),
                 consTrigNotif=True,
             )

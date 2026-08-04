@@ -161,6 +161,59 @@ def test_scope_resolution_keeps_all_active_groups_and_peer_identity():
     coordinator._client.close()
 
 
+def test_scope_resolution_prefers_retained_training_data_descriptors():
+    policy, intent = retrain_intent()
+    payload = sync_snapshot().model_dump(by_alias=True, mode="json")
+    payload["smfResources"] = []
+    payload["trainingDataSource"] = "adrf"
+    payload["trainingDataDescriptors"] = [
+        {
+            "correlationId": f"descriptor-{group}",
+            "state": "RETAINED",
+            "storedDataSpec": {
+                "dataSpec": {
+                    "smfDataSub": {
+                        "supi": f"imsi-{index}",
+                        "pduSeId": 10,
+                        "notifId": f"corr-{group}",
+                        "notifUri": "http://anlf.example/callback",
+                        "eventSubs": [{"event": "UPF_EVENT"}],
+                    }
+                },
+                "timePeriod": {
+                    "startTime": "2026-08-04T09:00:00Z",
+                    "stopTime": "2026-08-04T09:30:00Z",
+                },
+            },
+            "mlEventSubscription": {
+                "mLEvent": "UE_COMMUNICATION",
+                "tgtUe": {"intGroupIds": [group]},
+            },
+            "sourceNfInstanceId": "11111111-1111-4111-8111-111111111111",
+            "adrfInstanceId": "22222222-2222-4222-8222-222222222222",
+            "retainUntil": "2099-08-04T10:30:00Z",
+        }
+        for index, group in enumerate(("group-a", "group-b"), start=1)
+    ]
+    snapshot = BackendSyncRequest.model_validate(payload)
+    projection = SyncProjection()
+    projection.replace(snapshot)
+    coordinator = DatasetCoordinator(
+        DatasetSettings(), projection, policy, Mock(close=Mock())
+    )
+
+    resources = coordinator._resolve(intent, projection.snapshot())
+
+    assert {resource.identity for resource in resources} == {
+        "descriptor-group-a",
+        "descriptor-group-b",
+    }
+    assert {resource.adrf_instance_id for resource in resources} == {
+        "22222222-2222-4222-8222-222222222222"
+    }
+    coordinator._client.close()
+
+
 def test_training_scope_matches_standard_event_subscription_network_area():
     tai = {
         "plmnId": {"mcc": "466", "mnc": "92"},

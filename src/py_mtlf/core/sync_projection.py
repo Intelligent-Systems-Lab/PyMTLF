@@ -19,6 +19,10 @@ class SyncProjection:
                 [item.correlation_id for item in snapshot.smf_resources],
             ),
             (
+                "trainingDataDescriptors.correlationId",
+                [item.correlation_id for item in snapshot.training_data_descriptors],
+            ),
+            (
                 "mlModelProvisionSubscriptions.subscriptionId",
                 [item.subscription_id for item in snapshot.ml_model_provision_subscriptions],
             ),
