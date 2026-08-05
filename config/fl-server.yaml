@@ -56,6 +56,8 @@ federated_learning:
     callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
     # Initial preparation deadline offered to every selected Client.
     preparation_timeout_seconds: 300
+    # Historical data interval requested from each Client during preparation.
+    preparation_data_window_seconds: 3600
     # Deadline offered for each fitting round and final validation round.
     round_timeout_seconds: 300
     # Number of FedAvg fitting rounds; final validation is an additional round.

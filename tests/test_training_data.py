@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import pytest
 
 from py_mtlf.config import FittingSettings
@@ -122,8 +123,8 @@ def test_builder_preserves_feature_aggregation_and_purged_chronological_split():
 
     scope = dataset.scopes[0]
     assert scope.observation_count == 400
-    assert scope.validation_sample_count == 20
-    assert scope.training_sample_count == 290
+    assert scope.validation_sample_count == 34
+    assert scope.training_sample_count == 306
     assert scope.training_inputs is not None
     assert scope.training_inputs[0, 0].tolist() == [
         3,
@@ -143,7 +144,7 @@ def test_builder_preserves_feature_aggregation_and_purged_chronological_split():
 
 def test_non_triggering_scope_can_train_without_reference_validation():
     dataset = TrainingDatasetBuilder(FittingSettings()).build(
-        snapshot(second_scope_observations=100),
+        snapshot(second_scope_observations=60),
         manifest(),
     )
 
@@ -153,6 +154,34 @@ def test_non_triggering_scope_can_train_without_reference_validation():
     assert secondary.exclusion_reason == "insufficient_reference_validation_data"
     assert secondary in dataset.training_scopes
     assert secondary not in dataset.evaluation_scopes
+
+
+def test_window_first_split_keeps_validation_and_training_observations_disjoint():
+    observations = tuple(
+        np.full(len(FEATURE_ORDER), index, dtype=float) for index in range(62)
+    )
+
+    scope = TrainingDatasetBuilder(FittingSettings())._scope_dataset(
+        "scope-a",
+        observations,
+        seq_length=30,
+        out_seq_len=1,
+        output_indices=(1, 2),
+        purge=30,
+    )
+
+    assert scope.validation_sample_count == 1
+    assert scope.training_sample_count == 1
+    assert scope.validation_inputs is not None
+    assert scope.validation_targets is not None
+    assert scope.training_inputs is not None
+    assert scope.training_targets is not None
+    assert scope.training_observations is not None
+    assert scope.validation_inputs[0, :, 0].tolist() == list(range(30))
+    assert scope.validation_targets[0].tolist() == [30, 30]
+    assert scope.training_inputs[0, :, 0].tolist() == list(range(31, 61))
+    assert scope.training_targets[0].tolist() == [61, 61]
+    assert scope.training_observations[0, 0] == 31
 
 
 def test_triggering_scope_requires_training_and_reference_validation():

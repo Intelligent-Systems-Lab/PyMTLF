@@ -198,8 +198,8 @@ local_training:
   learning_rate: 0.001
   # Full local-dataset passes per retraining job.
   epochs: 18
-  # Fraction of each prepared dataset reserved for validation instead of fitting.
-  validation_ratio: 0.20
+  # Oldest share of retained sliding-window samples used for validation.
+  validation_ratio: 0.10
   # Seed controlling deterministic split, shuffle, and model training behavior.
   random_seed: 42
   # Maximum standalone/local retraining jobs executed concurrently.

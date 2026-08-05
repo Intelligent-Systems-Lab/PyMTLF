@@ -7,6 +7,7 @@ from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
     FederatedLearningSettings,
+    FittingSettings,
     FLClientSettings,
     FLServerSettings,
     ModelProvisionSettings,
@@ -28,6 +29,8 @@ def test_defaults_use_confirmed_phase_one_values():
     assert settings.artifact.max_extracted_bytes == 1024 * 1024 * 1024
     assert settings.artifact.max_single_file_bytes == 512 * 1024 * 1024
     assert settings.artifact.max_entries == 32
+    assert FittingSettings().validation_ratio == 0.10
+    assert FLServerSettings().preparation_data_window_seconds == 3600
 
 
 def test_load_settings_rejects_unknown_fields(tmp_path):

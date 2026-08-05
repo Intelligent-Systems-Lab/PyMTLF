@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime
 from unittest.mock import Mock
 
 import httpx
@@ -222,6 +223,60 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
         assert participant.requested_extension == 30
         assert participant.accepted_delay_notification_digest == first_digest
         assert process.failure == ""
+    finally:
+        orchestrator.close()
+
+
+def test_preparation_uses_configured_historical_data_window(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    projection = SyncProjection()
+    projection.replace(
+        BackendSyncRequest.model_validate(
+            {
+                "containingNwdaf": {
+                    "nfInstanceId": "33333333-3333-4333-8333-333333333333",
+                    "apiBaseUri": "http://go-c.example",
+                    "internalCallbackBaseUri": "http://go-c-internal.example",
+                },
+                "eventsSubscriptions": [],
+                "smfResources": [],
+            }
+        )
+    )
+    client = Mock()
+    client.post.return_value = Mock(
+        status_code=201,
+        headers={"Location": "http://go.example/subscriptions/preparation-a"},
+    )
+    orchestrator = FLServerOrchestrator(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(preparation_data_window_seconds=3600),
+        projection,
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="preparation-client-a",
+    )
+    process = FLProcess(process_id="process-1", intent=Mock())
+    try:
+        orchestrator._create_preparation(
+            process,
+            participant,
+            "001122",
+            "http://server.example/base.tar.gz",
+        )
+
+        payload = client.post.call_args.kwargs["json"]
+        window = payload["mLModelTrainInfos"][0]["dataAvReq"]["timeWindows"][0]
+        start = datetime.fromisoformat(window["startTime"].replace("Z", "+00:00"))
+        stop = datetime.fromisoformat(window["stopTime"].replace("Z", "+00:00"))
+        assert (stop - start).total_seconds() == 3600
     finally:
         orchestrator.close()
 

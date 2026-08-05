@@ -184,21 +184,31 @@ class TrainingDatasetBuilder:
             if observations
             else np.empty((0, len(FEATURE_ORDER)), dtype=np.float64)
         )
-        split = int(math.floor(len(values) * self._settings.validation_ratio))
-        validation_observations = values[: max(split - purge, 0)]
-        training_observations = values[split:]
-        validation_inputs, validation_targets = self._windows(
-            validation_observations,
+        candidate_inputs, candidate_targets = self._windows(
+            values,
             seq_length,
             out_seq_len,
             output_indices,
         )
-        training_inputs, training_targets = self._windows(
-            training_observations,
-            seq_length,
-            out_seq_len,
-            output_indices,
-        )
+        retained_count = len(candidate_inputs) - purge
+        if retained_count >= 2:
+            validation_count = max(
+                1,
+                int(math.floor(retained_count * self._settings.validation_ratio)),
+            )
+            validation_count = min(validation_count, retained_count - 1)
+            training_start = validation_count + purge
+            validation_inputs = candidate_inputs[:validation_count]
+            validation_targets = candidate_targets[:validation_count]
+            training_inputs = candidate_inputs[training_start:]
+            training_targets = candidate_targets[training_start:]
+            training_observations = values[training_start:]
+        else:
+            validation_inputs = candidate_inputs[:0]
+            validation_targets = candidate_targets[:0]
+            training_inputs = candidate_inputs
+            training_targets = candidate_targets
+            training_observations = values
         training_eligible = len(training_inputs) > 0
         evaluation_eligible = len(validation_inputs) > 0
         reason = ""

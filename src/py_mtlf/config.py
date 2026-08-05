@@ -143,7 +143,7 @@ class FittingSettings(FrozenSettings):
     batch_size: int = Field(default=32, gt=0)
     learning_rate: float = Field(default=0.001, gt=0)
     epochs: int = Field(default=18, gt=0)
-    validation_ratio: float = Field(default=0.20, gt=0, lt=1)
+    validation_ratio: float = Field(default=0.10, gt=0, lt=1)
     random_seed: int = Field(default=42, ge=0)
 
     @field_validator("device")
@@ -218,6 +218,7 @@ class CleanupSettings(FrozenSettings):
 class FLServerSettings(FrozenSettings):
     callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
     preparation_timeout_seconds: int = Field(default=300, gt=0, le=86400)
+    preparation_data_window_seconds: int = Field(default=3600, gt=0, le=604800)
     round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
     round_count: int = Field(default=2, ge=1, le=100)
     max_active_processes: int = Field(default=1, gt=0, le=32)

@@ -323,7 +323,7 @@ def test_insufficient_triggering_scope_fails_and_releases_claim(
     tmp_path,
 ):
     coordinator, datasets, catalog, _artifacts, notifications, policy = coordinator_subject(
-        settings, tmp_path, record_count=12
+        settings, tmp_path, record_count=9
     )
     original = catalog.current("ue-communication-default")
     coordinator.open()

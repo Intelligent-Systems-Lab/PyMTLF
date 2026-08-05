@@ -693,7 +693,10 @@ class FLServerOrchestrator:
                         minNumSamples=1,
                         timeWindows=[
                             TimeWindow(
-                                startTime=now - timedelta(minutes=30),
+                                startTime=now
+                                - timedelta(
+                                    seconds=self._server_settings.preparation_data_window_seconds
+                                ),
                                 stopTime=now,
                             )
                         ],
