@@ -62,7 +62,7 @@ federated_learning:
       preparation_timeout_seconds: 300
       round_timeout_seconds: 300
     training:
-      # Allowed values: "cpu" (the current implementation has no GPU backend).
+      # Training device: "cpu", "cuda", or an explicit CUDA index such as "cuda:0".
       device: "cpu"
       # Samples processed before one optimizer update.
       batch_size: 32

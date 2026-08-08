@@ -13,7 +13,7 @@ dependencies = [
     "pymongo>=4.11.0",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
-    "torch>=2.10.0",
+    "torch==2.5.1",
     "uvicorn>=0.40.0",
 ]
 
@@ -42,3 +42,16 @@ extend-exclude = ["seed_models"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+
+[tool.uv]
+constraint-dependencies = [
+    "nvidia-nvjitlink-cu12==12.1.105; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

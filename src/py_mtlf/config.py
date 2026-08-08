@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -150,9 +151,12 @@ class FittingSettings(FrozenSettings):
     @classmethod
     def validate_device(cls, value: str) -> str:
         value = value.strip().lower()
-        if value != "cpu":
-            raise ValueError("training.device must be 'cpu' in the current implementation")
-        return value
+        if value == "cpu":
+            return value
+        match = re.fullmatch(r"cuda(?::(0|[1-9][0-9]*))?", value)
+        if match is None:
+            raise ValueError("training.device must be 'cpu', 'cuda', or 'cuda:N'")
+        return f"cuda:{match.group(1) or '0'}"
 
 
 class ValidationSettings(FrozenSettings):

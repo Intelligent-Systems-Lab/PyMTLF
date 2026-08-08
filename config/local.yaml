@@ -190,7 +190,7 @@ dataset:
 local_training:
   # Enable local fitting; false rejects new training work.
   enabled: true
-  # Allowed values: "cpu" (the current implementation has no GPU backend).
+  # Training device: "cpu", "cuda", or an explicit CUDA index such as "cuda:0".
   device: "cpu"
   # Training samples processed before one optimizer update.
   batch_size: 32

@@ -127,6 +127,20 @@ def test_runtime_rejects_unknown_mode():
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    [("cpu", "cpu"), ("CUDA", "cuda:0"), ("cuda:0", "cuda:0"), ("cuda:12", "cuda:12")],
+)
+def test_training_device_is_validated_and_canonicalized(value, expected):
+    assert FittingSettings(device=value).device == expected
+
+
+@pytest.mark.parametrize("value", ["", "auto", "gpu", "cuda:-1", "cuda:01", "mps"])
+def test_invalid_training_device_is_rejected(value):
+    with pytest.raises(ValidationError, match="training.device"):
+        FittingSettings(device=value)
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {"workspace_root": ""},

@@ -2,12 +2,14 @@ import math
 from dataclasses import replace
 
 import numpy as np
+import pytest
 import torch
 from sklearn.preprocessing import StandardScaler
 
 from py_mtlf.config import FittingSettings, ValidationSettings
+from py_mtlf.core import trainer as trainer_module
 from py_mtlf.core.federated_trainer import FederatedTrainer
-from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, wape_sums
+from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, resolve_device, wape_sums
 from py_mtlf.core.training_data import FEATURE_ORDER, ScopeTrainingData, TrainingDataset
 
 
@@ -90,6 +92,48 @@ def test_local_trainer_warm_starts_and_always_evaluates_candidate():
     assert any(
         not torch.equal(before[name], value) for name, value in result.model.state_dict().items()
     )
+    assert next(result.model.parameters()).device.type == "cpu"
+
+
+def test_cpu_device_is_available_without_cuda():
+    assert str(resolve_device("cpu")) == "cpu"
+
+
+def test_configured_cuda_device_fails_when_cuda_is_unavailable(monkeypatch):
+    monkeypatch.setattr(trainer_module.torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="cuda:0 is unavailable"):
+        LocalTrainer(FittingSettings(device="cuda:0"))
+
+
+def test_configured_cuda_index_must_exist(monkeypatch):
+    monkeypatch.setattr(trainer_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trainer_module.torch.cuda, "device_count", lambda: 1)
+
+    with pytest.raises(RuntimeError, match=r"cuda:1 is unavailable; 1 device\(s\) detected"):
+        FederatedTrainer(FittingSettings(device="cuda:1"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime is unavailable")
+def test_local_trainer_uses_cuda_and_returns_cpu_model():
+    current = bundle(TinyModel())
+    candidate = bundle(TinyModel())
+    result = LocalTrainer(
+        FittingSettings(device="cuda:0", epochs=1, batch_size=8)
+    ).train(current, candidate, training_dataset())
+
+    assert math.isfinite(result.final_loss)
+    assert next(result.model.parameters()).device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime is unavailable")
+def test_federated_trainer_uses_cuda_and_returns_cpu_model():
+    result = FederatedTrainer(
+        FittingSettings(device="cuda:0", epochs=1, batch_size=8)
+    ).train(bundle(TinyModel()), training_dataset())
+
+    assert math.isfinite(result.final_loss)
+    assert next(result.model.parameters()).device.type == "cpu"
 
 
 def test_wape_zero_denominator_matches_accuracy_policy():
@@ -115,7 +159,7 @@ def test_per_scope_regression_rejects_candidate_even_when_aggregate_improves(
     current = bundle(TinyModel())
     candidate = bundle(TinyModel())
 
-    def predict(model, _scaler, scope, _dataset):
+    def predict(model, _scaler, scope, _dataset, _device):
         if model is current.model:
             return np.full((2, 2), 5.0 if scope.scope_key == "scope-a" else 9.0)
         return np.full((2, 2), 8.0 if scope.scope_key == "scope-a" else 7.0)
@@ -141,7 +185,7 @@ def test_disabled_performance_gate_keeps_evaluation_but_accepts_regression(
     current = bundle(TinyModel())
     candidate = bundle(TinyModel())
 
-    def predict(model, _scaler, scope, _dataset):
+    def predict(model, _scaler, scope, _dataset, _device):
         assert scope.validation_targets is not None
         offset = 1 if model is current.model else 3
         return scope.validation_targets + offset

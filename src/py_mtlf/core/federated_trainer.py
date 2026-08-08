@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -8,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from py_mtlf.config import FittingSettings
-from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, TrainingError
+from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, TrainingError, resolve_device
 from py_mtlf.core.training_data import TrainingDataset
 
 
@@ -24,43 +25,50 @@ class FederatedTrainer:
 
     def __init__(self, settings: FittingSettings) -> None:
         self._settings = settings
+        self._device = resolve_device(settings.device)
 
     def train(
         self,
         base: LoadedBundle,
         dataset: TrainingDataset,
     ) -> FederatedTrainingResult:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         np.random.seed(self._settings.random_seed)
         torch.manual_seed(self._settings.random_seed)
         torch.use_deterministic_algorithms(True, warn_only=True)
         inputs, targets = LocalTrainer._training_tensors(dataset, base.scaler)
-        model = copy.deepcopy(base.model).to("cpu")
-        model.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=self._settings.learning_rate)
-        loss_function = torch.nn.HuberLoss()
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(self._settings.random_seed)
-        loader = DataLoader(
-            TensorDataset(inputs, targets),
-            batch_size=self._settings.batch_size,
-            shuffle=True,
-            generator=generator,
-        )
-        final_loss = math.nan
-        for _epoch in range(self._settings.epochs):
-            for features, expected in loader:
-                optimizer.zero_grad(set_to_none=True)
-                actual = model(features)
-                if actual.shape != expected.shape:
-                    raise TrainingError("federated model output shape is incompatible")
-                loss = loss_function(actual, expected)
-                if not torch.isfinite(loss):
-                    raise TrainingError("federated training loss is not finite")
-                loss.backward()
-                optimizer.step()
-                final_loss = float(loss.detach())
-        if not math.isfinite(final_loss):
-            raise TrainingError("federated training produced no finite loss")
+        model = copy.deepcopy(base.model).to(self._device)
+        try:
+            model.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=self._settings.learning_rate)
+            loss_function = torch.nn.HuberLoss()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self._settings.random_seed)
+            loader = DataLoader(
+                TensorDataset(inputs, targets),
+                batch_size=self._settings.batch_size,
+                shuffle=True,
+                generator=generator,
+            )
+            final_loss = math.nan
+            for _epoch in range(self._settings.epochs):
+                for features, expected in loader:
+                    features = features.to(self._device)
+                    expected = expected.to(self._device)
+                    optimizer.zero_grad(set_to_none=True)
+                    actual = model(features)
+                    if actual.shape != expected.shape:
+                        raise TrainingError("federated model output shape is incompatible")
+                    loss = loss_function(actual, expected)
+                    if not torch.isfinite(loss):
+                        raise TrainingError("federated training loss is not finite")
+                    loss.backward()
+                    optimizer.step()
+                    final_loss = float(loss.detach().cpu().item())
+            if not math.isfinite(final_loss):
+                raise TrainingError("federated training produced no finite loss")
+        finally:
+            model.to("cpu")
         model.eval()
         return FederatedTrainingResult(
             model=model,

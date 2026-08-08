@@ -1,6 +1,7 @@
 import copy
 import inspect
 import math
+import os
 import tarfile
 import tempfile
 import types
@@ -21,6 +22,23 @@ from py_mtlf.core.training_data import ScopeTrainingData, TrainingDataError, Tra
 
 class TrainingError(RuntimeError):
     pass
+
+
+def resolve_device(value: str) -> torch.device:
+    device = torch.device(value)
+    if device.type == "cpu":
+        return device
+    if device.type != "cuda":
+        raise ValueError("training.device must select a CPU or CUDA device")
+    index = 0 if device.index is None else device.index
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"configured CUDA device cuda:{index} is unavailable")
+    count = torch.cuda.device_count()
+    if index >= count:
+        raise RuntimeError(
+            f"configured CUDA device cuda:{index} is unavailable; {count} device(s) detected"
+        )
+    return torch.device("cuda", index)
 
 
 @dataclass
@@ -179,6 +197,7 @@ class LocalTrainer:
     ) -> None:
         self._settings = settings
         self._validation_settings = validation_settings or ValidationSettings()
+        self._device = resolve_device(settings.device)
 
     def train(
         self,
@@ -189,38 +208,44 @@ class LocalTrainer:
         self._seed()
         scaler = self._fit_scaler(dataset)
         inputs, targets = self._training_tensors(dataset, scaler)
-        model = candidate_base.model.to("cpu")
-        model.train()
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=self._settings.learning_rate,
-        )
-        loss_function = torch.nn.HuberLoss()
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(self._settings.random_seed)
-        loader = DataLoader(
-            TensorDataset(inputs, targets),
-            batch_size=self._settings.batch_size,
-            shuffle=True,
-            generator=generator,
-        )
-        final_loss = math.nan
-        for _epoch in range(self._settings.epochs):
-            for features, expected in loader:
-                optimizer.zero_grad(set_to_none=True)
-                actual = model(features)
-                if actual.shape != expected.shape:
-                    raise TrainingError("candidate model output shape is incompatible")
-                loss = loss_function(actual, expected)
-                if not torch.isfinite(loss):
-                    raise TrainingError("training loss is not finite")
-                loss.backward()
-                optimizer.step()
-                final_loss = float(loss.detach())
-        if not math.isfinite(final_loss):
-            raise TrainingError("training produced no finite loss")
-        model.eval()
-        evaluation = self._evaluate(current, model, scaler, dataset)
+        model = candidate_base.model.to(self._device)
+        try:
+            model.train()
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=self._settings.learning_rate,
+            )
+            loss_function = torch.nn.HuberLoss()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self._settings.random_seed)
+            loader = DataLoader(
+                TensorDataset(inputs, targets),
+                batch_size=self._settings.batch_size,
+                shuffle=True,
+                generator=generator,
+            )
+            final_loss = math.nan
+            for _epoch in range(self._settings.epochs):
+                for features, expected in loader:
+                    features = features.to(self._device)
+                    expected = expected.to(self._device)
+                    optimizer.zero_grad(set_to_none=True)
+                    actual = model(features)
+                    if actual.shape != expected.shape:
+                        raise TrainingError("candidate model output shape is incompatible")
+                    loss = loss_function(actual, expected)
+                    if not torch.isfinite(loss):
+                        raise TrainingError("training loss is not finite")
+                    loss.backward()
+                    optimizer.step()
+                    final_loss = float(loss.detach().cpu().item())
+            if not math.isfinite(final_loss):
+                raise TrainingError("training produced no finite loss")
+            model.eval()
+            evaluation = self._evaluate(current, model, scaler, dataset)
+        finally:
+            current.model.to("cpu")
+            model.to("cpu")
         manifest = copy.deepcopy(candidate_base.manifest)
         return TrainingResult(
             model=model,
@@ -232,6 +257,7 @@ class LocalTrainer:
         )
 
     def _seed(self) -> None:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         np.random.seed(self._settings.random_seed)
         torch.manual_seed(self._settings.random_seed)
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -303,12 +329,14 @@ class LocalTrainer:
                 current.scaler,
                 scope,
                 dataset,
+                self._device,
             )
             candidate_prediction = self._predict(
                 candidate,
                 candidate_scaler,
                 scope,
                 dataset,
+                self._device,
             )
             expected = scope.validation_targets
             if expected is None:
@@ -360,6 +388,7 @@ class LocalTrainer:
         scaler: StandardScaler,
         scope: ScopeTrainingData,
         dataset: TrainingDataset,
+        device: torch.device,
     ) -> np.ndarray:
         inputs = scope.validation_inputs
         if inputs is None:
@@ -370,7 +399,9 @@ class LocalTrainer:
         tensor = torch.as_tensor(
             transformed.transpose(0, 2, 1),
             dtype=torch.float32,
+            device=device,
         )
+        model.to(device)
         model.eval()
         with torch.no_grad():
             output = model(tensor).detach().cpu().numpy()
