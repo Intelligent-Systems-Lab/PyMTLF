@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
+from nwdaf_context import context_client
 
 from py_mtlf.config import PublicationSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
@@ -17,8 +18,6 @@ from py_mtlf.core.model_records import (
     PublicationState,
 )
 from py_mtlf.core.publication import PublicationCoordinator
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest
 from py_mtlf.wire.private import SelectedTarget
 
 NWDAF_ID = "11111111-1111-4111-8111-111111111111"
@@ -27,22 +26,12 @@ CLIENT_ID = "33333333-3333-4333-8333-333333333333"
 DIGEST = "a" * 64
 
 
-def synchronized_projection() -> SyncProjection:
-    projection = SyncProjection()
-    projection.replace(
-        BackendSyncRequest.model_validate(
-            {
-                "containingNwdaf": {
-                    "nfInstanceId": NWDAF_ID,
-                    "apiBaseUri": "http://nwdaf-c.example",
-                    "internalCallbackBaseUri": "http://go-c.example",
-                },
-                "eventsSubscriptions": [],
-                "smfResources": [],
-            }
-        )
+def nwdaf_context_client():
+    return context_client(
+        nf_instance_id=NWDAF_ID,
+        api_root="http://nwdaf-c.example",
+        internal_api_root="http://go-c.example",
     )
-    return projection
 
 
 def pending_publication() -> PendingPublication:
@@ -158,7 +147,7 @@ def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference():
         artifacts,
         Mock(),
         resolver,
-        synchronized_projection(),
+        nwdaf_context_client(),
         client,
     )
     coordinator._replace_publication = lambda value: value
@@ -227,7 +216,7 @@ def test_store_in_flight_probes_existing_record_without_reposting():
         artifacts,
         Mock(),
         Mock(),
-        synchronized_projection(),
+        nwdaf_context_client(),
         client,
     )
     coordinator._replace_publication = lambda value: value
@@ -276,7 +265,7 @@ def test_restart_reannounces_cutover_pending_publication():
         Mock(),
         Mock(),
         Mock(),
-        synchronized_projection(),
+        nwdaf_context_client(),
         httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500))),
         on_published=lambda publication, current: announced.set(),
     )

@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+from nwdaf_context import context_client
 
 from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
@@ -18,8 +19,6 @@ from py_mtlf.core.fl_server import (
     _assign,
 )
 from py_mtlf.core.fl_workspace import preprocessing_contract_digest
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
 from py_mtlf.wire.private import SelectedTarget
 
@@ -91,19 +90,10 @@ def test_assignment_does_not_substitute_another_eligible_same_tai_client():
 
 def test_fl_client_discovery_requests_training_capability_for_scope_tai():
     target_id = "11111111-1111-4111-8111-111111111111"
-    projection = SyncProjection()
-    projection.replace(
-        BackendSyncRequest.model_validate(
-            {
-                "containingNwdaf": {
-                    "nfInstanceId": "33333333-3333-4333-8333-333333333333",
-                    "apiBaseUri": "http://go-c.example",
-                    "internalCallbackBaseUri": "http://go-c-internal.example",
-                },
-                "eventsSubscriptions": [],
-                "smfResources": [],
-            }
-        )
+    projection = context_client(
+        nf_instance_id="33333333-3333-4333-8333-333333333333",
+        api_root="http://go-c.example",
+        internal_api_root="http://go-c-internal.example",
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -229,19 +219,10 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
 
 def test_preparation_uses_configured_historical_data_window(tmp_path):
     owner_id = "11111111-1111-4111-8111-111111111111"
-    projection = SyncProjection()
-    projection.replace(
-        BackendSyncRequest.model_validate(
-            {
-                "containingNwdaf": {
-                    "nfInstanceId": "33333333-3333-4333-8333-333333333333",
-                    "apiBaseUri": "http://go-c.example",
-                    "internalCallbackBaseUri": "http://go-c-internal.example",
-                },
-                "eventsSubscriptions": [],
-                "smfResources": [],
-            }
-        )
+    projection = context_client(
+        nf_instance_id="33333333-3333-4333-8333-333333333333",
+        api_root="http://go-c.example",
+        internal_api_root="http://go-c-internal.example",
     )
     client = Mock()
     client.post.return_value = Mock(

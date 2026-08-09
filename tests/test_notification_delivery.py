@@ -14,10 +14,7 @@ from py_mtlf.core.model_records import AdrfReference
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.seed_catalog import ModelCatalog
-from py_mtlf.wire.ml_model import (
-    MLModelProvisionSnapshot,
-    MLModelProvisionSubscription,
-)
+from py_mtlf.wire.ml_model import MLModelProvisionSubscription
 
 
 def wait_until(predicate, timeout: float = 2) -> None:
@@ -211,7 +208,7 @@ def test_deleted_resource_cancels_retry(
     assert dispatcher.delivered_version(resource.subscription_id) is None
 
 
-def test_repeated_sync_does_not_redeliver_unchanged_model(
+def test_repeated_enqueue_does_not_redeliver_unchanged_model(
     settings,
     bundle_path,
     monkeypatch,
@@ -249,15 +246,7 @@ def test_repeated_sync_does_not_redeliver_unchanged_model(
     dispatcher.enqueue(resource)
     wait_until(lambda: len(requests) == 1)
 
-    snapshot = MLModelProvisionSnapshot(
-        subscriptionId=resource.subscription_id,
-        representation=resource.representation,
-        initiator="ANLF_BACKEND",
-        destination="MTLF_BACKEND",
-    )
-    unchanged = store.commit_from_sync(store.prepare_from_sync([snapshot]))[0]
-    assert unchanged.revision == resource.revision
-    dispatcher.enqueue(unchanged)
+    dispatcher.enqueue(resource)
     time.sleep(0.05)
     assert len(requests) == 1
 
@@ -265,11 +254,8 @@ def test_repeated_sync_does_not_redeliver_unchanged_model(
         update={"notification_correlation_id": "corr-2"},
         deep=True,
     )
-    changed_snapshot = snapshot.model_copy(
-        update={"representation": changed_representation},
-        deep=True,
-    )
-    changed = store.commit_from_sync(store.prepare_from_sync([changed_snapshot]))[0]
+    changed = store.replace(resource.subscription_id, changed_representation)
+    assert changed is not None
     assert changed.revision == resource.revision + 1
     dispatcher.enqueue(changed)
     wait_until(lambda: len(requests) == 2)

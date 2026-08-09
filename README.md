@@ -5,7 +5,7 @@ not a standalone 3GPP network function. NWDAF Go owns standard SBI routing and
 the standard ADRF subscription and callback procedures. PyMTLF consumes ADRF
 fetch instructions and retrieves the referenced records directly.
 
-The current runtime provides the service lifecycle, health and sync endpoints,
+The current runtime provides the service lifecycle and generation-aware readiness,
 an immutable model artifact repository, a configured seed-model catalog,
 standard-shaped Model Provision and ML Model Monitor resources, and a
 degradation-only WAPE policy, scope-aware historical dataset retrieval, and
@@ -13,6 +13,12 @@ read-only MongoDB fallback access. A bounded CPU trainer consumes READY
 datasets, warm-starts the current model, evaluates per-scope and aggregate
 WAPE, publishes a new immutable bundle, and reprovisions the current artifact
 through the existing Model Provision resource.
+
+There is no liveness endpoint and no full-state synchronization endpoint. Each
+process start exposes a new `processInstanceId` through `GET /health/ready`.
+PyMTLF reads its containing NWDAF identity and Go callback origins on demand
+from `GET /internal/v1/nwdaf-context`; a replacement process does not restore
+old provision, monitor, retrieval, training, or FL runtime resources.
 
 Before using the sample configuration, import the initial seed bundle:
 

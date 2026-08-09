@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from nwdaf_context import context_client
 from pymongo.errors import AutoReconnect
 
 from py_mtlf.app import create_app
@@ -15,8 +16,7 @@ from py_mtlf.core.dataset import (
     DatasetJob,
     DatasetJobState,
 )
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest
+from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import (
     DataNotification,
     DataSubscription,
@@ -94,115 +94,70 @@ def retrain_intent():
     return policy, policy.take_intents()[0]
 
 
-def sync_snapshot() -> BackendSyncRequest:
-    return BackendSyncRequest.model_validate(
-        {
-            "containingNwdaf": {
-                "nfInstanceId": "nwdaf-1",
-                "apiBaseUri": "http://go.example",
-                "internalCallbackBaseUri": "http://go-internal.example",
-            },
-            "eventsSubscriptions": [
-                {
-                    "subscriptionId": f"events-{group}",
-                    "subscription": {
-                        "eventSubscriptions": [
-                            {
-                                "event": "UE_COMMUNICATION",
-                                "tgtUe": {"intGroupIds": [group]},
-                            }
-                        ]
+def descriptor_snapshot(state: str = "ACTIVE") -> tuple[TrainingDataDescriptor, ...]:
+    return tuple(
+        TrainingDataDescriptor.model_validate(
+            {
+                "correlationId": f"descriptor-{group}",
+                "state": state,
+                "storedDataSpec": {
+                    "dataSpec": {
+                        "smfDataSub": {
+                            "supi": f"imsi-{index}",
+                            "notifId": f"smf-{group}",
+                            "notifUri": "http://anlf.example/callback",
+                            "eventSubs": [{"event": "UPF_EVENT"}],
+                        }
                     },
-                    "externalNotificationUri": "http://consumer.example",
-                }
-                for group in ("group-a", "group-b")
-            ],
-            "smfResources": [
-                {
-                    "correlationId": f"smf-{group}",
-                    "resourceLocation": (
-                        f"http://smf.example/nsmf-event-exposure/v1/subscriptions/{group}"
-                    ),
-                    "targetApiRoot": "http://smf.example",
-                    "nwdafSubscriptionIds": [f"events-{group}"],
-                    "pendingCleanup": False,
-                    "subscription": {
-                        "supi": f"imsi-{index}",
-                        "notifId": f"smf-{group}",
-                        "notifUri": "http://anlf.example/callback",
-                        "eventSubs": [{"event": "UPF_EVENT"}],
+                    "timePeriod": {
+                        "startTime": "2026-08-04T09:00:00Z",
+                        "stopTime": "2026-08-04T09:30:00Z",
                     },
-                }
-                for index, group in enumerate(("group-a", "group-b"), start=1)
-            ],
-            "trainingDataSource": "mongodb",
-        }
+                },
+                "mlEventSubscription": {
+                    "mLEvent": "UE_COMMUNICATION",
+                    "tgtUe": {"intGroupIds": [group]},
+                },
+                "sourceNfInstanceId": "11111111-1111-4111-8111-111111111111",
+                "adrfInstanceId": "22222222-2222-4222-8222-222222222222",
+                "retainUntil": "2099-08-04T10:30:00Z",
+            }
+        )
+        for index, group in enumerate(("group-a", "group-b"), start=1)
     )
 
 
 def test_scope_resolution_keeps_all_active_groups_and_peer_identity():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    descriptors = descriptor_snapshot()
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
 
-    resources = coordinator._resolve(intent, projection.snapshot())
+    resources = coordinator._resolve(intent, descriptors)
 
     assert {resource.supi for resource in resources} == {"imsi-1", "imsi-2"}
     assert {scope for resource in resources for scope in resource.scope_keys} == set(
         intent.active_scope_keys
     )
-    assert all(resource.identity.startswith("http://smf.example|") for resource in resources)
+    assert {resource.identity for resource in resources} == {
+        "descriptor-group-a",
+        "descriptor-group-b",
+    }
     coordinator._client.close()
 
 
 def test_scope_resolution_prefers_retained_training_data_descriptors():
     policy, intent = retrain_intent()
-    payload = sync_snapshot().model_dump(by_alias=True, mode="json")
-    payload["smfResources"] = []
-    payload["trainingDataSource"] = "adrf"
-    payload["trainingDataDescriptors"] = [
-        {
-            "correlationId": f"descriptor-{group}",
-            "state": "RETAINED",
-            "storedDataSpec": {
-                "dataSpec": {
-                    "smfDataSub": {
-                        "supi": f"imsi-{index}",
-                        "pduSeId": 10,
-                        "notifId": f"corr-{group}",
-                        "notifUri": "http://anlf.example/callback",
-                        "eventSubs": [{"event": "UPF_EVENT"}],
-                    }
-                },
-                "timePeriod": {
-                    "startTime": "2026-08-04T09:00:00Z",
-                    "stopTime": "2026-08-04T09:30:00Z",
-                },
-            },
-            "mlEventSubscription": {
-                "mLEvent": "UE_COMMUNICATION",
-                "tgtUe": {"intGroupIds": [group]},
-            },
-            "sourceNfInstanceId": "11111111-1111-4111-8111-111111111111",
-            "adrfInstanceId": "22222222-2222-4222-8222-222222222222",
-            "retainUntil": "2099-08-04T10:30:00Z",
-        }
-        for index, group in enumerate(("group-a", "group-b"), start=1)
-    ]
-    snapshot = BackendSyncRequest.model_validate(payload)
-    projection = SyncProjection()
-    projection.replace(snapshot)
+    descriptors = descriptor_snapshot("RETAINED")
     coordinator = DatasetCoordinator(
-        DatasetSettings(), projection, policy, Mock(close=Mock())
+        DatasetSettings(), context_client(), policy, Mock(close=Mock())
     )
 
-    resources = coordinator._resolve(intent, projection.snapshot())
+    resources = coordinator._resolve(intent, descriptors)
 
     assert {resource.identity for resource in resources} == {
         "descriptor-group-a",
@@ -250,13 +205,44 @@ def test_training_scope_matches_standard_event_subscription_network_area():
     assert not DatasetCoordinator._matches_scope(scope, subscription)
 
 
-def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
+def test_scope_resolution_ignores_empty_target_defaults_from_standard_models():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    descriptors = list(descriptor_snapshot())
+    descriptors[0] = descriptors[0].model_copy(
+        update={
+            "ml_event_subscription": descriptors[0].ml_event_subscription.model_copy(
+                update={
+                    "target_ue": {
+                        "anyUe": False,
+                        "supis": [],
+                        "intGroupIds": ["group-a"],
+                    }
+                }
+            )
+        }
+    )
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
+        policy,
+        Mock(close=Mock()),
+    )
+
+    resources = coordinator._resolve(intent, tuple(descriptors))
+
+    assert {resource.identity for resource in resources} == {
+        "descriptor-group-a",
+        "descriptor-group-b",
+    }
+    coordinator._client.close()
+
+
+def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
+    policy, intent = retrain_intent()
+    projection = descriptor_snapshot()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
@@ -266,7 +252,7 @@ def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
     )
     job = DatasetJob("job-1", intent, window, "mongodb")
     coordinator._jobs[job.job_id] = job
-    job.resources = coordinator._resolve(intent, projection.snapshot())
+    job.resources = coordinator._resolve(intent, projection)
     for resource in job.resources:
         record = NadrfDataStoreRecord(
             dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
@@ -300,11 +286,10 @@ def test_dataset_ready_requires_each_scope_and_deduplicates_native_identity():
 
 def test_ready_snapshot_can_only_be_claimed_once_and_records_terminal_outcome():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
@@ -314,7 +299,7 @@ def test_ready_snapshot_can_only_be_claimed_once_and_records_terminal_outcome():
     )
     job = DatasetJob("job-1", intent, window, "mongodb")
     coordinator._jobs[job.job_id] = job
-    job.resources = coordinator._resolve(intent, projection.snapshot())
+    job.resources = coordinator._resolve(intent, projection)
     for resource in job.resources:
         coordinator._append_record(
             job,
@@ -338,17 +323,37 @@ def test_ready_snapshot_can_only_be_claimed_once_and_records_terminal_outcome():
     coordinator.shutdown()
 
 
+def test_descriptor_without_adrf_identity_selects_mongodb_without_discovery():
+    policy, intent = retrain_intent()
+    resolver = Mock(close=Mock())
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
+        policy,
+        resolver,
+    )
+    descriptors = tuple(
+        descriptor.model_copy(update={"adrf_instance_id": None})
+        for descriptor in descriptor_snapshot()
+    )
+
+    resources = coordinator._resolve(intent, descriptors)
+
+    assert coordinator._select_source(resources) == "mongodb"
+    resolver.resolve.assert_not_called()
+    coordinator.shutdown()
+
+
 def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     requests: list[str] = []
     resource = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
-    )._resolve(intent, projection.snapshot())[0]
+    )._resolve(intent, projection)[0]
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(str(request.url))
@@ -370,7 +375,7 @@ def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
         client=client,
@@ -402,8 +407,7 @@ def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():
 
 def test_adrf_fetch_does_not_dereference_nonstandard_instruction_uri():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     requests: list[str] = []
     resource = None
 
@@ -422,12 +426,12 @@ def test_adrf_fetch_does_not_dereference_nonstandard_instruction_uri():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
         client=client,
     )
-    resource = coordinator._resolve(intent, projection.snapshot())[0]
+    resource = coordinator._resolve(intent, projection)[0]
     route = AdrfRoute(
         "corr-1",
         resource,
@@ -455,14 +459,13 @@ def test_adrf_fetch_does_not_dereference_nonstandard_instruction_uri():
 
 def test_adrf_fetch_retries_transport_failure():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     resource = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
-    )._resolve(intent, projection.snapshot())[0]
+    )._resolve(intent, projection)[0]
     attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -482,7 +485,7 @@ def test_adrf_fetch_retries_transport_failure():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     coordinator = DatasetCoordinator(
         DatasetSettings(max_retry_attempts=2, retry_initial_backoff_seconds=0),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
         client=client,
@@ -512,15 +515,14 @@ def test_adrf_fetch_retries_transport_failure():
 
 def test_adrf_callback_rejects_fetch_ids_above_job_limit():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     coordinator = DatasetCoordinator(
         DatasetSettings(max_records_per_job=1),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
-    resource = coordinator._resolve(intent, projection.snapshot())[0]
+    resource = coordinator._resolve(intent, projection)[0]
     job = DatasetJob(
         "job-1",
         intent,
@@ -558,11 +560,10 @@ def test_adrf_callback_rejects_fetch_ids_above_job_limit():
 @patch("pymongo.MongoClient")
 def test_mongo_skips_malformed_document_and_keeps_valid_records(mongo_client):
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     coordinator = DatasetCoordinator(
         DatasetSettings(),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
@@ -575,7 +576,7 @@ def test_mongo_skips_malformed_document_and_keeps_valid_records(mongo_client):
         ),
         "mongodb",
     )
-    job.resources = coordinator._resolve(intent, projection.snapshot())
+    job.resources = coordinator._resolve(intent, projection)
     resource = job.resources[0]
     collection = mongo_client.return_value.__getitem__.return_value.__getitem__.return_value
     collection.find.return_value.sort.return_value = [
@@ -606,11 +607,10 @@ def test_mongo_skips_malformed_document_and_keeps_valid_records(mongo_client):
 
 def test_mongo_query_retries_without_committing_partial_attempt():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     coordinator = DatasetCoordinator(
         DatasetSettings(max_retry_attempts=2, retry_initial_backoff_seconds=0),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
     )
@@ -623,7 +623,7 @@ def test_mongo_query_retries_without_committing_partial_attempt():
         ),
         "mongodb",
     )
-    job.resources = coordinator._resolve(intent, projection.snapshot())
+    job.resources = coordinator._resolve(intent, projection)
     resource = job.resources[0]
     record = NadrfDataStoreRecord(
         dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
@@ -655,8 +655,7 @@ def test_mongo_query_retries_without_committing_partial_attempt():
 
 def test_adrf_cleanup_retries_and_is_idempotent():
     policy, intent = retrain_intent()
-    projection = SyncProjection()
-    projection.replace(sync_snapshot())
+    projection = descriptor_snapshot()
     attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -667,12 +666,12 @@ def test_adrf_cleanup_retries_and_is_idempotent():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     coordinator = DatasetCoordinator(
         DatasetSettings(max_retry_attempts=2, retry_initial_backoff_seconds=0),
-        projection,
+        context_client(),
         policy,
         Mock(close=Mock()),
         client=client,
     )
-    resource = coordinator._resolve(intent, projection.snapshot())[0]
+    resource = coordinator._resolve(intent, projection)[0]
     job = DatasetJob(
         "job-1",
         intent,

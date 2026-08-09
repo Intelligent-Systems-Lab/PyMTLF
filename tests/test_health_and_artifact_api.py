@@ -7,7 +7,8 @@ from py_mtlf.app import create_app
 
 def test_health_is_ready_after_startup(settings):
     with TestClient(create_app(settings)) as client:
-        assert client.get("/health/live").json() == {"status": "live"}
+        assert client.get("/health/live").status_code == 404
+        assert client.post("/internal/v1/sync", json={}).status_code == 404
         response = client.get("/health/ready")
 
     assert response.status_code == 200
@@ -34,6 +35,7 @@ def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
         response = client.get("/health/ready")
 
     assert response.status_code == 503
+    UUID(response.json()["processInstanceId"])
     assert response.json()["artifacts"] == "unavailable"
     assert "database" not in response.json()
     assert "reconciliation" not in response.json()

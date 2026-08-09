@@ -4,9 +4,7 @@ from uuid import uuid4
 
 from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistration,
-    MLModelMonitorRegistrationSnapshot,
     MLModelMonitorSubscription,
-    MLModelMonitorSubscriptionSnapshot,
 )
 from py_mtlf.wire.private import SelectedTarget
 
@@ -42,37 +40,6 @@ class MonitorRegistrationStore:
         with self._lock:
             resource = self._resources.get(registration_id)
             return self._copy(resource) if resource is not None else None
-
-    def replace_from_sync(
-        self,
-        snapshots: list[MLModelMonitorRegistrationSnapshot],
-    ) -> tuple[MonitorRegistrationResource, ...]:
-        restored = self.prepare_from_sync(snapshots)
-        return self.commit_from_sync(restored)
-
-    def prepare_from_sync(
-        self,
-        snapshots: list[MLModelMonitorRegistrationSnapshot],
-    ) -> dict[str, MonitorRegistrationResource]:
-        registration_ids = [snapshot.registration_id for snapshot in snapshots]
-        if len(registration_ids) != len(set(registration_ids)):
-            raise ValueError("mlModelMonitorRegistrations contains duplicate registrationId")
-        restored = {
-            snapshot.registration_id: MonitorRegistrationResource(
-                registration_id=snapshot.registration_id,
-                representation=snapshot.representation.model_copy(deep=True),
-            )
-            for snapshot in snapshots
-        }
-        return restored
-
-    def commit_from_sync(
-        self,
-        restored: dict[str, MonitorRegistrationResource],
-    ) -> tuple[MonitorRegistrationResource, ...]:
-        with self._lock:
-            self._resources = dict(restored)
-            return tuple(self._copy(resource) for resource in restored.values())
 
     def snapshot(self) -> tuple[MonitorRegistrationResource, ...]:
         with self._lock:
@@ -115,39 +82,6 @@ class MonitorSubscriptionProjectionStore:
         self._lock = lock or threading.RLock()
         self._resources: dict[str, MonitorSubscriptionProjection] = {}
 
-    def replace_from_sync(
-        self,
-        snapshots: list[MLModelMonitorSubscriptionSnapshot],
-    ) -> tuple[MonitorSubscriptionProjection, ...]:
-        restored = self.prepare_from_sync(snapshots)
-        return self.commit_from_sync(restored)
-
-    def prepare_from_sync(
-        self,
-        snapshots: list[MLModelMonitorSubscriptionSnapshot],
-    ) -> dict[str, MonitorSubscriptionProjection]:
-        subscription_ids = [snapshot.subscription_id for snapshot in snapshots]
-        if len(subscription_ids) != len(set(subscription_ids)):
-            raise ValueError("mlModelMonitorSubscriptions contains duplicate subscriptionId")
-        restored = {
-            snapshot.subscription_id: MonitorSubscriptionProjection(
-                subscription_id=snapshot.subscription_id,
-                owner_registration_id=snapshot.owner_registration_id,
-                representation=snapshot.representation.model_copy(deep=True),
-                selected_target=snapshot.selected_target,
-            )
-            for snapshot in snapshots
-        }
-        return restored
-
-    def commit_from_sync(
-        self,
-        restored: dict[str, MonitorSubscriptionProjection],
-    ) -> tuple[MonitorSubscriptionProjection, ...]:
-        with self._lock:
-            self._resources = dict(restored)
-            return tuple(self._copy(resource) for resource in restored.values())
-
     def upsert(
         self,
         subscription_id: str,
@@ -180,6 +114,14 @@ class MonitorSubscriptionProjectionStore:
                 if resource.representation.notification_id == notification_id:
                     return self._copy(resource)
         return None
+
+    def find_by_id(
+        self,
+        subscription_id: str,
+    ) -> MonitorSubscriptionProjection | None:
+        with self._lock:
+            resource = self._resources.get(subscription_id)
+            return self._copy(resource) if resource is not None else None
 
     @staticmethod
     def _copy(resource: MonitorSubscriptionProjection) -> MonitorSubscriptionProjection:

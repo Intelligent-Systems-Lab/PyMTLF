@@ -2,7 +2,6 @@ from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
-from py_mtlf.core.monitor_reconciler import PreparedMonitorRestore
 from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistration,
     MLModelMonitorSubscription,
@@ -121,12 +120,7 @@ def test_notification_correlates_subscription_and_updates_policy(settings):
         registration.registration_id,
         monitor_subscription(),
     )
-    app.state.monitor_reconciler.commit_restore(
-        PreparedMonitorRestore(
-            subscription_ids={registration.registration_id: "monitor-a"},
-            orphan_subscription_ids=frozenset(),
-        )
-    )
+    app.state.monitor_reconciler._subscription_ids[registration.registration_id] = "monitor-a"
 
     with TestClient(app) as client:
         sufficient = client.post(

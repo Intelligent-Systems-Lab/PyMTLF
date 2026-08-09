@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from py_mtlf.config import ModelMonitorSettings
-from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.wire.private import SelectedTarget
 
 
@@ -14,11 +14,11 @@ class NwdafMonitorResolver:
     def __init__(
         self,
         settings: ModelMonitorSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         client: httpx.Client | None = None,
     ) -> None:
         self._settings = settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._client = client or httpx.Client(
             timeout=settings.discovery_timeout_seconds,
             follow_redirects=False,
@@ -38,6 +38,19 @@ class NwdafMonitorResolver:
             self._expires_at.pop(nf_instance_id, None)
 
     def resolve(self, nf_instance_id: str) -> SelectedTarget | None:
+        try:
+            context = self._nwdaf_context.get()
+        except RuntimeError:
+            return None
+        if nf_instance_id == context.nf_instance_id:
+            return SelectedTarget(
+                nfInstanceId=context.nf_instance_id,
+                nfServiceInstanceId="containing-nwdaf-mlmodelmonitor",
+                serviceName="nnwdaf-mlmodelmonitor",
+                apiRoot=context.api_root,
+                selectionSource="CONFIGURED",
+            )
+
         now = time.monotonic()
         with self._lock:
             if nf_instance_id in self._cached and now < self._expires_at.get(
@@ -45,10 +58,7 @@ class NwdafMonitorResolver:
                 0.0,
             ):
                 return self._cached[nf_instance_id]
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            return None
-        base_uri = snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        base_uri = context.internal_api_root
         query_entry = {"mlAnalyticsIds": ["UE_COMMUNICATION"]}
         response = self._client.get(
             f"{base_uri}/internal/v1/nrf/nf-instances",

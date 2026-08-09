@@ -5,10 +5,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
-from py_mtlf.wire.ml_model import (
-    MLModelProvisionSnapshot,
-    MLModelProvisionSubscription,
-)
+from py_mtlf.wire.ml_model import MLModelProvisionSubscription
 
 
 @dataclass(frozen=True)
@@ -61,56 +58,6 @@ class ProvisionResourceStore:
         with self._lock:
             resource = self._resources.get(subscription_id)
             return resource is not None and resource.revision == revision
-
-    def replace_from_sync(
-        self,
-        snapshots: list[MLModelProvisionSnapshot],
-    ) -> tuple[ProvisionResource, ...]:
-        restored = self.prepare_from_sync(snapshots)
-        return self.commit_from_sync(restored)
-
-    def prepare_from_sync(
-        self,
-        snapshots: list[MLModelProvisionSnapshot],
-    ) -> dict[str, ProvisionResource]:
-        subscription_ids = [snapshot.subscription_id for snapshot in snapshots]
-        if len(subscription_ids) != len(set(subscription_ids)):
-            raise ValueError("mlModelProvisionSubscriptions contains duplicate subscriptionId")
-        restored: dict[str, ProvisionResource] = {}
-        for snapshot in snapshots:
-            restored[snapshot.subscription_id] = self._prepare(
-                snapshot.subscription_id,
-                snapshot.representation,
-                revision=1,
-            )
-        return restored
-
-    def commit_from_sync(
-        self,
-        restored: dict[str, ProvisionResource],
-    ) -> tuple[ProvisionResource, ...]:
-        with self._lock:
-            reconciled: dict[str, ProvisionResource] = {}
-            for subscription_id, resource in restored.items():
-                current = self._resources.get(subscription_id)
-                if (
-                    current is not None
-                    and current.representation == resource.representation
-                    and current.family_keys == resource.family_keys
-                ):
-                    revision = current.revision
-                elif current is not None:
-                    revision = current.revision + 1
-                else:
-                    revision = 1
-                reconciled[subscription_id] = ProvisionResource(
-                    subscription_id=resource.subscription_id,
-                    representation=resource.representation,
-                    family_keys=resource.family_keys,
-                    revision=revision,
-                )
-            self._resources = reconciled
-            return tuple(self._copy(resource) for resource in reconciled.values())
 
     def snapshot(self) -> tuple[ProvisionResource, ...]:
         with self._lock:

@@ -7,11 +7,6 @@ router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
 
 
-@router.get("/health/live")
-async def liveness() -> dict[str, str]:
-    return {"status": "live"}
-
-
 @router.get("/health/ready")
 def readiness(request: Request) -> JSONResponse:
     state = request.app.state.runtime

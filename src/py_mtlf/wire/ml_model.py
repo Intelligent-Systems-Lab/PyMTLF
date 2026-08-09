@@ -5,7 +5,6 @@ from typing import Any
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from py_mtlf.wire.private import SelectedTarget
 from py_mtlf.wire.reporting import ReportingInformation, StandardModel
 
 
@@ -110,18 +109,6 @@ class MLModelProvisionSubscription(StandardModel):
 class MLModelProvisionNotification(StandardModel):
     event_notifications: list[MLEventNotification] = Field(min_length=1, alias="eventNotifs")
     subscription_id: str = Field(min_length=1, alias="subscriptionId")
-
-
-class MLModelProvisionSnapshot(StandardModel):
-    subscription_id: str = Field(min_length=1, alias="subscriptionId")
-    representation: MLModelProvisionSubscription
-    initiator: str
-    destination: str
-    direction: str = ""
-    selected_target: SelectedTarget | None = Field(default=None, alias="selectedTarget")
-    peer_location: str = Field(default="", alias="peerLocation")
-    lifecycle_state: str = Field(default="", alias="lifecycleState")
-    process_generation: str = Field(default="", alias="processGeneration")
 
 
 class ProblemDetails(BaseModel):

@@ -21,7 +21,7 @@ from py_mtlf.core.fl_workspace import (
     preprocessing_contract_digest,
     weights_digest,
 )
-from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.trainer import LocalTrainer, TrustedBundleLoader, wape
 from py_mtlf.core.training_data import TrainingDatasetBuilder
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
@@ -102,7 +102,7 @@ class FLClientService:
         settings: FederatedLearningSettings,
         client_settings: FLClientSettings,
         notification_settings: NotificationSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         datasets: DatasetCoordinator,
         workspace: FLWorkspace,
         client: httpx.Client | None = None,
@@ -110,7 +110,7 @@ class FLClientService:
         self._settings = settings
         self._client_settings = client_settings
         self._notification_settings = notification_settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._datasets = datasets
         self._workspace = workspace
         self._trainer = FederatedTrainer(client_settings.training)
@@ -849,10 +849,10 @@ class FLClientService:
             self._outbox_futures.discard(future)
 
     def _participant_id(self) -> str:
-        snapshot = self._projection.snapshot()
-        if snapshot is None or not snapshot.containing_nwdaf.nf_instance_id:
+        context = self._nwdaf_context.get()
+        if not context.nf_instance_id:
             raise RuntimeError("containing NWDAF identity is unavailable")
-        return snapshot.containing_nwdaf.nf_instance_id
+        return context.nf_instance_id
 
     def _schedule_delay(self, resource: FLClientResource) -> None:
         self._cancel_delay(resource.subscription_id)

@@ -86,6 +86,16 @@ class RuntimeSettings(FrozenSettings):
         return value
 
 
+class ContainingNwdafSettings(FrozenSettings):
+    internal_api_root: str = "http://127.0.0.1:8091"
+    request_timeout_seconds: float = Field(default=30, gt=0, le=3600)
+
+    @field_validator("internal_api_root")
+    @classmethod
+    def validate_internal_api_root(cls, value: str) -> str:
+        return _validate_http_base_url(value, "containing_nwdaf.internal_api_root")
+
+
 def _validate_http_base_url(value: str, field_name: str) -> str:
     value = value.strip().rstrip("/")
     parsed = urlsplit(value)
@@ -330,6 +340,8 @@ class NotificationSettings(FrozenSettings):
 class ModelMonitorSettings(FrozenSettings):
     callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
     report_period_seconds: int = Field(default=90, gt=0)
+    missed_report_threshold: int = Field(default=2, gt=0, le=20)
+    watchdog_grace_seconds: int = Field(default=30, ge=0, le=3600)
     request_timeout_seconds: float = Field(default=30, gt=0, le=300)
     discovery_timeout_seconds: float = Field(default=30, gt=0, le=300)
     retry_interval_seconds: float = Field(default=1, gt=0, le=300)
@@ -440,6 +452,7 @@ class LogSettings(FrozenSettings):
 class Settings(FrozenSettings):
     server: ServerSettings = ServerSettings()
     runtime: RuntimeSettings = RuntimeSettings()
+    containing_nwdaf: ContainingNwdafSettings = ContainingNwdafSettings()
     storage: StorageSettings = StorageSettings()
     model_state: ModelStateSettings = ModelStateSettings()
     publication: PublicationSettings = PublicationSettings()

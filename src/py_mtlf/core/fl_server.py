@@ -31,9 +31,9 @@ from py_mtlf.core.fl_workspace import (
 )
 from py_mtlf.core.model_records import ParticipantSampleCount
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.publication import PublicationCoordinator, ValidatedCandidate
 from py_mtlf.core.seed_catalog import ModelCatalog
-from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription, MLModelAddress
@@ -134,11 +134,11 @@ class FLClientResolver:
     def __init__(
         self,
         settings: FederatedLearningSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         client: httpx.Client | None = None,
     ) -> None:
         self._settings = settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds, follow_redirects=False
         )
@@ -153,16 +153,14 @@ class FLClientResolver:
         scope: ScopeReference,
         model_interoperability: str,
     ) -> tuple[FLClientCandidate, ...]:
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            raise RuntimeError("backend sync is unavailable")
+        context = self._nwdaf_context.get()
         owner_id = scope.consumer_id.strip()
         if not owner_id:
             raise RuntimeError(f"FL scope {scope.scope_key} has no monitor owner consumerId")
         tracking_areas = _scope_tracking_area_values(scope)
         if not tracking_areas:
             raise RuntimeError(f"FL scope {scope.scope_key} has no tracking area")
-        base = snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        base = context.internal_api_root
         response = self._client.get(
             base + "/internal/v1/nrf/nf-instances",
             params={
@@ -204,7 +202,7 @@ class FLClientResolver:
             if (
                 not nf_id
                 or nf_id != owner_id
-                or nf_id == snapshot.containing_nwdaf.nf_instance_id
+                or nf_id == context.nf_instance_id
                 or areas is None
             ):
                 continue
@@ -245,7 +243,7 @@ class FLServerOrchestrator:
         self,
         settings: FederatedLearningSettings,
         server_settings: FLServerSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         policy: AccuracyPolicy,
         catalog: ModelCatalog,
         workspace: FLWorkspace,
@@ -256,7 +254,7 @@ class FLServerOrchestrator:
     ) -> None:
         self._settings = settings
         self._server_settings = server_settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._policy = policy
         self._catalog = catalog
         self._workspace = workspace
@@ -1080,16 +1078,10 @@ class FLServerOrchestrator:
         )
 
     def _go_base(self) -> str:
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            raise RuntimeError("backend sync is unavailable")
-        return snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        return self._nwdaf_context.get().internal_api_root
 
     def _server_id(self) -> str:
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            raise RuntimeError("backend sync is unavailable")
-        return snapshot.containing_nwdaf.nf_instance_id
+        return self._nwdaf_context.get().nf_instance_id
 
     def _future_done(self, future: Future) -> None:
         with self._lock:

@@ -4,7 +4,6 @@ from uuid import UUID
 from pydantic import AnyHttpUrl, Field, JsonValue, field_validator, model_validator
 
 from py_mtlf.wire.ml_model import StandardModel
-from py_mtlf.wire.private import SelectedTarget
 from py_mtlf.wire.reporting import ReportingInformation
 
 
@@ -88,29 +87,6 @@ class MLModelMonitorNotification(StandardModel):
         if not self.model_accuracy_info and not self.analytics_feedback:
             raise ValueError("modelAccuInfos or anaFeedbacks must be non-empty")
         return self
-
-
-class MLModelMonitorRegistrationSnapshot(StandardModel):
-    registration_id: str = Field(min_length=1, alias="registrationId")
-    representation: MLModelMonitorRegistration
-    initiator: str
-    direction: str = ""
-    selected_target: SelectedTarget | None = Field(default=None, alias="selectedTarget")
-    peer_location: str = Field(default="", alias="peerLocation")
-    lifecycle_state: str = Field(default="", alias="lifecycleState")
-    process_generation: str = Field(default="", alias="processGeneration")
-
-
-class MLModelMonitorSubscriptionSnapshot(StandardModel):
-    subscription_id: str = Field(min_length=1, alias="subscriptionId")
-    representation: MLModelMonitorSubscription
-    destination: str
-    owner_registration_id: str = Field(min_length=1, alias="ownerRegistrationId")
-    direction: str = ""
-    selected_target: SelectedTarget | None = Field(default=None, alias="selectedTarget")
-    peer_location: str = Field(default="", alias="peerLocation")
-    lifecycle_state: str = Field(default="", alias="lifecycleState")
-    process_generation: str = Field(default="", alias="processGeneration")
 
 
 class MonitorInterval(StandardModel):

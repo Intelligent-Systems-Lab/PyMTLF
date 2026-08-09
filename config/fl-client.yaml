@@ -11,6 +11,10 @@ runtime:
   # This profile intentionally selects the FL Client role.
   mode: "fl_client"
 
+containing_nwdaf:
+  internal_api_root: "http://127.0.0.1:8091"
+  request_timeout_seconds: 30
+
 storage:
   # Local immutable artifact cache used by backend infrastructure.
   artifact_root: "data/artifacts"

@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from py_mtlf.config import AdrfSettings
-from py_mtlf.core.sync_projection import SyncProjection
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.wire.private import SelectedTarget
 
 
@@ -34,11 +34,11 @@ class AdrfResolver:
     def __init__(
         self,
         settings: AdrfSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         client: httpx.Client | None = None,
     ) -> None:
         self._settings = settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._client = client or httpx.Client(timeout=settings.discovery_timeout_seconds)
         self._owns_client = client is None
         self._lock = threading.RLock()
@@ -93,10 +93,11 @@ class AdrfResolver:
             cached = self._cached.get(cache_key)
             if cached is not None and now < cached[1]:
                 return cached[0]
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
+        try:
+            context = self._nwdaf_context.get()
+        except RuntimeError:
             return None
-        base = snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        base = context.internal_api_root
         params = {
             "target-nf-type": "ADRF",
             "requester-nf-type": "NWDAF",

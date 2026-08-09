@@ -16,9 +16,9 @@ import httpx
 from py_mtlf.config import DatasetSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.adrf_discovery import AdrfResolver, normalize_api_root
+from py_mtlf.core.nwdaf_context import NwdafContext, NwdafContextClient
 from py_mtlf.core.seed_catalog import FamilyKey
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest, SmfResourceSnapshot
+from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import (
     DataSubscription,
     NadrfDataRetrievalNotification,
@@ -112,14 +112,14 @@ class DatasetCoordinator:
     def __init__(
         self,
         settings: DatasetSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         policy: AccuracyPolicy,
         resolver: AdrfResolver,
         client: httpx.Client | None = None,
         clock=lambda: datetime.now(UTC),
     ) -> None:
         self._settings = settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._policy = policy
         self._resolver = resolver
         self._client = client or httpx.Client(timeout=settings.fetch_timeout_seconds)
@@ -128,6 +128,7 @@ class DatasetCoordinator:
         self._lock = threading.RLock()
         self._jobs: dict[str, DatasetJob] = {}
         self._routes: dict[str, str] = {}
+        self._descriptors: dict[str, TrainingDataDescriptor] = {}
         self._closing = threading.Event()
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_concurrent_jobs,
@@ -149,9 +150,7 @@ class DatasetCoordinator:
                 startTime=stop - timedelta(seconds=self._settings.retrieval_window_seconds),
                 stopTime=stop,
             )
-            snapshot = self._projection.snapshot()
-            source = snapshot.training_data_source if snapshot else "unavailable"
-            job = DatasetJob(str(uuid4()), intent, window, source)
+            job = DatasetJob(str(uuid4()), intent, window, "unavailable")
             with self._lock:
                 self._jobs[job.job_id] = job
             future = self._executor.submit(self._run_job, job)
@@ -171,7 +170,7 @@ class DatasetCoordinator:
             str(uuid4()),
             intent,
             time_window,
-            "adrf",
+            "unavailable",
             policy_owned=False,
             completion_handler=completion_handler,
         )
@@ -184,10 +183,36 @@ class DatasetCoordinator:
         return job.job_id
 
     def validate_external_scope(self, intent: RetrainIntent) -> None:
-        sync = self._projection.snapshot()
-        if sync is None:
-            raise RuntimeError("backend sync is unavailable")
-        self._resolve(intent, sync)
+        self._resolve(intent, self._descriptor_snapshot())
+
+    def put_training_data_descriptor(
+        self,
+        descriptor_id: str,
+        descriptor: TrainingDataDescriptor,
+    ) -> None:
+        if descriptor_id != descriptor.correlation_id:
+            raise ValueError("descriptorId must match correlationId")
+        with self._lock:
+            self._descriptors[descriptor_id] = descriptor.model_copy(deep=True)
+
+    def delete_training_data_descriptor(self, descriptor_id: str) -> bool:
+        with self._lock:
+            return self._descriptors.pop(descriptor_id, None) is not None
+
+    def _descriptor_snapshot(self) -> tuple[TrainingDataDescriptor, ...]:
+        now = self._clock().astimezone(UTC)
+        with self._lock:
+            expired = [
+                descriptor_id
+                for descriptor_id, descriptor in self._descriptors.items()
+                if descriptor.retain_until <= now
+            ]
+            for descriptor_id in expired:
+                self._descriptors.pop(descriptor_id, None)
+            return tuple(
+                self._descriptors[key].model_copy(deep=True)
+                for key in sorted(self._descriptors)
+            )
 
     def shutdown(self) -> None:
         self._closing.set()
@@ -284,15 +309,14 @@ class DatasetCoordinator:
             if self._closing.is_set():
                 raise RuntimeError("dataset coordinator is shutting down")
             job.state = DatasetJobState.RESOLVING
-            sync = self._projection.snapshot()
-            if sync is None:
-                raise RuntimeError("backend sync is unavailable")
-            job.resources = self._resolve(job.intent, sync)
+            descriptors = self._descriptor_snapshot()
+            job.resources = self._resolve(job.intent, descriptors)
             if not job.resources:
                 raise RuntimeError("no accepted SMF collection resource matches the retrain scopes")
+            job.source = self._select_source(job.resources)
             job.state = DatasetJobState.RETRIEVING
             if job.source == "adrf":
-                self._retrieve_adrf(job, sync)
+                self._retrieve_adrf(job, self._nwdaf_context.get())
             elif job.source == "mongodb":
                 self._retrieve_mongo(job)
             else:
@@ -320,63 +344,20 @@ class DatasetCoordinator:
             self._futures.discard(future)
 
     def _resolve(
-        self, intent: RetrainIntent, sync: BackendSyncRequest
+        self,
+        intent: RetrainIntent,
+        descriptors: tuple[TrainingDataDescriptor, ...],
     ) -> tuple[ResolvedResource, ...]:
-        if sync.training_data_descriptors:
-            return self._resolve_descriptors(intent, sync)
-        scope_to_subscriptions: dict[str, set[str]] = {}
-        for scope in intent.active_scopes:
-            matched = {
-                item.subscription_id
-                for item in sync.events_subscriptions
-                if self._matches_scope(
-                    scope,
-                    item.subscription.model_dump(
-                        by_alias=True,
-                        exclude_defaults=True,
-                        exclude_none=True,
-                    ),
-                )
-            }
-            if not matched:
-                raise RuntimeError(f"scope {scope.scope_key} has no matching Events Subscription")
-            scope_to_subscriptions[scope.scope_key] = matched
-        resources: dict[str, tuple[SmfResourceSnapshot, set[str]]] = {}
-        for item in sync.smf_resources:
-            if item.pending_cleanup or item.subscription is None:
-                continue
-            scopes = {
-                scope_key
-                for scope_key, subscription_ids in scope_to_subscriptions.items()
-                if subscription_ids.intersection(item.nwdaf_subscription_ids)
-            }
-            if not scopes:
-                continue
-            identity = f"{item.target_api_root.rstrip('/')}|{item.resource_location}"
-            existing = resources.get(identity)
-            if existing and existing[0].subscription != item.subscription:
-                raise RuntimeError(f"conflicting SMF collection profile for {identity}")
-            resources[identity] = (item, scopes | (existing[1] if existing else set()))
-        resolved: list[ResolvedResource] = []
-        for identity, (item, scopes) in sorted(resources.items()):
-            smf_data_sub = dict(item.subscription)
-            supi = str(smf_data_sub.get("supi", "")).strip()
-            if not supi:
-                raise RuntimeError(f"accepted SMF resource {identity} has no SUPI")
-            resolved.append(ResolvedResource(identity, tuple(sorted(scopes)), smf_data_sub, supi))
-        for scope in intent.active_scope_keys:
-            if not any(scope in resource.scope_keys for resource in resolved):
-                raise RuntimeError(f"scope {scope} has no usable SMF collection resource")
-        return tuple(resolved)
+        return self._resolve_descriptors(intent, descriptors)
 
     def _resolve_descriptors(
         self,
         intent: RetrainIntent,
-        sync: BackendSyncRequest,
+        descriptors: tuple[TrainingDataDescriptor, ...],
     ) -> tuple[ResolvedResource, ...]:
         now = self._clock().astimezone(UTC)
         resolved: list[ResolvedResource] = []
-        for descriptor in sync.training_data_descriptors:
+        for descriptor in descriptors:
             if descriptor.retain_until <= now:
                 continue
             event = descriptor.ml_event_subscription
@@ -385,7 +366,10 @@ class DatasetCoordinator:
                     scope.scope_key
                     for scope in intent.active_scopes
                     if scope.ml_event == event.ml_event
-                    and (scope.target_ue is None or scope.target_ue == event.target_ue)
+                    and (
+                        scope.target_ue is None
+                        or self._targets_match(scope.target_ue, event.target_ue)
+                    )
                     and (
                         not scope.ml_event_filter
                         or scope.ml_event_filter == (event.ml_event_filter or {})
@@ -405,7 +389,7 @@ class DatasetCoordinator:
                     scope_keys=scopes,
                     smf_data_sub=smf_data_sub,
                     supi=descriptor.stored_data_spec.data_spec.smf_data_sub.supi,
-                    adrf_instance_id=descriptor.adrf_instance_id,
+                    adrf_instance_id=descriptor.adrf_instance_id or "",
                     available_start=descriptor.stored_data_spec.time_period.start_time,
                     available_stop=descriptor.stored_data_spec.time_period.stop_time,
                 )
@@ -431,7 +415,7 @@ class DatasetCoordinator:
                             "tgtUe": item.ml_event_subscription.target_ue,
                             "retainUntil": item.retain_until.isoformat(),
                         }
-                        for item in sync.training_data_descriptors
+                        for item in descriptors
                     ],
                 )
                 raise RuntimeError(f"scope {scope} has no usable training-data descriptor")
@@ -443,7 +427,10 @@ class DatasetCoordinator:
             if event.get("event") != scope.ml_event:
                 continue
             target = event.get("tgtUe") or subscription.get("tgtUe")
-            if scope.target_ue is not None and target != scope.target_ue:
+            if scope.target_ue is not None and not DatasetCoordinator._targets_match(
+                scope.target_ue,
+                target,
+            ):
                 continue
             event_filter = event.get("eventFilter") or event.get("analyticsFilter")
             if not isinstance(event_filter, dict):
@@ -453,7 +440,52 @@ class DatasetCoordinator:
             return True
         return False
 
-    def _retrieve_adrf(self, job: DatasetJob, sync: BackendSyncRequest) -> None:
+    @staticmethod
+    def _targets_match(expected: dict, actual: dict | None) -> bool:
+        """Compare TargetUeInformation by its meaningful selection fields.
+
+        Release 18 models may serialize unset target fields as ``false`` or an
+        empty list while a peer sends the equivalent compact JSON form.  Those
+        representation defaults must not split one analytics scope into two.
+        """
+
+        def normalized(value: dict | None) -> dict:
+            if not isinstance(value, dict):
+                return {}
+            target: dict = {}
+            if value.get("anyUe") is True:
+                target["anyUe"] = True
+            for key in ("supis", "intGroupIds"):
+                members = value.get(key)
+                if isinstance(members, list) and members:
+                    target[key] = sorted(members)
+            for key, item in value.items():
+                if key in {"anyUe", "supis", "intGroupIds"}:
+                    continue
+                if item not in (None, False, "", [], {}):
+                    target[key] = item
+            return target
+
+        return normalized(expected) == normalized(actual)
+
+    def _select_source(self, resources: tuple[ResolvedResource, ...]) -> str:
+        if any(not resource.adrf_instance_id for resource in resources):
+            return "mongodb"
+        adrf_ids = {
+            resource.adrf_instance_id
+            for resource in resources
+            if resource.adrf_instance_id
+        }
+        if len(adrf_ids) > 1:
+            raise RuntimeError("one dataset job cannot span multiple ADRF instances")
+        try:
+            if self._resolver.resolve(next(iter(adrf_ids), "")):
+                return "adrf"
+        except Exception as error:
+            logger.warning("ADRF is unavailable; using MongoDB fallback: %s", error)
+        return "mongodb"
+
+    def _retrieve_adrf(self, job: DatasetJob, context: NwdafContext) -> None:
         adrf_ids = {
             resource.adrf_instance_id
             for resource in job.resources
@@ -464,8 +496,8 @@ class DatasetCoordinator:
         api_root = self._resolver.resolve(next(iter(adrf_ids), ""))
         if not api_root:
             raise RuntimeError("ADRF could not be resolved")
-        callback = sync.containing_nwdaf.api_base_uri.rstrip("/") + "/collector/retrieval-notify"
-        go_base = sync.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        callback = context.api_root + "/collector/retrieval-notify"
+        go_base = context.internal_api_root
         create_url = go_base + "/internal/v1/adrf-data-management/data-retrieval-subscriptions"
         for resource in job.resources:
             start_time = max(
@@ -787,10 +819,11 @@ class DatasetCoordinator:
             ready_handler(job.job_id)
 
     def _cleanup(self, job: DatasetJob) -> None:
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
+        try:
+            context = self._nwdaf_context.get()
+        except RuntimeError:
             return
-        go_base = snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        go_base = context.internal_api_root
         for route in job.routes.values():
             if route.peer_subscription_id and not route.cleanup_complete:
                 terminal = False

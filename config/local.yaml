@@ -12,6 +12,11 @@ runtime:
   # This profile intentionally selects the local role.
   mode: "local"
 
+# Thin Go-side internal API owned by the containing NWDAF process.
+containing_nwdaf:
+  internal_api_root: "http://127.0.0.1:8091"
+  request_timeout_seconds: 30
+
 # Immutable model bundles and durable model/publication state.
 storage:
   # Root directory containing immutable, content-addressed model bundles.
@@ -105,6 +110,9 @@ model_monitor:
   callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
   # Requested seconds between periodic reports from the model consumer.
   report_period_seconds: 90
+  # Cancel the monitor after two missed periods plus a 30-second grace window.
+  missed_report_threshold: 2
+  watchdog_grace_seconds: 30
   # Seconds allowed for one monitor create, update, or delete request.
   request_timeout_seconds: 30
   # Seconds to wait for the required remote monitor route to become discoverable.

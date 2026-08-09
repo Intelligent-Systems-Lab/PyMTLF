@@ -1,31 +1,43 @@
 import json
 
 import httpx
+from nwdaf_context import context_client
 
 from py_mtlf.config import ModelMonitorSettings
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest
 
 TARGET_ID = "11111111-1111-4111-8111-111111111111"
 
 
-def projection() -> SyncProjection:
-    value = SyncProjection()
-    value.replace(
-        BackendSyncRequest.model_validate(
-            {
-                "containingNwdaf": {
-                    "nfInstanceId": "33333333-3333-4333-8333-333333333333",
-                    "apiBaseUri": "http://go-c.example",
-                    "internalCallbackBaseUri": "http://go-c-internal.example",
-                },
-                "eventsSubscriptions": [],
-                "smfResources": [],
-            }
-        )
+def nwdaf_context():
+    return context_client(
+        nf_instance_id="33333333-3333-4333-8333-333333333333",
+        api_root="http://go-c.example",
+        internal_api_root="http://go-c-internal.example",
     )
-    return value
+
+
+def test_containing_nwdaf_monitor_uses_stateless_context_without_nrf():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    context = nwdaf_context()
+    resolver = NwdafMonitorResolver(ModelMonitorSettings(), context, client)
+
+    target = resolver.resolve(context.get().nf_instance_id)
+
+    assert target is not None
+    assert target.nf_instance_id == context.get().nf_instance_id
+    assert target.nf_service_instance_id == "containing-nwdaf-mlmodelmonitor"
+    assert target.api_root == "http://go-c.example"
+    assert target.selection_source == "CONFIGURED"
+    assert calls == 0
+    client.close()
 
 
 def test_exact_monitor_discovery_selects_requested_nwdaf_and_caches():
@@ -83,7 +95,7 @@ def test_exact_monitor_discovery_selects_requested_nwdaf_and_caches():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    resolver = NwdafMonitorResolver(ModelMonitorSettings(), projection(), client)
+    resolver = NwdafMonitorResolver(ModelMonitorSettings(), nwdaf_context(), client)
 
     first = resolver.resolve(TARGET_ID)
     second = resolver.resolve(TARGET_ID)
@@ -107,7 +119,7 @@ def test_exact_monitor_discovery_keeps_missing_target_pending():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    resolver = NwdafMonitorResolver(ModelMonitorSettings(), projection(), client)
+    resolver = NwdafMonitorResolver(ModelMonitorSettings(), nwdaf_context(), client)
 
     assert resolver.resolve(TARGET_ID) is None
     client.close()

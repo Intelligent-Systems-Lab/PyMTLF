@@ -18,7 +18,7 @@ from py_mtlf.api import (
     ml_model_monitor,
     ml_model_provision,
     ml_model_training,
-    sync,
+    training_data,
 )
 from py_mtlf.config import FLClientSettings, FLServerSettings, LocalTrainingSettings, Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
@@ -41,11 +41,11 @@ from py_mtlf.core.monitor_store import (
     MonitorSubscriptionProjectionStore,
 )
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.publication import PublicationCoordinator
 from py_mtlf.core.seed_catalog import SeedCatalog
-from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.core.training_jobs import TrainingCoordinator
 from py_mtlf.models import PrivateError
 
@@ -90,10 +90,13 @@ def create_app(
         seed_catalog,
     )
     runtime = RuntimeState(process_instance_id=str(uuid4()), mode=settings.runtime.mode)
-    sync_projection = SyncProjection(state_lock)
+    nwdaf_context = NwdafContextClient(
+        settings.containing_nwdaf.internal_api_root,
+        settings.containing_nwdaf.request_timeout_seconds,
+    )
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
-    adrf_resolver = AdrfResolver(settings.adrf, sync_projection)
+    adrf_resolver = AdrfResolver(settings.adrf, nwdaf_context)
     fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
     local_training = settings.local_training or LocalTrainingSettings()
     fl_client_settings = settings.federated_learning.client or FLClientSettings()
@@ -119,7 +122,7 @@ def create_app(
         artifact_repository,
         fl_workspace,
         adrf_resolver,
-        sync_projection,
+        nwdaf_context,
         on_published=resume_published_cutover,
     )
     fl_server_holder: dict[str, FLServerOrchestrator] = {}
@@ -136,22 +139,26 @@ def create_app(
                 AccuracyPolicy.registration_scope_key(registration),
             )
 
+    def monitor_subscription_timed_out(registration) -> None:
+        accuracy_policy.remove_registration(registration)
+
     nwdaf_monitor_resolver = NwdafMonitorResolver(
         settings.model_monitor,
-        sync_projection,
+        nwdaf_context,
     )
     monitor_reconciler = MonitorSubscriptionReconciler(
         settings.model_monitor,
-        sync_projection,
+        nwdaf_context,
         monitor_registrations,
         monitor_subscriptions,
         nwdaf_monitor_resolver,
         state_lock,
         on_subscription_created=monitor_subscription_created,
+        on_subscription_timeout=monitor_subscription_timed_out,
     )
     dataset_coordinator = DatasetCoordinator(
         settings.dataset,
-        sync_projection,
+        nwdaf_context,
         accuracy_policy,
         adrf_resolver,
     )
@@ -166,20 +173,20 @@ def create_app(
     )
     fl_client_resolver = FLClientResolver(
         settings.federated_learning,
-        sync_projection,
+        nwdaf_context,
     )
     fl_client = FLClientService(
         settings.federated_learning,
         fl_client_settings,
         settings.notification,
-        sync_projection,
+        nwdaf_context,
         dataset_coordinator,
         fl_workspace,
     )
     fl_server = FLServerOrchestrator(
         settings.federated_learning,
         fl_server_settings,
-        sync_projection,
+        nwdaf_context,
         accuracy_policy,
         seed_catalog,
         fl_workspace,
@@ -223,6 +230,7 @@ def create_app(
                 monitor_reconciler.shutdown()
                 provision_notifications.shutdown()
             nwdaf_monitor_resolver.close()
+            nwdaf_context.close()
             runtime.accepting_requests = False
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
@@ -236,7 +244,7 @@ def create_app(
     app.state.model_state = model_state
     app.state.provision_store = provision_store
     app.state.provision_notifications = provision_notifications
-    app.state.sync_projection = sync_projection
+    app.state.nwdaf_context = nwdaf_context
     app.state.monitor_registrations = monitor_registrations
     app.state.monitor_subscriptions = monitor_subscriptions
     app.state.monitor_reconciler = monitor_reconciler
@@ -251,7 +259,7 @@ def create_app(
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)
-    app.include_router(sync.router)
+    app.include_router(training_data.router)
     app.include_router(adrf.router)
     if settings.runtime.mode in {"local", "fl_server"}:
         app.include_router(ml_model_provision.router)

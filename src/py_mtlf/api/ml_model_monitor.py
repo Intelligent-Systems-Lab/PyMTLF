@@ -103,6 +103,7 @@ def receive_monitor_notification(
                 "monitor subscription has no active registration owner",
                 cause="RESOURCE_NOT_FOUND",
             )
+        request.app.state.monitor_reconciler.record_report(subscription.subscription_id)
         decisions = request.app.state.accuracy_policy.observe(
             subscription.representation,
             payload,

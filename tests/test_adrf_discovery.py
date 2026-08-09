@@ -1,28 +1,9 @@
 import httpx
 import pytest
+from nwdaf_context import context_client
 
 from py_mtlf.config import AdrfSettings
 from py_mtlf.core.adrf_discovery import AdrfResolver
-from py_mtlf.core.sync_projection import SyncProjection
-from py_mtlf.models import BackendSyncRequest
-
-
-def projection() -> SyncProjection:
-    value = SyncProjection()
-    value.replace(
-        BackendSyncRequest.model_validate(
-            {
-                "containingNwdaf": {
-                    "nfInstanceId": "nwdaf-1",
-                    "apiBaseUri": "http://go.example",
-                    "internalCallbackBaseUri": "http://go-internal.example",
-                },
-                "eventsSubscriptions": [],
-                "smfResources": [],
-            }
-        )
-    )
-    return value
 
 
 def test_configured_mode_bypasses_go_discovery():
@@ -40,7 +21,7 @@ def test_configured_mode_bypasses_go_discovery():
             configured_endpoint="http://adrf.example:9888",
             configured_nf_instance_id="adrf-a",
         ),
-        projection(),
+        context_client(),
         client,
     )
 
@@ -92,7 +73,7 @@ def test_nrf_mode_selects_deterministically_and_reuses_valid_result():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    resolver = AdrfResolver(AdrfSettings(mode="nrf"), projection(), client)
+    resolver = AdrfResolver(AdrfSettings(mode="nrf"), context_client(), client)
 
     assert resolver.resolve() == "http://192.0.2.10:9888"
     assert resolver.resolve() == "http://192.0.2.10:9888"
@@ -132,7 +113,7 @@ def test_nrf_mode_uses_service_identity_before_api_root():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    resolver = AdrfResolver(AdrfSettings(mode="nrf"), projection(), client)
+    resolver = AdrfResolver(AdrfSettings(mode="nrf"), context_client(), client)
 
     assert resolver.resolve() == "http://adrf-z.example:9888"
     client.close()
@@ -151,7 +132,7 @@ def test_nrf_mode_rejects_malformed_search_result(body):
         return httpx.Response(200, json=body, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    resolver = AdrfResolver(AdrfSettings(mode="nrf"), projection(), client)
+    resolver = AdrfResolver(AdrfSettings(mode="nrf"), context_client(), client)
 
     with pytest.raises(ValueError, match="malformed SearchResult"):
         resolver.resolve()

@@ -32,8 +32,8 @@ from py_mtlf.core.model_records import (
     PublicationState,
     RevisionOrigin,
 )
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.seed_catalog import CatalogModel, FamilyKey, ModelCatalog
-from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.core.trainer import TrustedBundleLoader
 from py_mtlf.wire.adrf import (
     AllowedConsumer,
@@ -75,7 +75,7 @@ class PublicationCoordinator:
         artifacts: ArtifactRepository,
         workspace: FLWorkspace,
         adrf_resolver: AdrfResolver,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         client: httpx.Client | None = None,
         on_published: Callable[[PendingPublication, CatalogModel], None] | None = None,
     ) -> None:
@@ -85,7 +85,7 @@ class PublicationCoordinator:
         self._artifacts = artifacts
         self._workspace = workspace
         self._adrf_resolver = adrf_resolver
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._on_published = on_published or (lambda _publication, _model: None)
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
@@ -352,12 +352,13 @@ class PublicationCoordinator:
             target_instance_id = publication.selected_adrf_instance_id or ""
             if not target_api_root or not target_instance_id:
                 raise RuntimeError("in-flight publication lost its selected ADRF identity")
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            raise RecoverablePublicationError("containing NWDAF is not synchronized")
+        try:
+            context = self._nwdaf_context.get()
+        except RuntimeError as error:
+            raise RecoverablePublicationError("containing NWDAF context is unavailable") from error
         artifact = self._artifacts.metadata(publication.final_bundle_digest or "")
         allowed_consumer_ids = {
-            snapshot.containing_nwdaf.nf_instance_id,
+            context.nf_instance_id,
             *(
                 item.participant_nf_instance_id
                 for item in publication.participants_and_sample_counts
@@ -378,7 +379,7 @@ class PublicationCoordinator:
         record = self._retrieve_by_model_id(publication, target_api_root)
         if record is None:
             request_record = NadrfMLModelStoreRecord(
-                nfInstanceId=snapshot.containing_nwdaf.nf_instance_id,
+                nfInstanceId=context.nf_instance_id,
                 mlModelInfo=[
                     MLModelInfo(
                         modelUniqueId=publication.reserved_model_id,
@@ -429,7 +430,7 @@ class PublicationCoordinator:
         ):
             raise RuntimeError("ADRF did not confirm successful ML model storage")
         stored_info = record.ml_model_info[0]
-        if record.nf_instance_id != snapshot.containing_nwdaf.nf_instance_id:
+        if record.nf_instance_id != context.nf_instance_id:
             raise RuntimeError("ADRF record owner does not match the publishing NWDAF")
         if stored_info.model_unique_id != publication.reserved_model_id:
             raise RuntimeError("ADRF response changed the reserved model identity")
@@ -774,7 +775,4 @@ class PublicationCoordinator:
             delay = min(delay * 2, self._settings.retry_max_interval_seconds)
 
     def _go_base(self) -> str:
-        snapshot = self._projection.snapshot()
-        if snapshot is None:
-            raise RuntimeError("containing NWDAF is not synchronized")
-        return snapshot.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        return self._nwdaf_context.get().internal_api_root

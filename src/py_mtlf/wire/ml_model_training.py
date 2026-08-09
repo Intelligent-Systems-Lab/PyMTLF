@@ -4,7 +4,6 @@ from datetime import datetime
 from pydantic import AnyHttpUrl, Field, JsonValue, model_validator
 
 from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription
-from py_mtlf.wire.private import SelectedTarget
 from py_mtlf.wire.reporting import ReportingInformation, StandardModel
 
 
@@ -193,16 +192,6 @@ class NwdafMLModelTrainSubscPatch(StandardModel):
     round_indicator: int | None = Field(default=None, alias="roundInd", ge=0)
     target_reporting_ue: dict[str, JsonValue] | None = Field(default=None, alias="tgtRepUe")
     skip_fl_indicator: bool | None = Field(default=None, alias="skipFlInd")
-
-
-class MLModelTrainingSubscriptionSnapshot(StandardModel):
-    subscription_id: str = Field(min_length=1, alias="subscriptionId")
-    representation: NwdafMLModelTrainSubsc
-    direction: str = ""
-    selected_target: "SelectedTarget | None" = Field(default=None, alias="selectedTarget")
-    peer_location: str = Field(default="", alias="peerLocation")
-    lifecycle_state: str = Field(default="", alias="lifecycleState")
-    process_generation: str = Field(default="", alias="processGeneration")
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,6 @@ import json
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from time import monotonic
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -13,11 +12,10 @@ from py_mtlf.config import ModelMonitorSettings
 from py_mtlf.core.monitor_store import (
     MonitorRegistrationResource,
     MonitorRegistrationStore,
-    MonitorSubscriptionProjection,
     MonitorSubscriptionProjectionStore,
 )
+from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
-from py_mtlf.core.sync_projection import SyncProjection
 from py_mtlf.wire.ml_model_monitor import (
     MLModelMonitorRegistration,
     MLModelMonitorSubscription,
@@ -28,38 +26,31 @@ from py_mtlf.wire.private import SelectedTarget, selected_target_headers
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class PreparedMonitorRestore:
-    subscription_ids: dict[str, str]
-    orphan_subscription_ids: frozenset[str]
-    correlation_ids: dict[str, str] = field(default_factory=dict)
-    selected_targets: dict[str, SelectedTarget] = field(default_factory=dict)
-    retired_registration_ids: frozenset[str] = frozenset()
-
-
 class MonitorSubscriptionReconciler:
     def __init__(
         self,
         settings: ModelMonitorSettings,
-        projection: SyncProjection,
+        nwdaf_context: NwdafContextClient,
         registrations: MonitorRegistrationStore,
         subscriptions: MonitorSubscriptionProjectionStore,
         resolver: NwdafMonitorResolver,
         state_lock=None,
         on_subscription_created: Callable[[MLModelMonitorRegistration], None] | None = None,
+        on_subscription_timeout: Callable[[MLModelMonitorRegistration], None] | None = None,
     ) -> None:
         self._settings = settings
-        self._projection = projection
+        self._nwdaf_context = nwdaf_context
         self._registrations = registrations
         self._subscriptions = subscriptions
         self._resolver = resolver
         self._on_subscription_created = on_subscription_created or (lambda _registration: None)
+        self._on_subscription_timeout = on_subscription_timeout or (lambda _registration: None)
         self._condition = threading.Condition(state_lock or threading.RLock())
         self._subscription_ids: dict[str, str] = {}
-        self._orphan_subscription_ids: set[str] = set()
         self._correlation_ids: dict[str, str] = {}
         self._selected_targets: dict[str, SelectedTarget] = {}
         self._retired_registration_ids: set[str] = set()
+        self._last_reports: dict[str, float] = {}
         self._closing = False
         self._worker: threading.Thread | None = None
         self._session = httpx.Client()
@@ -91,91 +82,21 @@ class MonitorSubscriptionReconciler:
         with self._condition:
             self._condition.notify_all()
 
-    def restore(
-        self,
-        subscriptions: tuple[MonitorSubscriptionProjection, ...],
-    ) -> None:
-        prepared = self.prepare_restore(
-            self._registrations.snapshot(),
-            subscriptions,
-        )
-        self.commit_restore(prepared)
-        self.finalize_restore()
-
-    def prepare_restore(
-        self,
-        registrations: tuple[MonitorRegistrationResource, ...],
-        subscriptions: tuple[MonitorSubscriptionProjection, ...],
-    ) -> PreparedMonitorRestore:
-        available = list(subscriptions)
-        restored: dict[str, str] = {}
-        correlation_ids: dict[str, str] = {}
-        selected_targets: dict[str, SelectedTarget] = {}
-        for registration in registrations:
-            for index, candidate in enumerate(available):
-                if (
-                    candidate.owner_registration_id == registration.registration_id
-                    and self._same_scope(
-                        self._subscription_for(registration),
-                        candidate.representation,
-                    )
-                ):
-                    restored[registration.registration_id] = candidate.subscription_id
-                    correlation_ids[registration.registration_id] = (
-                        candidate.representation.notification_id
-                    )
-                    if candidate.selected_target is not None:
-                        selected_targets[registration.registration_id] = candidate.selected_target
-                    available.pop(index)
-                    break
-        newest_by_scope: dict[str, MonitorRegistrationResource] = {}
-        retired: set[str] = set()
-        for registration in registrations:
-            scope_key = self._registration_scope_key(registration.representation)
-            newest = newest_by_scope.get(scope_key)
-            if (
-                newest is None
-                or registration.representation.model_id > newest.representation.model_id
-            ):
-                if newest is not None:
-                    retired.add(newest.registration_id)
-                newest_by_scope[scope_key] = registration
-            else:
-                retired.add(registration.registration_id)
-        return PreparedMonitorRestore(
-            subscription_ids=restored,
-            orphan_subscription_ids=frozenset(candidate.subscription_id for candidate in available),
-            correlation_ids=correlation_ids,
-            selected_targets=selected_targets,
-            retired_registration_ids=frozenset(retired),
-        )
-
-    def commit_restore(self, prepared: PreparedMonitorRestore) -> None:
-        with self._condition:
-            self._subscription_ids = dict(prepared.subscription_ids)
-            self._orphan_subscription_ids = set(prepared.orphan_subscription_ids)
-            self._correlation_ids = dict(prepared.correlation_ids)
-            self._selected_targets = dict(prepared.selected_targets)
-            self._retired_registration_ids = set(prepared.retired_registration_ids)
-
-    def finalize_restore(self) -> None:
-        with self._condition:
-            self._condition.notify_all()
-
     def snapshot(self) -> dict[str, str]:
         with self._condition:
             return dict(self._subscription_ids)
-
-    def orphans(self) -> frozenset[str]:
-        with self._condition:
-            return frozenset(self._orphan_subscription_ids)
 
     def owns(self, registration_id: str, subscription_id: str) -> bool:
         with self._condition:
             return (
                 self._subscription_ids.get(registration_id) == subscription_id
-                and subscription_id not in self._orphan_subscription_ids
             )
+
+    def record_report(self, subscription_id: str) -> None:
+        with self._condition:
+            if subscription_id in self._last_reports:
+                self._last_reports[subscription_id] = monotonic()
+                self._condition.notify_all()
 
     def _run(self) -> None:
         delay = self._settings.retry_interval_seconds
@@ -187,7 +108,10 @@ class MonitorSubscriptionReconciler:
                     now = monotonic()
                     if action is not None and now >= next_attempt:
                         break
-                    timeout = None if action is None else max(0.0, next_attempt - now)
+                    if action is None:
+                        timeout = self._watchdog_wait_seconds(now)
+                    else:
+                        timeout = max(0.0, next_attempt - now)
                     self._condition.wait(timeout=timeout)
                 if self._closing:
                     return
@@ -197,8 +121,8 @@ class MonitorSubscriptionReconciler:
                     self._create(registration_id)
                 elif kind == "delete":
                     self._delete(registration_id)
-                else:
-                    self._delete_orphan(registration_id)
+                elif kind == "expire":
+                    self._expire(registration_id)
                 delay = self._settings.retry_interval_seconds
                 next_attempt = 0.0
             except Exception:
@@ -207,8 +131,16 @@ class MonitorSubscriptionReconciler:
                 delay = min(delay * 2, self._settings.retry_max_interval_seconds)
 
     def _next_action(self) -> tuple[str, str] | None:
-        if self._orphan_subscription_ids:
-            return "delete_orphan", min(self._orphan_subscription_ids)
+        now = monotonic()
+        for registration_id, subscription_id in sorted(self._subscription_ids.items()):
+            last_report = self._last_reports.get(subscription_id)
+            projection = self._subscriptions.find_by_id(subscription_id)
+            if (
+                last_report is not None
+                and projection is not None
+                and now >= last_report + self._watchdog_timeout(projection.representation)
+            ):
+                return "expire", registration_id
         resources = self._registrations.snapshot()
         available = {resource.registration_id for resource in resources}
         self._retired_registration_ids.intersection_update(available)
@@ -273,6 +205,7 @@ class MonitorSubscriptionReconciler:
                     accepted,
                     target,
                 )
+                self._last_reports[subscription_id] = monotonic()
                 logger.info(
                     "ML Model Monitor subscription active subscription_id=%s "
                     "registration_id=%s correlation_id=%s",
@@ -297,10 +230,68 @@ class MonitorSubscriptionReconciler:
             self._subscription_ids.pop(registration_id, None)
             self._correlation_ids.pop(registration_id, None)
             self._selected_targets.pop(registration_id, None)
+            self._last_reports.pop(subscription_id, None)
         logger.info(
             "ML Model Monitor subscription removed subscription_id=%s registration_id=%s",
             subscription_id,
             registration_id,
+        )
+
+    def _expire(self, registration_id: str) -> None:
+        with self._condition:
+            subscription_id = self._subscription_ids.get(registration_id, "")
+        if not subscription_id:
+            return
+        try:
+            self._delete_remote(subscription_id)
+        except Exception:
+            logger.warning(
+                "Monitor subscription watchdog cleanup failed; state will not be replayed "
+                "subscription_id=%s registration_id=%s",
+                subscription_id,
+                registration_id,
+                exc_info=True,
+            )
+        registration = self._registrations.get(registration_id)
+        self._subscriptions.delete(subscription_id)
+        self._registrations.delete(registration_id)
+        with self._condition:
+            self._subscription_ids.pop(registration_id, None)
+            self._correlation_ids.pop(registration_id, None)
+            self._selected_targets.pop(registration_id, None)
+            self._last_reports.pop(subscription_id, None)
+        if registration is not None:
+            self._on_subscription_timeout(registration.representation)
+        logger.warning(
+            "Monitor subscription expired after missing periodic reports "
+            "subscription_id=%s registration_id=%s",
+            subscription_id,
+            registration_id,
+        )
+
+    def _watchdog_wait_seconds(self, now: float) -> float | None:
+        deadlines: list[float] = []
+        for subscription_id, last_report in self._last_reports.items():
+            projection = self._subscriptions.find_by_id(subscription_id)
+            if projection is not None:
+                deadlines.append(
+                    last_report + self._watchdog_timeout(projection.representation)
+                )
+        if not deadlines:
+            return None
+        return max(0.0, min(deadlines) - now)
+
+    def _watchdog_timeout(self, subscription: MLModelMonitorSubscription) -> float:
+        report_period = self._settings.report_period_seconds
+        if (
+            subscription.event_report_request is not None
+            and subscription.event_report_request.repetition_period is not None
+            and subscription.event_report_request.repetition_period > 0
+        ):
+            report_period = subscription.event_report_request.repetition_period
+        return (
+            report_period * self._settings.missed_report_threshold
+            + self._settings.watchdog_grace_seconds
         )
 
     def _retire_older_scope_registrations(
@@ -317,16 +308,6 @@ class MonitorSubscriptionReconciler:
             ):
                 self._retired_registration_ids.add(candidate.registration_id)
 
-    def _delete_orphan(self, subscription_id: str) -> None:
-        self._delete_remote(subscription_id)
-        self._subscriptions.delete(subscription_id)
-        with self._condition:
-            self._orphan_subscription_ids.discard(subscription_id)
-        logger.info(
-            "Orphan ML Model Monitor subscription removed subscription_id=%s",
-            subscription_id,
-        )
-
     def _delete_remote(self, subscription_id: str) -> None:
         response = self._request(
             "DELETE",
@@ -338,10 +319,7 @@ class MonitorSubscriptionReconciler:
             )
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        projection = self._projection.snapshot()
-        if projection is None:
-            raise RuntimeError("containing NWDAF is not synchronized")
-        base_uri = projection.containing_nwdaf.internal_callback_base_uri.rstrip("/")
+        base_uri = self._nwdaf_context.get().internal_api_root
         return self._session.request(
             method,
             base_uri + path,

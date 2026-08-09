@@ -11,6 +11,10 @@ runtime:
   # This profile intentionally selects the FL Server role.
   mode: "fl_server"
 
+containing_nwdaf:
+  internal_api_root: "http://127.0.0.1:8091"
+  request_timeout_seconds: 30
+
 storage:
   # Immutable, content-addressed completed-model bundles.
   artifact_root: "data/artifacts"
@@ -101,6 +105,9 @@ model_monitor:
   # Callback receiving periodic accuracy reports from model consumers.
   callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
   report_period_seconds: 90
+  # Cancel the monitor after two missed periods plus a 30-second grace window.
+  missed_report_threshold: 2
+  watchdog_grace_seconds: 30
   request_timeout_seconds: 30
   discovery_timeout_seconds: 30
   retry_interval_seconds: 1
