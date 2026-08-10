@@ -1,7 +1,9 @@
 import time
+from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import httpx
+import numpy as np
 import pytest
 
 from py_mtlf.config import (
@@ -16,6 +18,7 @@ from py_mtlf.core.fl_client import (
     FLClientState,
     _termination,
 )
+from py_mtlf.core.trainer import LocalTrainer
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model_training import (
     NwdafMLModelTrainNotif,
@@ -345,6 +348,89 @@ def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
         submitted = service._submit.call_args.args
         assert submitted[0].__name__ == "_run_validation"
         service._trainer.train.assert_not_called()
+    finally:
+        service.close()
+
+
+def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch):
+    nwdaf_context = Mock()
+    nwdaf_context.get.return_value.nf_instance_id = "participant-a"
+    workspace = Mock()
+    workspace.download.return_value = Mock()
+    workspace.publish.return_value.url = "http://client.example/validation.tar.gz"
+    service = FLClientService(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        nwdaf_context,
+        Mock(),
+        workspace,
+    )
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://server.example/final-candidate.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    snapshot = Mock()
+    snapshot.time_window.start_time = datetime(2026, 7, 1, tzinfo=UTC)
+    snapshot.time_window.stop_time = datetime(2026, 7, 2, tzinfo=UTC)
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.VALIDATION_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        dataset_snapshot=snapshot,
+        prepared_training_sample_count=10,
+        expected_model_contract_digest="a" * 64,
+        expected_preprocessing_contract_digest="b" * 64,
+        preparation_base_artifact=Mock(),
+    )
+    service._resources[resource.subscription_id] = resource
+    base = Mock(manifest={"bundle": "base"}, model=Mock(), scaler=Mock())
+    candidate = Mock(manifest={"bundle": "candidate"}, model=Mock(), scaler=Mock())
+    service._loader = Mock()
+    service._loader.load.side_effect = [base, candidate]
+    scope = Mock(
+        training_sample_count=10,
+        validation_sample_count=2,
+        validation_targets=np.asarray([2.0, 4.0]),
+    )
+    dataset = Mock(training_scopes=(scope,), evaluation_scopes=(scope,))
+    service._dataset_builder = Mock()
+    service._dataset_builder.build.return_value = dataset
+    service._enqueue_delivery = Mock()
+    predict = Mock(
+        side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
+    )
+    monkeypatch.setattr(LocalTrainer, "_predict", predict)
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_client.model_contract_digest", lambda _: "a" * 64
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_client.preprocessing_contract_digest", lambda _: "b" * 64
+    )
+    monkeypatch.setattr("py_mtlf.core.fl_client.weights_digest", lambda _: "c" * 64)
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_validation(resource.subscription_id, resource.revision)
+
+        assert service.get(resource.subscription_id).state is FLClientState.RESULT_PENDING
+        assert predict.call_count == 2
+        assert all(call.args[4] == service._device for call in predict.call_args_list)
+        service._enqueue_delivery.assert_called_once()
     finally:
         service.close()
 

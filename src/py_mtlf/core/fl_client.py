@@ -22,7 +22,7 @@ from py_mtlf.core.fl_workspace import (
     weights_digest,
 )
 from py_mtlf.core.nwdaf_context import NwdafContextClient
-from py_mtlf.core.trainer import LocalTrainer, TrustedBundleLoader, wape
+from py_mtlf.core.trainer import LocalTrainer, TrustedBundleLoader, resolve_device, wape
 from py_mtlf.core.training_data import TrainingDatasetBuilder
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
@@ -114,6 +114,7 @@ class FLClientService:
         self._datasets = datasets
         self._workspace = workspace
         self._trainer = FederatedTrainer(client_settings.training)
+        self._device = resolve_device(client_settings.training.device)
         self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
@@ -662,7 +663,13 @@ class FLClientService:
                     continue
                 base_metric = wape(
                     expected,
-                    LocalTrainer._predict(base.model, base.scaler, scope, dataset),
+                    LocalTrainer._predict(
+                        base.model,
+                        base.scaler,
+                        scope,
+                        dataset,
+                        self._device,
+                    ),
                 )
                 candidate_metric = wape(
                     expected,
@@ -671,6 +678,7 @@ class FLClientService:
                         candidate.scaler,
                         scope,
                         dataset,
+                        self._device,
                     ),
                 )
                 base_error += base_metric.error_sum
