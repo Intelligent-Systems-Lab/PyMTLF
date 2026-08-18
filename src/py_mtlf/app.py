@@ -25,9 +25,9 @@ from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetCoordinator
-from py_mtlf.core.fl_client import FLClientService
+from py_mtlf.core.fl_client import FLClientEngine
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
-from py_mtlf.core.fl_server import FLClientResolver, FLServerOrchestrator
+from py_mtlf.core.fl_server import FLClientResolver, FLServerEngine
 from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.model_records import (
     CompletedRevision,
@@ -133,7 +133,7 @@ def create_app(
         nwdaf_context,
         on_published=resume_published_cutover,
     )
-    fl_server_holder: dict[str, FLServerOrchestrator] = {}
+    fl_server_holder: dict[str, FLServerEngine] = {}
 
     def monitor_subscription_created(registration) -> None:
         family_key = seed_catalog.family_for_version(
@@ -184,7 +184,7 @@ def create_app(
         else None
     )
     fl_client = (
-        FLClientService(
+        FLClientEngine(
             settings.federated_learning,
             fl_client_settings,
             settings.notification,
@@ -205,7 +205,7 @@ def create_app(
         else None
     )
     fl_server = (
-        FLServerOrchestrator(
+        FLServerEngine(
             settings.federated_learning,
             fl_server_settings,
             nwdaf_context,

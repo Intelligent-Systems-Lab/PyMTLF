@@ -243,7 +243,7 @@ class FLClientResolver:
         )
 
 
-class FLServerOrchestrator:
+class FLServerEngine:
     def __init__(
         self,
         settings: FederatedLearningSettings,

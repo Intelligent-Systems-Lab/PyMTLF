@@ -14,8 +14,8 @@ from py_mtlf.config import (
 from py_mtlf.core.dataset import DatasetJobState
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
+    FLClientEngine,
     FLClientResource,
-    FLClientService,
     FLClientState,
     _termination,
 )
@@ -90,7 +90,7 @@ def client_settings() -> FLClientSettings:
 def test_create_admits_before_async_adrf_preparation(tmp_path):
     datasets = Mock()
     datasets.submit_external.return_value = "dataset-job-1"
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -120,7 +120,7 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
 
 def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         FLClientSettings(
             model_interoperability_ids=("001122",),
@@ -157,7 +157,7 @@ def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, mo
 
 def test_create_failure_rolls_back_experiment_reservation(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -184,7 +184,7 @@ def test_create_failure_rolls_back_experiment_reservation(tmp_path, monkeypatch)
 
 def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -207,7 +207,7 @@ def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
 
 def test_delete_preserves_bound_resource_until_experiment_cleanup(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -242,7 +242,7 @@ def test_delete_preserves_bound_resource_until_experiment_cleanup(tmp_path, monk
 def test_duplicate_notification_correlation_is_rejected(tmp_path):
     datasets = Mock()
     datasets.submit_external.return_value = "dataset-job-1"
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -287,7 +287,7 @@ def test_preparation_rejects_unsupported_contract_requirements(
         payload["mLEventSubscs"][0][field] = value
     else:
         payload["mLModelTrainInfos"][0][field] = value
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -304,7 +304,7 @@ def test_preparation_rejects_unsupported_contract_requirements(
 
 
 def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -352,7 +352,7 @@ def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
 def test_preparation_rejects_base_bundle_with_different_interoperability(tmp_path):
     datasets = Mock()
     workspace = Mock()
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -394,7 +394,7 @@ def test_preparation_rejects_base_bundle_with_different_interoperability(tmp_pat
 def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
     datasets = Mock()
     datasets.submit_external.return_value = "dataset-job-1"
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -421,7 +421,7 @@ def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
 
 
 def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -487,7 +487,7 @@ def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch)
     workspace = Mock()
     workspace.download.return_value = Mock()
     workspace.publish.return_value.url = "http://client.example/validation.tar.gz"
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -584,7 +584,7 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         httpx.Response(503),
         httpx.Response(204),
     ]
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(
@@ -642,7 +642,7 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
             ],
         }
     )
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
@@ -701,7 +701,7 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
 
 
 def test_restart_terminal_resource_rejects_future_update(tmp_path):
-    service = FLClientService(
+    service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),

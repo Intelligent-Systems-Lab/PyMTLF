@@ -16,7 +16,7 @@ from py_mtlf.core.fl_server import (
     FLClientResolver,
     FLParticipant,
     FLProcess,
-    FLServerOrchestrator,
+    FLServerEngine,
     FLServerState,
     _assign,
 )
@@ -186,7 +186,7 @@ def test_server_process_reserves_shared_slot_until_cleanup_finishes(tmp_path):
         return None
 
     catalog.current.side_effect = current
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
         Mock(),
@@ -224,7 +224,7 @@ def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
     policy = Mock()
     intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
     policy.take_intents.return_value = (intent,)
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
         Mock(),
@@ -261,7 +261,7 @@ def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_pat
     process.published_model_id = 7
     reservation = registry.reserve_server(process.process_id)
     process.experiment_reservation_id = reservation.reservation_id
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
         Mock(),
@@ -296,7 +296,7 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
     process = FLProcess(process_id="process-1", intent=Mock())
     process.state = FLServerState.PREPARATION_WAITING
     process.participants = [participant]
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
         Mock(),
@@ -345,7 +345,7 @@ def test_preparation_uses_configured_historical_data_window(tmp_path):
         status_code=201,
         headers={"Location": "http://go.example/subscriptions/preparation-a"},
     )
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(preparation_data_window_seconds=3600),
         projection,
@@ -422,7 +422,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
     local = Mock(manifest=local_manifest)
     workspace = Mock()
     workspace.download.return_value = Mock(key="6" * 64)
-    orchestrator = FLServerOrchestrator(
+    orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
         Mock(),

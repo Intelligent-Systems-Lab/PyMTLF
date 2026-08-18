@@ -101,7 +101,7 @@ class FLClientResource:
         )
 
 
-class FLClientService:
+class FLClientEngine:
     def __init__(
         self,
         settings: FederatedLearningSettings,
