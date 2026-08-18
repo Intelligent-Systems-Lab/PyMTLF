@@ -15,6 +15,7 @@ from py_mtlf.api import (
     adrf,
     artifacts,
     health,
+    hierarchical_fl,
     ml_model_monitor,
     ml_model_provision,
     ml_model_training,
@@ -27,7 +28,11 @@ from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.fl_client import FLClientEngine
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
+from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
+from py_mtlf.core.fl_hierarchy_discovery import HierarchyNodeResolver
+from py_mtlf.core.fl_root import FLRootCoordinator
 from py_mtlf.core.fl_server import FLClientResolver, FLServerEngine
+from py_mtlf.core.fl_topology import StaticTopologyPlanner
 from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.model_records import (
     CompletedRevision,
@@ -222,6 +227,29 @@ def create_app(
     )
     if fl_server is not None:
         fl_server_holder["server"] = fl_server
+    topology_settings = settings.federated_learning.topology
+    strategy_settings = settings.federated_learning.strategy
+    fl_root = None
+    if topology_settings is not None:
+        if fl_server is None or strategy_settings is None:
+            raise RuntimeError("validated hierarchy configuration is incomplete")
+        topology_planner = StaticTopologyPlanner.load(topology_settings.config_file)
+        hierarchy_resolver = HierarchyNodeResolver(
+            settings.federated_learning,
+            nwdaf_context,
+        )
+        fl_root = FLRootCoordinator(
+            strategy=strategy_settings,
+            planner=topology_planner,
+            resolver=hierarchy_resolver,
+            nwdaf_context=nwdaf_context,
+            catalog=seed_catalog,
+            artifact_service=HierarchyArtifactService(fl_workspace),
+            workspace=fl_workspace,
+            server=fl_server,
+            policy=accuracy_policy,
+            experiments=fl_experiments,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -245,6 +273,9 @@ def create_app(
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
+            runtime.accepting_requests = False
+            if fl_root is not None:
+                fl_root.close()
             fl_experiments.shutdown()
             if training_coordinator is not None:
                 training_coordinator.shutdown()
@@ -261,7 +292,6 @@ def create_app(
                 provision_notifications.shutdown()
             nwdaf_monitor_resolver.close()
             nwdaf_context.close()
-            runtime.accepting_requests = False
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
 
@@ -286,6 +316,7 @@ def create_app(
     app.state.fl_workspace = fl_workspace
     app.state.fl_client = fl_client
     app.state.fl_server = fl_server
+    app.state.fl_root = fl_root
     app.state.fl_experiments = fl_experiments
     app.state.publication = publication
     app.state.state_lock = state_lock
@@ -298,6 +329,11 @@ def create_app(
         app.include_router(ml_model_monitor.router)
     if fl_client is not None or fl_server is not None:
         app.include_router(ml_model_training.router)
+    if (
+        fl_root is not None
+        and settings.federated_learning.training_trigger.private_api.enabled
+    ):
+        app.include_router(hierarchical_fl.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -307,6 +343,7 @@ def create_app(
             (
                 "/internal/v1/ml-model-",
                 "/internal/v1/adrf-data-management/",
+                "/internal/v1/hierarchical-fl/",
             )
         ):
             from py_mtlf.api.problems import problem_response

@@ -18,6 +18,7 @@ from py_mtlf.core.fl_server import (
     FLProcess,
     FLServerEngine,
     FLServerState,
+    HierarchyPreparationTarget,
     _assign,
 )
 from py_mtlf.core.fl_workspace import preprocessing_contract_digest
@@ -248,6 +249,168 @@ def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
         policy.complete_retrain.assert_called_once_with(intent.family_key)
     finally:
         orchestrator.close()
+
+
+def test_hierarchy_preparation_attaches_root_process_and_uses_branch_bundle_urls(tmp_path):
+    plan_id = "00000000-0000-4000-8000-000000000900"
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_root(plan_id)
+    posts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            target_id = request.headers["X-NWDAF-Target-Nf-Instance-Id"]
+            return httpx.Response(
+                201,
+                headers={"Location": f"http://go.example/subscriptions/{target_id}"},
+                request=request,
+            )
+        return httpx.Response(204, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    context = context_client(
+        nf_instance_id="00000000-0000-4000-8000-000000000001",
+        internal_api_root="http://go.example",
+    )
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        context,
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    targets = tuple(
+        HierarchyPreparationTarget(
+            branch_nf_instance_id=branch_id,
+            candidate=FLClientCandidate(
+                target=SelectedTarget(
+                    nfInstanceId=branch_id,
+                    nfServiceInstanceId=f"training-{index}",
+                    serviceName="nnwdaf-mlmodeltraining",
+                    apiRoot=f"http://branch-{index}.example",
+                    selectionSource="NRF",
+                ),
+                tracking_areas=(),
+            ),
+            assignment_url=f"http://root.example/artifacts/assignment-{index}",
+        )
+        for index, branch_id in enumerate(
+            (
+                "00000000-0000-4000-8000-000000000010",
+                "00000000-0000-4000-8000-000000000020",
+            ),
+            start=1,
+        )
+    )
+
+    process = orchestrator.start_hierarchy_preparation(
+        plan_id=plan_id,
+        reservation_id=reservation.reservation_id,
+        family_key="ue-communication-default",
+        model_id=1,
+        ml_event="UE_COMMUNICATION",
+        ml_event_filter={"networkArea": {"tais": []}},
+        target_ue=None,
+        model_interoperability="001122",
+        targets=targets,
+    )
+
+    assert process.state is FLServerState.PREPARATION_WAITING
+    assert process.process_id != plan_id
+    assert process.hierarchy_plan_id == plan_id
+    assert registry.active().server_process_id == process.process_id
+    assert len(posts) == 2
+    for request, target in zip(posts, targets, strict=True):
+        payload = json.loads(request.content)
+        assert payload["mLPreFlag"] is True
+        assert payload["mlCorreId"] == process.process_id
+        assert payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] == target.assignment_url
+        assert request.headers["X-NWDAF-Target-Nf-Instance-Id"] == target.branch_nf_instance_id
+
+    orchestrator.cancel_hierarchy_preparation(process.process_id, "test cleanup")
+    orchestrator.close()
+    client.close()
+
+
+def test_hierarchy_preparation_rolls_back_partial_dispatch(tmp_path):
+    plan_id = "00000000-0000-4000-8000-000000000900"
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_root(plan_id)
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url)))
+        if request.method == "POST" and len([item for item in calls if item[0] == "POST"]) == 1:
+            return httpx.Response(
+                201,
+                headers={"Location": "http://go.example/subscriptions/first"},
+                request=request,
+            )
+        if request.method == "POST":
+            return httpx.Response(503, request=request)
+        return httpx.Response(204, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        context_client(internal_api_root="http://go.example"),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    targets = tuple(
+        HierarchyPreparationTarget(
+            branch_nf_instance_id=branch_id,
+            candidate=FLClientCandidate(
+                target=SelectedTarget(
+                    nfInstanceId=branch_id,
+                    nfServiceInstanceId=f"training-{index}",
+                    serviceName="nnwdaf-mlmodeltraining",
+                    apiRoot=f"http://branch-{index}.example",
+                    selectionSource="NRF",
+                ),
+                tracking_areas=(),
+            ),
+            assignment_url=f"http://root.example/artifacts/assignment-{index}",
+        )
+        for index, branch_id in enumerate(
+            (
+                "00000000-0000-4000-8000-000000000010",
+                "00000000-0000-4000-8000-000000000020",
+            ),
+            start=1,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="preparation create failed"):
+        orchestrator.start_hierarchy_preparation(
+            plan_id=plan_id,
+            reservation_id=reservation.reservation_id,
+            family_key="ue-communication-default",
+            model_id=1,
+            ml_event="UE_COMMUNICATION",
+            ml_event_filter={},
+            target_ue=None,
+            model_interoperability="001122",
+            targets=targets,
+        )
+
+    process = orchestrator.processes()[-1]
+    assert process.state is FLServerState.FAILED
+    assert process.hierarchy_cleanup_complete is True
+    assert calls[-1] == ("DELETE", "http://go.example/subscriptions/first")
+    assert registry.active().server_process_id == process.process_id
+    orchestrator.close()
+    client.close()
 
 
 def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_path):

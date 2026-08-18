@@ -37,7 +37,7 @@ from py_mtlf.core.model_records import ParticipantSampleCount
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
 from py_mtlf.core.nwdaf_context import NwdafContextClient
 from py_mtlf.core.publication import PublicationCoordinator, ValidatedCandidate
-from py_mtlf.core.seed_catalog import ModelCatalog
+from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription, MLModelAddress
@@ -85,6 +85,13 @@ class FLClientCandidate:
     tracking_areas: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HierarchyPreparationTarget:
+    branch_nf_instance_id: str
+    candidate: FLClientCandidate
+    assignment_url: str
+
+
 @dataclass
 class FLParticipant:
     scope: ScopeReference
@@ -116,7 +123,7 @@ class FLParticipant:
 @dataclass
 class FLProcess:
     process_id: str
-    intent: RetrainIntent
+    intent: RetrainIntent | None
     state: FLServerState = FLServerState.CREATED
     participants: list[FLParticipant] = field(default_factory=list)
     current_global_url: str = ""
@@ -130,6 +137,10 @@ class FLProcess:
     candidate_artifact: ArtifactMetadata | None = None
     published_model_id: int | None = None
     experiment_reservation_id: str = ""
+    hierarchy_plan_id: str = ""
+    hierarchy_family_key: FamilyKey = ""
+    hierarchy_active_scopes: tuple[ScopeReference, ...] = ()
+    hierarchy_cleanup_complete: bool = False
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -291,6 +302,9 @@ class FLServerEngine:
             with process.condition:
                 process.condition.notify_all()
         self._executor.shutdown(wait=True, cancel_futures=False)
+        for process in processes:
+            if process.hierarchy_plan_id and not process.hierarchy_cleanup_complete:
+                self.cancel_hierarchy_preparation(process.process_id, "FL Server is closing")
         self._resolver.close()
         if self._owns_client:
             self._client.close()
@@ -340,6 +354,97 @@ class FLServerEngine:
             with self._lock:
                 self._futures.add(future)
             future.add_done_callback(self._future_done)
+
+    def start_hierarchy_preparation(
+        self,
+        *,
+        plan_id: str,
+        reservation_id: str,
+        family_key: FamilyKey,
+        model_id: int,
+        ml_event: str,
+        ml_event_filter: dict,
+        target_ue: dict | None,
+        model_interoperability: str,
+        targets: tuple[HierarchyPreparationTarget, ...],
+        active_scopes: tuple[ScopeReference, ...] = (),
+    ) -> FLProcess:
+        if self._closing.is_set():
+            raise RuntimeError("FL Server is closing")
+        if not targets:
+            raise ValueError("hierarchy preparation requires at least one Branch target")
+        branch_ids = tuple(item.branch_nf_instance_id for item in targets)
+        if branch_ids != tuple(sorted(branch_ids)) or len(branch_ids) != len(set(branch_ids)):
+            raise ValueError("hierarchy Branch targets must be unique and canonically ordered")
+        for target in targets:
+            if target.candidate.target.nf_instance_id != target.branch_nf_instance_id:
+                raise ValueError("hierarchy Branch target identity does not match its candidate")
+            if not target.assignment_url.strip():
+                raise ValueError("hierarchy Branch assignment URL must not be blank")
+
+        process = FLProcess(
+            process_id=str(uuid4()),
+            intent=None,
+            experiment_reservation_id=reservation_id,
+            hierarchy_plan_id=plan_id,
+            hierarchy_family_key=family_key,
+            hierarchy_active_scopes=active_scopes,
+        )
+        self._experiments.attach_server(reservation_id, plan_id, process.process_id)
+        process.participants = [
+            FLParticipant(
+                scope=ScopeReference(
+                    scope_key=f"hierarchy:{plan_id}:{target.branch_nf_instance_id}",
+                    consumer_id=target.branch_nf_instance_id,
+                    model_ids=(model_id,),
+                    ml_event=ml_event,
+                    ml_event_filter=dict(ml_event_filter),
+                    target_ue=dict(target_ue) if target_ue is not None else None,
+                ),
+                candidate=target.candidate,
+                notification_correlation_id=str(uuid4()),
+            )
+            for target in targets
+        ]
+        with self._lock:
+            self._processes[process.process_id] = process
+            for participant in process.participants:
+                self._correlations[participant.notification_correlation_id] = process.process_id
+
+        try:
+            process.state = FLServerState.PREPARATION_CREATING
+            for participant, target in zip(process.participants, targets, strict=True):
+                self._create_preparation(
+                    process,
+                    participant,
+                    model_interoperability,
+                    target.assignment_url,
+                )
+            process.state = FLServerState.PREPARATION_WAITING
+            logger.info(
+                "Hierarchy preparation dispatched plan_id=%s process_id=%s branches=%s",
+                plan_id,
+                process.process_id,
+                branch_ids,
+            )
+            return process
+        except Exception as error:
+            process.state = FLServerState.FAILED
+            process.failure = str(error)
+            self._cleanup_hierarchy_process(process)
+            raise
+
+    def cancel_hierarchy_preparation(self, process_id: str, reason: str) -> None:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        if process.hierarchy_cleanup_complete:
+            return
+        process.state = FLServerState.FAILED
+        if not process.failure:
+            process.failure = reason
+        self._cleanup_hierarchy_process(process)
 
     def receive_notification(self, notification: NwdafMLModelTrainNotif) -> None:
         with self._lock:
@@ -465,7 +570,9 @@ class FLServerEngine:
                 (
                     item
                     for item in self._processes.values()
-                    if item.intent.family_key == family_key and item.published_model_id == model_id
+                    if item.intent is not None
+                    and item.intent.family_key == family_key
+                    and item.published_model_id == model_id
                 ),
                 None,
             )
@@ -481,6 +588,8 @@ class FLServerEngine:
         return True
 
     def _run(self, process: FLProcess) -> None:
+        if process.intent is None:
+            raise RuntimeError("flat FL process requires a retraining intent")
         try:
             logger.info(
                 "Federated process started process_id=%s scopes=%s",
@@ -897,6 +1006,20 @@ class FLServerEngine:
             f"participant {participant.candidate.target.nf_instance_id} cleanup failed: "
             f"{last_error}"
         )
+
+    def _cleanup_hierarchy_process(self, process: FLProcess) -> None:
+        if process.hierarchy_cleanup_complete:
+            return
+        for participant in process.participants:
+            if not participant.resource_location:
+                continue
+            failure = self._cleanup_participant(process, participant)
+            if failure:
+                process.cleanup_failure = f"{process.cleanup_failure}; {failure}".strip("; ")
+        with self._lock:
+            for participant in process.participants:
+                self._correlations.pop(participant.notification_correlation_id, None)
+        process.hierarchy_cleanup_complete = True
 
     def _grant_extension(self, participant: FLParticipant, extension: int) -> None:
         patch = NwdafMLModelTrainSubscPatch(mLTrainRepInfo=MLTrainReportInfo(maxResTime=extension))

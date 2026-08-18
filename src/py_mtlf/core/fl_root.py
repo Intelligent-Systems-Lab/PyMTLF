@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from enum import StrEnum
+from uuid import UUID, uuid4
+
+from py_mtlf.config import FederatedStrategySettings
+from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
+from py_mtlf.core.fl_experiment import (
+    ExperimentConflictError,
+    ExperimentLifecycle,
+    FLExperimentRegistry,
+)
+from py_mtlf.core.fl_hierarchy import FederatedStrategy, FedProxAlgorithm
+from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
+from py_mtlf.core.fl_hierarchy_discovery import (
+    HierarchyDiscoveryError,
+    HierarchyNodeResolver,
+    HierarchyNodeRole,
+)
+from py_mtlf.core.fl_server import (
+    FLClientCandidate,
+    FLServerEngine,
+    HierarchyPreparationTarget,
+)
+from py_mtlf.core.fl_topology import TopologyPlanner
+from py_mtlf.core.fl_workspace import FLWorkspace
+from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
+from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
+from py_mtlf.core.trainer import TrustedBundleLoader
+
+logger = logging.getLogger(__name__)
+
+
+class RootRequestState(StrEnum):
+    ACCEPTED = "ACCEPTED"
+    VALIDATING = "VALIDATING"
+    DISPATCHING = "DISPATCHING"
+    PREPARATION_WAITING = "PREPARATION_WAITING"
+    FAILED = "FAILED"
+
+
+class RootFailureCause(StrEnum):
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    DISCOVERY_FAILED = "DISCOVERY_FAILED"
+    ASSIGNMENT_PUBLICATION_FAILED = "ASSIGNMENT_PUBLICATION_FAILED"
+    PREPARATION_DISPATCH_FAILED = "PREPARATION_DISPATCH_FAILED"
+    SHUTDOWN = "SHUTDOWN"
+
+
+class RootCoordinatorError(RuntimeError):
+    pass
+
+
+class RootRequestConflictError(RootCoordinatorError):
+    pass
+
+
+class RootModelFamilyNotFoundError(RootCoordinatorError):
+    pass
+
+
+class RootCoordinatorUnavailableError(RootCoordinatorError):
+    pass
+
+
+@dataclass(frozen=True)
+class RootRequestSnapshot:
+    request_id: str
+    plan_id: str
+    model_family_id: FamilyKey
+    state: RootRequestState
+    failure_cause: str = ""
+    failure_detail: str = ""
+
+
+@dataclass(frozen=True)
+class RootInitiation:
+    request_id: str
+    plan_id: str
+    model_family_id: FamilyKey
+    source: str
+    active_scopes: tuple[ScopeReference, ...] = ()
+
+
+@dataclass
+class _RootRequestRecord:
+    initiation: RootInitiation
+    reservation_id: str
+    state: RootRequestState = RootRequestState.ACCEPTED
+    failure_cause: str = ""
+    failure_detail: str = ""
+    server_process_id: str = ""
+    future: Future | None = field(default=None, repr=False)
+
+
+class FLRootCoordinator:
+    def __init__(
+        self,
+        *,
+        strategy: FederatedStrategySettings,
+        planner: TopologyPlanner,
+        resolver: HierarchyNodeResolver,
+        nwdaf_context: NwdafContextClient,
+        catalog: ModelCatalog,
+        artifact_service: HierarchyArtifactService,
+        workspace: FLWorkspace,
+        server: FLServerEngine,
+        policy: AccuracyPolicy,
+        experiments: FLExperimentRegistry,
+        loader: TrustedBundleLoader | None = None,
+    ) -> None:
+        self._strategy = FederatedStrategy(
+            algorithm=FedProxAlgorithm(
+                name=strategy.algorithm.name,
+                proximal_mu=strategy.algorithm.proximal_mu,
+            ),
+            participant_selection=strategy.participant_selection,
+            waiting_policy=strategy.waiting_policy,
+            aggregation=strategy.aggregation,
+        )
+        self._planner = planner
+        self._resolver = resolver
+        self._nwdaf_context = nwdaf_context
+        self._catalog = catalog
+        self._artifact_service = artifact_service
+        self._workspace = workspace
+        self._server = server
+        self._policy = policy
+        self._experiments = experiments
+        self._loader = loader or TrustedBundleLoader()
+        self._condition = threading.Condition(threading.RLock())
+        self._records: dict[str, _RootRequestRecord] = {}
+        self._active_request_id: str | None = None
+        self._failure_latched = False
+        self._closing = False
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fl-root")
+
+    def submit_manual(
+        self,
+        *,
+        request_id: str,
+        model_family_id: FamilyKey,
+    ) -> RootRequestSnapshot:
+        return self._submit(
+            request_id=_uuid4_identity(request_id, "request_id"),
+            model_family_id=_required_identity(model_family_id, "model_family_id"),
+            source="PRIVATE_API",
+            active_scopes=(),
+            manual=True,
+        )
+
+    def accept_policy_intents(self) -> None:
+        with self._condition:
+            if self._closing:
+                logger.info("Ignored degradation intent dispatch while Root coordinator is closing")
+                return
+            if self._active_request_id is not None:
+                logger.info(
+                    "Deferred degradation intent dispatch while Root request %s is active",
+                    self._active_request_id,
+                )
+                return
+            if self._failure_latched:
+                logger.warning("Ignored degradation intent dispatch due to terminal failure latch")
+                return
+        intents = self._policy.take_intents()
+        for index, intent in enumerate(intents):
+            if index > 0:
+                self._policy.complete_retrain(intent.family_key)
+                logger.warning(
+                    "Skipped concurrent degradation intent family=%s due to single-active policy",
+                    intent.family_key,
+                )
+                continue
+            try:
+                self._submit_policy_intent(intent)
+            except RootCoordinatorError as error:
+                logger.error("Failed to accept degradation intent: %s", error)
+
+    def get(self, request_id: str) -> RootRequestSnapshot | None:
+        try:
+            normalized = _uuid4_identity(request_id, "request_id")
+        except ValueError:
+            return None
+        with self._condition:
+            record = self._records.get(normalized)
+            return self._snapshot(record) if record is not None else None
+
+    def requests(self) -> tuple[RootRequestSnapshot, ...]:
+        with self._condition:
+            return tuple(self._snapshot(self._records[key]) for key in sorted(self._records))
+
+    def wait_for_state(
+        self,
+        request_id: str,
+        states: set[RootRequestState],
+        *,
+        timeout: float,
+    ) -> RootRequestSnapshot:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                record = self._records.get(request_id)
+                if record is None:
+                    raise KeyError(request_id)
+                if record.state in states:
+                    return self._snapshot(record)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Root request {request_id} did not reach {states}")
+                self._condition.wait(remaining)
+
+    def close(self) -> None:
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        with self._condition:
+            active = (
+                self._records.get(self._active_request_id)
+                if self._active_request_id is not None
+                else None
+            )
+        if active is not None:
+            self._cleanup_attempt(active, cancel_server=True, reason="Root coordinator is closing")
+            with self._condition:
+                active.state = RootRequestState.FAILED
+                active.failure_cause = RootFailureCause.SHUTDOWN.value
+                active.failure_detail = "Root coordinator is closing"
+                self._active_request_id = None
+                self._condition.notify_all()
+        self._resolver.close()
+
+    def _submit_policy_intent(self, intent: RetrainIntent) -> RootRequestSnapshot:
+        return self._submit(
+            request_id=str(uuid4()),
+            model_family_id=intent.family_key,
+            source="DEGRADATION",
+            active_scopes=intent.active_scopes,
+            manual=False,
+        )
+
+    def _submit(
+        self,
+        *,
+        request_id: str,
+        model_family_id: FamilyKey,
+        source: str,
+        active_scopes: tuple[ScopeReference, ...],
+        manual: bool,
+    ) -> RootRequestSnapshot:
+        with self._condition:
+            existing = self._records.get(request_id)
+            if existing is not None:
+                if existing.initiation.model_family_id != model_family_id:
+                    raise RootRequestConflictError(
+                        "request_id is already bound to a different model family"
+                    )
+                return self._snapshot(existing)
+            if self._closing:
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            if not manual and self._failure_latched:
+                raise RootRequestConflictError("automatic training is latched after failure")
+            if self._active_request_id is not None:
+                raise RootRequestConflictError("another top-level training request is active")
+            if self._catalog.current(model_family_id) is None:
+                raise RootModelFamilyNotFoundError(
+                    f"model family {model_family_id} was not found"
+                )
+
+            plan_id = str(uuid4())
+            try:
+                reservation = self._experiments.reserve_root(plan_id)
+            except ExperimentConflictError as error:
+                raise RootRequestConflictError(str(error)) from error
+            initiation = RootInitiation(
+                request_id=request_id,
+                plan_id=plan_id,
+                model_family_id=model_family_id,
+                source=source,
+                active_scopes=active_scopes,
+            )
+            record = _RootRequestRecord(
+                initiation=initiation,
+                reservation_id=reservation.reservation_id,
+            )
+            self._records[request_id] = record
+            self._active_request_id = request_id
+            if manual:
+                self._failure_latched = False
+            try:
+                record.future = self._executor.submit(self._run, record)
+            except Exception as error:
+                self._active_request_id = None
+                self._cleanup_attempt(record, cancel_server=False, reason=str(error))
+                record.state = RootRequestState.FAILED
+                record.failure_cause = RootFailureCause.VALIDATION_FAILED.value
+                record.failure_detail = _public_failure_detail(
+                    RootFailureCause.VALIDATION_FAILED
+                )
+                self._failure_latched = True
+                raise RootCoordinatorUnavailableError(
+                    "Root request executor is unavailable"
+                ) from error
+            logger.info(
+                "Accepted hierarchy Root request request_id=%s plan_id=%s source=%s family=%s",
+                request_id,
+                plan_id,
+                source,
+                model_family_id,
+            )
+            return self._snapshot(record)
+
+    def _run(self, record: _RootRequestRecord) -> None:
+        cause = RootFailureCause.VALIDATION_FAILED
+        try:
+            self._set_state(record, RootRequestState.VALIDATING)
+            current = self._catalog.current(record.initiation.model_family_id)
+            if current is None:
+                raise RuntimeError("FL base model is no longer current")
+            descriptor = current.descriptor
+            if descriptor.event != "UE_COMMUNICATION":
+                raise RuntimeError("hierarchical FL V1 only supports UE_COMMUNICATION")
+            if not descriptor.model_interoperability:
+                raise RuntimeError("FL base model has no model interoperability identifier")
+            context = self._nwdaf_context.get(refresh=True)
+            if not any(
+                descriptor.event in capability.ml_analytics_ids
+                and capability.fl_capability_type
+                in {FLCapabilityType.SERVER, FLCapabilityType.SERVER_AND_CLIENT}
+                for capability in context.ml_analytics_capabilities
+            ):
+                raise RuntimeError(
+                    "containing NWDAF does not advertise the required FL Server capability"
+                )
+            topology = self._planner.build(root_nf_instance_id=context.nf_instance_id)
+            base = self._loader.load(current.artifact)
+
+            cause = RootFailureCause.DISCOVERY_FAILED
+            resolved_branches = []
+            for branch in topology.branches:
+                branch_node = self._resolver.resolve(
+                    nf_instance_id=branch.nf_instance_id,
+                    role=HierarchyNodeRole.BRANCH,
+                    ml_event=descriptor.event,
+                    model_interoperability=descriptor.model_interoperability,
+                )
+                for leaf_id in branch.leaf_nf_instance_ids:
+                    self._resolver.resolve(
+                        nf_instance_id=leaf_id,
+                        role=HierarchyNodeRole.LEAF,
+                        ml_event=descriptor.event,
+                        model_interoperability=descriptor.model_interoperability,
+                    )
+                resolved_branches.append((branch, branch_node))
+
+            latest = self._catalog.current(record.initiation.model_family_id)
+            if latest is None or latest.artifact.key != current.artifact.key:
+                cause = RootFailureCause.VALIDATION_FAILED
+                raise RuntimeError("FL base model changed during hierarchy validation")
+
+            self._set_state(record, RootRequestState.DISPATCHING)
+            cause = RootFailureCause.ASSIGNMENT_PUBLICATION_FAILED
+            targets = []
+            for branch, resolved in resolved_branches:
+                artifact = self._artifact_service.publish_branch_assignment(
+                    base=base,
+                    plan_id=record.initiation.plan_id,
+                    publisher_nf_instance_id=context.nf_instance_id,
+                    branch_nf_instance_id=branch.nf_instance_id,
+                    assigned_leaf_nf_instance_ids=branch.leaf_nf_instance_ids,
+                    strategy=self._strategy,
+                )
+                targets.append(
+                    HierarchyPreparationTarget(
+                        branch_nf_instance_id=branch.nf_instance_id,
+                        candidate=FLClientCandidate(
+                            target=resolved.target,
+                            tracking_areas=(),
+                        ),
+                        assignment_url=artifact.url,
+                    )
+                )
+
+            latest = self._catalog.current(record.initiation.model_family_id)
+            if latest is None or latest.artifact.key != current.artifact.key:
+                cause = RootFailureCause.VALIDATION_FAILED
+                raise RuntimeError("FL base model changed during assignment publication")
+
+            cause = RootFailureCause.PREPARATION_DISPATCH_FAILED
+            process = self._server.start_hierarchy_preparation(
+                plan_id=record.initiation.plan_id,
+                reservation_id=record.reservation_id,
+                family_key=record.initiation.model_family_id,
+                model_id=current.model_id,
+                ml_event=descriptor.event,
+                ml_event_filter=descriptor.event_filter,
+                target_ue=descriptor.target_ue,
+                model_interoperability=descriptor.model_interoperability,
+                targets=tuple(targets),
+                active_scopes=record.initiation.active_scopes,
+            )
+            with self._condition:
+                if self._active_request_id != record.initiation.request_id:
+                    raise RuntimeError("Root request became stale during dispatch")
+                record.server_process_id = process.process_id
+                record.state = RootRequestState.PREPARATION_WAITING
+                self._condition.notify_all()
+        except Exception as error:
+            if isinstance(error, HierarchyDiscoveryError):
+                cause = RootFailureCause.DISCOVERY_FAILED
+            elif isinstance(error, RootCoordinatorUnavailableError):
+                cause = RootFailureCause.SHUTDOWN
+            logger.exception(
+                "Hierarchy Root request failed request_id=%s plan_id=%s",
+                record.initiation.request_id,
+                record.initiation.plan_id,
+            )
+            self._cleanup_attempt(record, cancel_server=True, reason=str(error))
+            with self._condition:
+                record.state = RootRequestState.FAILED
+                record.failure_cause = cause.value
+                record.failure_detail = _public_failure_detail(cause)
+                if self._active_request_id == record.initiation.request_id:
+                    self._active_request_id = None
+                self._failure_latched = True
+                self._condition.notify_all()
+
+    def _set_state(self, record: _RootRequestRecord, state: RootRequestState) -> None:
+        with self._condition:
+            if self._closing:
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            if self._active_request_id != record.initiation.request_id:
+                raise RootRequestConflictError("Root request is stale")
+            record.state = state
+            self._condition.notify_all()
+
+    def _cleanup_attempt(
+        self,
+        record: _RootRequestRecord,
+        *,
+        cancel_server: bool,
+        reason: str,
+    ) -> None:
+        active = self._experiments.active()
+        process_id = record.server_process_id
+        if not process_id and active is not None and active.reservation_id == record.reservation_id:
+            process_id = active.server_process_id or ""
+        if cancel_server and process_id:
+            try:
+                self._server.cancel_hierarchy_preparation(process_id, reason)
+            except (KeyError, RuntimeError):
+                logger.exception("Failed to clean hierarchy Server process %s", process_id)
+        try:
+            self._workspace.release_plan(record.initiation.plan_id)
+        except RuntimeError:
+            logger.exception(
+                "Failed to release hierarchy workspace plan_id=%s",
+                record.initiation.plan_id,
+            )
+        active = self._experiments.active()
+        if active is None or active.reservation_id != record.reservation_id:
+            return
+        try:
+            if active.lifecycle in {ExperimentLifecycle.PROVISIONAL, ExperimentLifecycle.ACTIVE}:
+                self._experiments.mark_terminal(record.reservation_id, "FAILED")
+                active = self._experiments.active()
+            if active is not None and active.lifecycle is ExperimentLifecycle.TERMINAL:
+                self._experiments.begin_cleanup(record.reservation_id)
+                active = self._experiments.active()
+            if active is not None and active.lifecycle is ExperimentLifecycle.CLEANING:
+                self._experiments.release(record.reservation_id)
+        except RuntimeError:
+            logger.exception(
+                "Failed to release hierarchy registry reservation request_id=%s",
+                record.initiation.request_id,
+            )
+
+    @staticmethod
+    def _snapshot(record: _RootRequestRecord) -> RootRequestSnapshot:
+        return RootRequestSnapshot(
+            request_id=record.initiation.request_id,
+            plan_id=record.initiation.plan_id,
+            model_family_id=record.initiation.model_family_id,
+            state=record.state,
+            failure_cause=record.failure_cause,
+            failure_detail=record.failure_detail,
+        )
+
+
+def _required_identity(value: str, name: str) -> str:
+    normalized = value.strip()
+    if not normalized or normalized != value:
+        raise ValueError(f"{name} must be a non-empty canonical value")
+    return value
+
+
+def _uuid4_identity(value: str, name: str) -> str:
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a canonical UUIDv4") from error
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError(f"{name} must be a canonical UUIDv4")
+    return value
+
+
+def _public_failure_detail(cause: RootFailureCause) -> str:
+    return {
+        RootFailureCause.VALIDATION_FAILED: "Root hierarchy validation failed",
+        RootFailureCause.DISCOVERY_FAILED: "configured hierarchy node discovery failed",
+        RootFailureCause.ASSIGNMENT_PUBLICATION_FAILED: "hierarchy assignment publication failed",
+        RootFailureCause.PREPARATION_DISPATCH_FAILED: "upper-tier preparation dispatch failed",
+        RootFailureCause.SHUTDOWN: "Root coordinator is shutting down",
+    }[cause]

@@ -7,6 +7,7 @@ from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
     FederatedLearningSettings,
+    FederatedStrategySettings,
     FittingSettings,
     FLClientSettings,
     FLServerSettings,
@@ -17,6 +18,7 @@ from py_mtlf.config import (
     StorageSettings,
     load_settings,
 )
+from py_mtlf.core.fl_topology import StaticTopologyPlanner
 
 
 def test_defaults_use_confirmed_phase_one_values():
@@ -210,6 +212,7 @@ def test_federated_server_requires_single_active_process():
         ("fl-server.yaml", "federated"),
         ("fl-client.yaml", "federated"),
         ("fl-server-client.yaml", "federated"),
+        ("fl-server-hierarchy.yaml", "federated"),
     ],
 )
 def test_tracked_engine_profiles_are_valid(profile, mode):
@@ -218,8 +221,131 @@ def test_tracked_engine_profiles_are_valid(profile, mode):
     assert load_settings(path).runtime.mode == mode
 
 
+def test_tracked_hierarchy_profile_references_a_valid_topology():
+    path = Path(__file__).parents[1] / "config" / "fl-server-hierarchy.yaml"
+    loaded = load_settings(path)
+
+    assert loaded.federated_learning.topology is not None
+    planner = StaticTopologyPlanner.load(loaded.federated_learning.topology.config_file)
+    assignment = planner.build(
+        root_nf_instance_id="00000000-0000-4000-8000-000000000001"
+    )
+    assert len(assignment.branches) == 1
+
+
 def test_removed_flat_training_and_fl_role_keys_are_rejected():
     with pytest.raises(ValidationError):
         Settings.model_validate({"training": {"epochs": 1}})
     with pytest.raises(ValidationError):
         FederatedLearningSettings.model_validate({"round_count": 2})
+
+
+def test_load_settings_resolves_topology_from_main_config_directory(tmp_path, monkeypatch):
+    config_directory = tmp_path / "deployment"
+    topology_directory = config_directory / "topology"
+    topology_directory.mkdir(parents=True)
+    topology_path = topology_directory / "hierarchy.yaml"
+    topology_path.write_text(
+        "version: 1\nadmission:\n  mode: complete_required\n",
+        encoding="utf-8",
+    )
+    config_path = config_directory / "mtlf.yaml"
+    config_path.write_text(
+        """
+runtime:
+  mode: federated
+federated_learning:
+  server: {}
+  strategy:
+    algorithm:
+      name: fedprox
+      proximal_mu: 0.01
+    participant_selection: all
+    waiting_policy: all
+    aggregation: sample_weighted
+  topology:
+    strategy: static
+    config_file: ./topology/hierarchy.yaml
+""".strip(),
+        encoding="utf-8",
+    )
+    unrelated_directory = tmp_path / "unrelated"
+    unrelated_directory.mkdir()
+    monkeypatch.chdir(unrelated_directory)
+
+    loaded = load_settings(config_path)
+
+    assert loaded.federated_learning.topology is not None
+    assert loaded.federated_learning.topology.config_file == topology_path.resolve()
+
+
+def test_hierarchy_configuration_requires_server_strategy_and_topology_together(tmp_path):
+    topology = {"strategy": "static", "config_file": tmp_path / "topology.yaml"}
+    strategy = FederatedStrategySettings.model_validate(
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        }
+    )
+
+    with pytest.raises(ValidationError, match="requires federated_learning.server"):
+        FederatedLearningSettings(topology=topology, strategy=strategy)
+    with pytest.raises(ValidationError, match="requires federated_learning.strategy"):
+        FederatedLearningSettings(server=FLServerSettings(), topology=topology)
+    with pytest.raises(ValidationError, match="requires federated_learning.topology"):
+        FederatedLearningSettings(server=FLServerSettings(), strategy=strategy)
+    with pytest.raises(ValidationError, match="private API requires"):
+        FederatedLearningSettings.model_validate(
+            {
+                "server": {},
+                "training_trigger": {"private_api": {"enabled": True}},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        {
+            "algorithm": {"name": "fedavg", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": float("inf")},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "fixed_count",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "minimum_results",
+            "aggregation": "sample_weighted",
+        },
+        {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "uniform",
+        },
+    ],
+)
+def test_first_version_hierarchy_strategy_rejects_unsupported_values(strategy):
+    with pytest.raises(ValidationError):
+        FederatedStrategySettings.model_validate(strategy)

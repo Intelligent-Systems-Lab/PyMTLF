@@ -126,5 +126,7 @@ def _dispatch_retrain_intents(state, decisions) -> None:
         return
     if state.runtime.mode == "local":
         state.dataset_coordinator.accept_policy_intents()
+    elif getattr(state, "fl_root", None) is not None:
+        state.fl_root.accept_policy_intents()
     elif state.fl_server is not None:
         state.fl_server.accept_policy_intents()

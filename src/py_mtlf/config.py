@@ -1,6 +1,7 @@
 import re
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -252,6 +253,50 @@ class FLServerSettings(FrozenSettings):
         return value
 
 
+class FedProxAlgorithmSettings(FrozenSettings):
+    name: Literal["fedprox"]
+    proximal_mu: float = Field(gt=0)
+
+    @field_validator("proximal_mu")
+    @classmethod
+    def validate_proximal_mu(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("federated_learning.strategy.algorithm.proximal_mu must be finite")
+        return value
+
+
+class FederatedStrategySettings(FrozenSettings):
+    algorithm: FedProxAlgorithmSettings
+    participant_selection: Literal["all"]
+    waiting_policy: Literal["all"]
+    aggregation: Literal["sample_weighted"]
+
+
+class TopologySettings(FrozenSettings):
+    strategy: Literal["static"]
+    config_file: Path
+
+    @field_validator("config_file", mode="before")
+    @classmethod
+    def validate_config_file(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("federated_learning.topology.config_file must not be blank")
+        path = Path(value)  # type: ignore[arg-type]
+        if not path.is_absolute():
+            raise ValueError(
+                "federated_learning.topology.config_file must be resolved from the main config"
+            )
+        return path
+
+
+class PrivateTrainingTriggerSettings(FrozenSettings):
+    enabled: bool = False
+
+
+class TrainingTriggerSettings(FrozenSettings):
+    private_api: PrivateTrainingTriggerSettings = PrivateTrainingTriggerSettings()
+
+
 class FederatedLearningSettings(FrozenSettings):
     workspace_root: Path = Path("data/fl-workspaces")
     workspace_ttl_seconds: int = Field(default=3600, gt=0)
@@ -260,6 +305,9 @@ class FederatedLearningSettings(FrozenSettings):
     artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
     server: FLServerSettings | None = None
     client: FLClientSettings | None = None
+    strategy: FederatedStrategySettings | None = None
+    topology: TopologySettings | None = None
+    training_trigger: TrainingTriggerSettings = TrainingTriggerSettings()
 
     @field_validator("workspace_root", mode="before")
     @classmethod
@@ -272,6 +320,18 @@ class FederatedLearningSettings(FrozenSettings):
     @classmethod
     def validate_public_base_url(cls, value: str) -> str:
         return _validate_http_base_url(value, "federated_learning.public_base_url")
+
+    @model_validator(mode="after")
+    def validate_hierarchy_configuration(self) -> "FederatedLearningSettings":
+        if self.topology is not None and self.server is None:
+            raise ValueError("federated_learning.topology requires federated_learning.server")
+        if self.topology is not None and self.strategy is None:
+            raise ValueError("federated_learning.topology requires federated_learning.strategy")
+        if self.strategy is not None and self.topology is None:
+            raise ValueError("federated_learning.strategy requires federated_learning.topology")
+        if self.training_trigger.private_api.enabled and self.topology is None:
+            raise ValueError("private API requires federated_learning.topology")
+        return self
 
 
 
@@ -497,7 +557,19 @@ class Settings(FrozenSettings):
 
 
 def load_settings(path: str | Path) -> Settings:
-    config_path = Path(path)
+    config_path = Path(path).resolve()
     with config_path.open(encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
+    if isinstance(raw, dict):
+        federated_learning = raw.get("federated_learning")
+        if isinstance(federated_learning, dict):
+            topology = federated_learning.get("topology")
+            if isinstance(topology, dict):
+                topology_path = topology.get("config_file")
+                if isinstance(topology_path, str) and topology_path.strip():
+                    candidate = Path(topology_path)
+                    if not candidate.is_absolute():
+                        topology["config_file"] = str(
+                            (config_path.parent / candidate).resolve()
+                        )
     return Settings.model_validate(raw)

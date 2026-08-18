@@ -1,0 +1,10 @@
+version: 1
+
+admission:
+  mode: complete_required
+
+branches:
+  - nf_instance_id: "00000000-0000-4000-8000-000000000010"
+    leaves:
+      - nf_instance_id: "00000000-0000-4000-8000-000000000101"
+      - nf_instance_id: "00000000-0000-4000-8000-000000000102"
