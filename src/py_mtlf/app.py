@@ -41,7 +41,7 @@ from py_mtlf.core.monitor_store import (
     MonitorSubscriptionProjectionStore,
 )
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
-from py_mtlf.core.nwdaf_context import NwdafContextClient
+from py_mtlf.core.nwdaf_context import CapabilityConsistencyChecker, NwdafContextClient
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.publication import PublicationCoordinator
@@ -68,6 +68,7 @@ def create_app(
     settings: Settings,
     *,
     artifact_repository: ArtifactRepository | None = None,
+    capability_checker: CapabilityConsistencyChecker | None = None,
 ) -> FastAPI:
     artifact_repository = artifact_repository or ArtifactRepository(
         settings.storage.artifact_root, settings.artifact
@@ -93,6 +94,11 @@ def create_app(
     nwdaf_context = NwdafContextClient(
         settings.containing_nwdaf.internal_api_root,
         settings.containing_nwdaf.request_timeout_seconds,
+    )
+    capability_checker = capability_checker or CapabilityConsistencyChecker(
+        nwdaf_context,
+        configured_server=settings.federated_learning.server is not None,
+        configured_client=settings.federated_learning.client is not None,
     )
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
@@ -264,6 +270,7 @@ def create_app(
     app.state.provision_store = provision_store
     app.state.provision_notifications = provision_notifications
     app.state.nwdaf_context = nwdaf_context
+    app.state.capability_checker = capability_checker
     app.state.monitor_registrations = monitor_registrations
     app.state.monitor_subscriptions = monitor_subscriptions
     app.state.monitor_reconciler = monitor_reconciler

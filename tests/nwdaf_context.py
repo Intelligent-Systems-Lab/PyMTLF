@@ -1,4 +1,8 @@
-from py_mtlf.core.nwdaf_context import NwdafContext, NwdafContextClient
+from py_mtlf.core.nwdaf_context import (
+    CapabilityVerification,
+    NwdafContext,
+    NwdafContextClient,
+)
 
 
 def context_client(
@@ -15,4 +19,28 @@ def context_client(
             api_root=api_root,
             internal_api_root=internal_api_root,
         ),
+    )
+
+
+class StaticCapabilityChecker:
+    def __init__(self, verification: CapabilityVerification) -> None:
+        self.verification = verification
+
+    def check(self) -> CapabilityVerification:
+        return self.verification
+
+
+def verified_capability_checker(
+    *,
+    server: bool = False,
+    client: bool = False,
+) -> StaticCapabilityChecker:
+    return StaticCapabilityChecker(
+        CapabilityVerification(
+            status="verified",
+            configured_server=server,
+            configured_client=client,
+            advertised_server=server,
+            advertised_client=client,
+        )
     )

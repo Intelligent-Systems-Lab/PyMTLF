@@ -2,12 +2,16 @@ import hashlib
 from uuid import UUID
 
 from fastapi.testclient import TestClient
+from nwdaf_context import verified_capability_checker
 
 from py_mtlf.app import create_app
+from py_mtlf.core.nwdaf_context import CapabilityVerification
 
 
 def test_health_is_ready_after_startup(settings):
-    with TestClient(create_app(settings)) as client:
+    with TestClient(
+        create_app(settings, capability_checker=verified_capability_checker())
+    ) as client:
         assert client.get("/health/live").status_code == 404
         assert client.post("/internal/v1/sync", json={}).status_code == 404
         response = client.get("/health/ready")
@@ -18,7 +22,7 @@ def test_health_is_ready_after_startup(settings):
 
 
 def test_app_supports_repeated_startup_and_shutdown(settings):
-    app = create_app(settings)
+    app = create_app(settings, capability_checker=verified_capability_checker())
 
     for _ in range(2):
         with TestClient(app) as client:
@@ -26,7 +30,7 @@ def test_app_supports_repeated_startup_and_shutdown(settings):
 
 
 def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
-    app = create_app(settings)
+    app = create_app(settings, capability_checker=verified_capability_checker())
     with TestClient(app) as client:
 
         def fail_probe():
@@ -40,6 +44,57 @@ def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
     assert response.json()["artifacts"] == "unavailable"
     assert "database" not in response.json()
     assert "reconciliation" not in response.json()
+
+
+def test_readiness_recovers_after_capability_unavailable_and_mismatch(settings):
+    checker = SequenceCapabilityChecker(
+        [
+            CapabilityVerification(
+                status="unavailable",
+                configured_server=False,
+                configured_client=False,
+                advertised_server=None,
+                advertised_client=None,
+            ),
+            CapabilityVerification(
+                status="mismatch",
+                configured_server=False,
+                configured_client=False,
+                advertised_server=True,
+                advertised_client=False,
+            ),
+            CapabilityVerification(
+                status="verified",
+                configured_server=False,
+                configured_client=False,
+                advertised_server=False,
+                advertised_client=False,
+            ),
+        ]
+    )
+    app = create_app(settings, capability_checker=checker)
+
+    with TestClient(app) as client:
+        unavailable = client.get("/health/ready")
+        mismatch = client.get("/health/ready")
+        recovered = client.get("/health/ready")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json()["capabilityVerification"] == "unavailable"
+    assert mismatch.status_code == 503
+    assert mismatch.json()["capabilityVerification"] == "mismatch"
+    assert recovered.status_code == 200
+    assert recovered.json()["capabilityVerification"] == "verified"
+    assert recovered.json()["enabledFlEngines"] == {"server": False, "client": False}
+    assert recovered.json()["advertisedFlEngines"] == {"server": False, "client": False}
+
+
+class SequenceCapabilityChecker:
+    def __init__(self, verifications):
+        self.verifications = list(verifications)
+
+    def check(self):
+        return self.verifications.pop(0)
 
 
 def test_artifact_get_has_immutable_integrity_headers(settings, bundle_path):

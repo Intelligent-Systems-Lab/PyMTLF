@@ -17,8 +17,10 @@ through the existing Model Provision resource.
 There is no liveness endpoint and no full-state synchronization endpoint. Each
 process start exposes a new `processInstanceId` through `GET /health/ready`.
 PyMTLF reads its containing NWDAF identity and Go callback origins on demand
-from `GET /internal/v1/nwdaf-context`; a replacement process does not restore
-old provision, monitor, retrieval, training, or FL runtime resources.
+from `GET /internal/v1/nwdaf-context`. Readiness also compares the enabled FL
+engines with the capability projection produced from the containing NWDAF's
+actual NRF profile. A replacement process does not restore old provision,
+monitor, retrieval, training, or FL runtime resources.
 
 Before using the sample configuration, import the initial seed bundle:
 

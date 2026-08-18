@@ -55,10 +55,14 @@ in `Location`.
 
 ## Readiness And Containing NWDAF Context
 
-`GET /health/ready` returns the current `processInstanceId`, `runtimeMode`, and
-artifact status. Both ready `200` and not-ready `503` retain the same UUID for
-the lifetime of the process. A configured seed catalog is validated during
-startup; a missing or invalid artifact prevents readiness.
+`GET /health/ready` returns the current `processInstanceId`, `runtimeMode`,
+artifact status, `enabledFlEngines`, `advertisedFlEngines`, and
+`capabilityVerification`. Both ready `200` and not-ready `503` retain the same
+UUID for the lifetime of the process. A configured seed catalog is validated
+during startup; a missing or invalid artifact prevents readiness. Go context
+unavailability, malformed capability projection, or an exact engine mismatch
+also returns `503`. Each probe refreshes the context, so a late or temporarily
+unavailable Go listener can recover without restarting PyMTLF.
 
 PyMTLF reads immutable containing-NWDAF information from the corresponding Go
 MTLF edge:
@@ -71,14 +75,22 @@ GET /internal/v1/nwdaf-context
 {
   "nfInstanceId": "11111111-1111-4111-8111-111111111111",
   "apiRoot": "http://127.0.0.1:8000",
-  "internalApiRoot": "http://127.0.0.1:8091"
+  "internalApiRoot": "http://127.0.0.1:8091",
+  "mlAnalyticsCapabilities": [
+    {
+      "mlAnalyticsIds": ["UE_COMMUNICATION"],
+      "flCapabilityType": "FL_SERVER_AND_CLIENT"
+    }
+  ]
 }
 ```
 
-This endpoint supplies identity and origins only. It does not carry resource
-snapshots, storage selection, raw data, policy state, or model bytes. A new
-process starts with empty volatile provision, monitor, retrieval, training,
-and FL state; durable completed model artifacts remain available locally.
+This endpoint supplies identity, origins, and the canonical FL capability
+projection from the containing NWDAF's NRF profile. It does not carry topology
+roles, plan identity, resource snapshots, storage selection, raw data, policy
+state, or model bytes. A new process starts with empty volatile provision,
+monitor, retrieval, training, and FL state; durable completed model artifacts
+remain available locally.
 
 ## Initial Model Provision
 

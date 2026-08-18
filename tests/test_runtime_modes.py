@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
+from nwdaf_context import verified_capability_checker
 
 from py_mtlf.api.ml_model_monitor import _dispatch_retrain_intents
 from py_mtlf.app import create_app
@@ -38,7 +39,10 @@ def with_engines(
 
 
 def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
-    app = create_app(with_engines(settings, tmp_path / "local"))
+    app = create_app(
+        with_engines(settings, tmp_path / "local"),
+        capability_checker=verified_capability_checker(),
+    )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "local"
         assert app.state.fl_server is None
@@ -50,7 +54,10 @@ def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
 
 
 def test_fl_server_owns_model_services_without_local_training(settings, tmp_path):
-    app = create_app(with_engines(settings, tmp_path / "server", server=True))
+    app = create_app(
+        with_engines(settings, tmp_path / "server", server=True),
+        capability_checker=verified_capability_checker(server=True),
+    )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is not None
@@ -69,7 +76,10 @@ def test_fl_server_owns_model_services_without_local_training(settings, tmp_path
 
 def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_path):
     workspace = tmp_path / "client"
-    app = create_app(with_engines(settings, workspace, client=True))
+    app = create_app(
+        with_engines(settings, workspace, client=True),
+        capability_checker=verified_capability_checker(client=True),
+    )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is None
@@ -91,7 +101,8 @@ def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_p
 
 def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
     app = create_app(
-        with_engines(settings, tmp_path / "combined", server=True, client=True)
+        with_engines(settings, tmp_path / "combined", server=True, client=True),
+        capability_checker=verified_capability_checker(server=True, client=True),
     )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"

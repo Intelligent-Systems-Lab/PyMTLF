@@ -17,12 +17,22 @@ def readiness(request: Request) -> JSONResponse:
         except Exception as error:
             artifact_status = "unavailable"
             logger.warning("MTLF backend artifact readiness probe failed: %s", type(error).__name__)
-    ready = state.ready and artifact_status == "ready"
+    capability = request.app.state.capability_checker.check()
+    ready = state.ready and artifact_status == "ready" and capability.ready
     payload = {
         "status": "ready" if ready else "not_ready",
         "artifacts": artifact_status,
         "processInstanceId": state.process_instance_id,
         "runtimeMode": state.mode,
+        "enabledFlEngines": {
+            "server": capability.configured_server,
+            "client": capability.configured_client,
+        },
+        "advertisedFlEngines": {
+            "server": capability.advertised_server,
+            "client": capability.advertised_client,
+        },
+        "capabilityVerification": capability.status,
     }
     return JSONResponse(
         payload,
