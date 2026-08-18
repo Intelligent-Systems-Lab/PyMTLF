@@ -152,6 +152,11 @@ def test_training_fl_conditional_requirements_report_paths() -> None:
         {"notifCorreId": "corr", "delayEventNotif": {"delayEventInd": True}},
         {
             "notifCorreId": "corr",
+            "delayEventNotif": {"delayEventInd": True},
+            "statusReport": {"mlModelAcc": 92},
+        },
+        {
+            "notifCorreId": "corr",
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",
@@ -162,7 +167,12 @@ def test_training_fl_conditional_requirements_report_paths() -> None:
         {"notifCorreId": "corr", "termTrainReq": "OTHERS"},
         {
             "notifCorreId": "corr",
-            "mlCorreId": "fl-process-001",
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {"mLModelUrl": "http://client.example/local-model"},
+                }
+            ],
             "statusReport": {"trainInDataInfo": {"samplRatio": 100}},
         },
         {
@@ -185,6 +195,20 @@ def test_training_notification_valid_combinations(payload: dict) -> None:
     "payload",
     [
         {"notifCorreId": "corr"},
+        {
+            "notifCorreId": "corr",
+            "statusReport": {"trainInDataInfo": {"samplRatio": 100}},
+        },
+        {
+            "notifCorreId": "corr",
+            "delayEventNotif": {"delayEventInd": True},
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {"mLModelUrl": "http://client.example/local-model"},
+                }
+            ],
+        },
         {
             "notifCorreId": "corr",
             "delayEventNotif": {"delayEventInd": True},

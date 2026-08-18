@@ -10,12 +10,19 @@ from uuid import UUID, uuid4
 
 from py_mtlf.config import FederatedStrategySettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
+from py_mtlf.core.fl_artifacts import ArtifactRole, HierarchyPreparationResultArtifact
 from py_mtlf.core.fl_experiment import (
     ExperimentConflictError,
     ExperimentLifecycle,
     FLExperimentRegistry,
 )
-from py_mtlf.core.fl_hierarchy import FederatedStrategy, FedProxAlgorithm
+from py_mtlf.core.fl_hierarchy import (
+    FederatedStrategy,
+    FedProxAlgorithm,
+    HierarchyMessageType,
+    PreparationOutcome,
+    PreparationResultMetadata,
+)
 from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
 from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyDiscoveryError,
@@ -24,7 +31,10 @@ from py_mtlf.core.fl_hierarchy_discovery import (
 )
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
+    FLProcess,
     FLServerEngine,
+    FLServerState,
+    HierarchyPreparationCollection,
     HierarchyPreparationTarget,
 )
 from py_mtlf.core.fl_topology import TopologyPlanner
@@ -41,6 +51,8 @@ class RootRequestState(StrEnum):
     VALIDATING = "VALIDATING"
     DISPATCHING = "DISPATCHING"
     PREPARATION_WAITING = "PREPARATION_WAITING"
+    PREPARATION_EVALUATING = "PREPARATION_EVALUATING"
+    ADMITTED = "ADMITTED"
     FAILED = "FAILED"
 
 
@@ -49,6 +61,10 @@ class RootFailureCause(StrEnum):
     DISCOVERY_FAILED = "DISCOVERY_FAILED"
     ASSIGNMENT_PUBLICATION_FAILED = "ASSIGNMENT_PUBLICATION_FAILED"
     PREPARATION_DISPATCH_FAILED = "PREPARATION_DISPATCH_FAILED"
+    PREPARATION_FAILED = "PREPARATION_FAILED"
+    PREPARATION_TIMEOUT = "PREPARATION_TIMEOUT"
+    RESULT_VALIDATION_FAILED = "RESULT_VALIDATION_FAILED"
+    ADMISSION_REJECTED = "ADMISSION_REJECTED"
     SHUTDOWN = "SHUTDOWN"
 
 
@@ -68,6 +84,26 @@ class RootCoordinatorUnavailableError(RootCoordinatorError):
     pass
 
 
+class RootPreparationError(RuntimeError):
+    def __init__(self, cause: RootFailureCause, detail: str) -> None:
+        super().__init__(detail)
+        self.cause = cause
+
+
+@dataclass(frozen=True)
+class AdmittedBranchSnapshot:
+    branch_nf_instance_id: str
+    prepared_leaf_nf_instance_ids: tuple[str, ...]
+    upper_resource_location: str
+    result_digest: str
+
+
+@dataclass(frozen=True)
+class RootAdmissionSnapshot:
+    plan_id: str
+    branches: tuple[AdmittedBranchSnapshot, ...]
+
+
 @dataclass(frozen=True)
 class RootRequestSnapshot:
     request_id: str
@@ -76,6 +112,7 @@ class RootRequestSnapshot:
     state: RootRequestState
     failure_cause: str = ""
     failure_detail: str = ""
+    admission: RootAdmissionSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +132,7 @@ class _RootRequestRecord:
     failure_cause: str = ""
     failure_detail: str = ""
     server_process_id: str = ""
+    admission: RootAdmissionSnapshot | None = None
     future: Future | None = field(default=None, repr=False)
 
 
@@ -219,15 +257,29 @@ class FLRootCoordinator:
         with self._condition:
             self._closing = True
             self._condition.notify_all()
-        self._executor.shutdown(wait=True, cancel_futures=False)
-        with self._condition:
             active = (
                 self._records.get(self._active_request_id)
                 if self._active_request_id is not None
                 else None
             )
+        if active is not None and active.server_process_id:
+            try:
+                self._server.cancel_hierarchy_preparation(
+                    active.server_process_id,
+                    "Root coordinator is closing",
+                )
+            except (KeyError, RuntimeError):
+                logger.exception(
+                    "Failed to wake hierarchy Server process %s during shutdown",
+                    active.server_process_id,
+                )
+        self._executor.shutdown(wait=True, cancel_futures=False)
         if active is not None:
-            self._cleanup_attempt(active, cancel_server=True, reason="Root coordinator is closing")
+            self._cleanup_attempt(
+                active,
+                cancel_server=False,
+                reason="Root coordinator is closing",
+            )
             with self._condition:
                 active.state = RootRequestState.FAILED
                 active.failure_cause = RootFailureCause.SHUTDOWN.value
@@ -367,6 +419,7 @@ class FLRootCoordinator:
             self._set_state(record, RootRequestState.DISPATCHING)
             cause = RootFailureCause.ASSIGNMENT_PUBLICATION_FAILED
             targets = []
+            branch_assignments = {}
             for branch, resolved in resolved_branches:
                 artifact = self._artifact_service.publish_branch_assignment(
                     base=base,
@@ -376,9 +429,10 @@ class FLRootCoordinator:
                     assigned_leaf_nf_instance_ids=branch.leaf_nf_instance_ids,
                     strategy=self._strategy,
                 )
+                branch_assignments[branch.nf_instance_id] = artifact
                 targets.append(
                     HierarchyPreparationTarget(
-                        branch_nf_instance_id=branch.nf_instance_id,
+                        participant_nf_instance_id=branch.nf_instance_id,
                         candidate=FLClientCandidate(
                             target=resolved.target,
                             tracking_areas=(),
@@ -411,11 +465,34 @@ class FLRootCoordinator:
                 record.server_process_id = process.process_id
                 record.state = RootRequestState.PREPARATION_WAITING
                 self._condition.notify_all()
+            cause = RootFailureCause.PREPARATION_FAILED
+            collection = self._server.collect_hierarchy_preparation(process.process_id)
+            self._set_state(record, RootRequestState.PREPARATION_EVALUATING)
+            cause = RootFailureCause.RESULT_VALIDATION_FAILED
+            admission = self._evaluate_preparation(
+                record=record,
+                process=process,
+                collection=collection,
+                topology=topology,
+                assignments=branch_assignments,
+                root_nf_instance_id=context.nf_instance_id,
+                ml_event=descriptor.event,
+                base_artifact_key=current.artifact.key,
+            )
+            process.state = FLServerState.READY
+            with self._condition:
+                if self._active_request_id != record.initiation.request_id:
+                    raise RuntimeError("Root request became stale during admission")
+                record.admission = admission
+                record.state = RootRequestState.ADMITTED
+                self._condition.notify_all()
         except Exception as error:
             if isinstance(error, HierarchyDiscoveryError):
                 cause = RootFailureCause.DISCOVERY_FAILED
             elif isinstance(error, RootCoordinatorUnavailableError):
                 cause = RootFailureCause.SHUTDOWN
+            elif isinstance(error, RootPreparationError):
+                cause = error.cause
             logger.exception(
                 "Hierarchy Root request failed request_id=%s plan_id=%s",
                 record.initiation.request_id,
@@ -430,6 +507,139 @@ class FLRootCoordinator:
                     self._active_request_id = None
                 self._failure_latched = True
                 self._condition.notify_all()
+
+    def _evaluate_preparation(
+        self,
+        *,
+        record: _RootRequestRecord,
+        process: FLProcess,
+        collection: HierarchyPreparationCollection,
+        topology,
+        assignments: dict[str, object],
+        root_nf_instance_id: str,
+        ml_event: str,
+        base_artifact_key: str,
+    ) -> RootAdmissionSnapshot:
+        if collection.plan_id != record.initiation.plan_id:
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "upper preparation collection plan does not match",
+            )
+        if collection.process_id != process.process_id:
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "upper preparation collection process does not match",
+            )
+        if collection.timed_out_participant_nf_instance_ids:
+            raise RootPreparationError(
+                RootFailureCause.PREPARATION_TIMEOUT,
+                "one or more Branch callbacks timed out",
+            )
+        expected = {
+            branch.nf_instance_id: branch.leaf_nf_instance_ids
+            for branch in topology.branches
+        }
+        outcomes = {
+            item.participant_nf_instance_id: item for item in collection.participants
+        }
+        if set(outcomes) != set(expected):
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "upper preparation collection does not cover configured Branches",
+            )
+        admitted = []
+        rejected = False
+        for branch_id in sorted(expected):
+            outcome = outcomes[branch_id]
+            notification = outcome.notification
+            if outcome.failure or notification is None:
+                raise RootPreparationError(
+                    RootFailureCause.PREPARATION_FAILED,
+                    "Branch preparation did not return a valid outcome",
+                )
+            if len(notification.ml_model_infos or ()) != 1:
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch preparation result URL is missing",
+                )
+            model_info = notification.ml_model_infos[0]
+            if model_info.event != ml_event or model_info.model_file_address is None:
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch preparation result event or address is invalid",
+                )
+            validated = self._workspace.download_hierarchy(
+                str(model_info.model_file_address.model_url),
+                expected_role=ArtifactRole.HIERARCHY_PREPARATION_RESULT,
+                expected_message_type=HierarchyMessageType.PREPARATION_RESULT,
+                expected_publisher_nf_instance_id=branch_id,
+                intended_recipient_nf_instance_id=root_nf_instance_id,
+                expected_plan_id=record.initiation.plan_id,
+            )
+            contract = validated.contract
+            metadata = contract.hierarchy_metadata
+            if not isinstance(contract, HierarchyPreparationResultArtifact) or not isinstance(
+                metadata,
+                PreparationResultMetadata,
+            ):
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch result artifact contract is invalid",
+                )
+            assignment = assignments[branch_id]
+            if contract.file_digests != assignment.contract.file_digests:
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch result changed the assigned model bundle",
+                )
+            if metadata.assigned_client_nf_instance_ids != expected[branch_id]:
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch result assigned Leaf set does not match topology",
+                )
+            prepared_ids = tuple(item.nf_instance_id for item in metadata.prepared_clients)
+            if (
+                metadata.outcome is not PreparationOutcome.READY
+                or prepared_ids != expected[branch_id]
+                or metadata.failed_clients
+                or metadata.timed_out_client_nf_instance_ids
+                or notification.termination_request is not None
+            ):
+                rejected = True
+            admitted.append(
+                AdmittedBranchSnapshot(
+                    branch_nf_instance_id=branch_id,
+                    prepared_leaf_nf_instance_ids=prepared_ids,
+                    upper_resource_location=outcome.resource_location,
+                    result_digest=validated.metadata.key,
+                )
+            )
+        latest = self._catalog.current(record.initiation.model_family_id)
+        active = self._experiments.active()
+        if latest is None or latest.artifact.key != base_artifact_key:
+            raise RootPreparationError(
+                RootFailureCause.ADMISSION_REJECTED,
+                "Root base model changed during preparation",
+            )
+        if (
+            active is None
+            or active.reservation_id != record.reservation_id
+            or active.plan_id != record.initiation.plan_id
+            or active.server_process_id != process.process_id
+        ):
+            raise RootPreparationError(
+                RootFailureCause.ADMISSION_REJECTED,
+                "active hierarchy experiment changed during preparation",
+            )
+        if rejected:
+            raise RootPreparationError(
+                RootFailureCause.ADMISSION_REJECTED,
+                "complete-required hierarchy admission was rejected",
+            )
+        return RootAdmissionSnapshot(
+            plan_id=record.initiation.plan_id,
+            branches=tuple(admitted),
+        )
 
     def _set_state(self, record: _RootRequestRecord, state: RootRequestState) -> None:
         with self._condition:
@@ -490,6 +700,7 @@ class FLRootCoordinator:
             state=record.state,
             failure_cause=record.failure_cause,
             failure_detail=record.failure_detail,
+            admission=record.admission,
         )
 
 
@@ -516,5 +727,9 @@ def _public_failure_detail(cause: RootFailureCause) -> str:
         RootFailureCause.DISCOVERY_FAILED: "configured hierarchy node discovery failed",
         RootFailureCause.ASSIGNMENT_PUBLICATION_FAILED: "hierarchy assignment publication failed",
         RootFailureCause.PREPARATION_DISPATCH_FAILED: "upper-tier preparation dispatch failed",
+        RootFailureCause.PREPARATION_FAILED: "one or more Branch preparations failed",
+        RootFailureCause.PREPARATION_TIMEOUT: "one or more Branch preparations timed out",
+        RootFailureCause.RESULT_VALIDATION_FAILED: "Branch preparation result validation failed",
+        RootFailureCause.ADMISSION_REJECTED: "complete-required hierarchy admission was rejected",
         RootFailureCause.SHUTDOWN: "Root coordinator is shutting down",
     }[cause]

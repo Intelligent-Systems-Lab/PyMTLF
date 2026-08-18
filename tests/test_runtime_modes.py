@@ -100,6 +100,7 @@ def test_fl_server_owns_model_services_without_local_training(settings, tmp_path
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is not None
         assert app.state.fl_client is None
+        assert app.state.fl_branch is None
         assert app.state.training_coordinator is None
         paths = app.openapi()["paths"]
         assert "/internal/v1/ml-model-provision/subscriptions" in paths
@@ -122,6 +123,7 @@ def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_p
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is None
         assert app.state.fl_client is not None
+        assert app.state.fl_branch is None
         assert app.state.training_coordinator is None
         paths = app.openapi()["paths"]
         assert "/internal/v1/artifacts/{artifact_key}" in paths
@@ -146,6 +148,8 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is not None
         assert app.state.fl_client is not None
+        assert app.state.fl_branch is not None
+        assert app.state.fl_client._branch_coordinator is app.state.fl_branch
         assert app.state.fl_client._experiments is app.state.fl_experiments
         assert app.state.fl_server._experiments is app.state.fl_experiments
         assert app.state.training_coordinator is None
@@ -166,6 +170,7 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
         assert notification_response.status_code == 404
     assert app.state.fl_server._closing.is_set()
     assert app.state.fl_client._closing.is_set()
+    assert app.state.fl_branch._closing is True
 
 
 def test_hierarchy_private_api_is_mounted_only_when_enabled(settings, tmp_path):

@@ -163,12 +163,54 @@ class FLWorkspace:
         intended_recipient_nf_instance_id: str,
         expected_plan_id: str | None = None,
     ) -> ValidatedHierarchyArtifact:
+        return self._download_hierarchy(
+            url,
+            expected_role=expected_role,
+            expected_message_type=expected_message_type,
+            expected_publisher_nf_instance_id=expected_publisher_nf_instance_id,
+            intended_recipient_nf_instance_id=intended_recipient_nf_instance_id,
+            expected_plan_id=expected_plan_id,
+        )
+
+    def download_assignment(
+        self,
+        url: str,
+        *,
+        intended_recipient_nf_instance_id: str,
+        expected_plan_id: str | None = None,
+    ) -> ValidatedHierarchyArtifact:
+        return self._download_hierarchy(
+            url,
+            expected_role=ArtifactRole.HIERARCHY_ASSIGNMENT,
+            expected_message_type=None,
+            expected_publisher_nf_instance_id=None,
+            intended_recipient_nf_instance_id=intended_recipient_nf_instance_id,
+            expected_plan_id=expected_plan_id,
+        )
+
+    def inspect_artifact(self, artifact: ArtifactMetadata) -> ValidatedArchive:
+        return self._validate_archive(artifact.path)
+
+    def _download_hierarchy(
+        self,
+        url: str,
+        *,
+        expected_role: ArtifactRole,
+        expected_message_type: HierarchyMessageType | None,
+        expected_publisher_nf_instance_id: str | None,
+        intended_recipient_nf_instance_id: str,
+        expected_plan_id: str | None,
+    ) -> ValidatedHierarchyArtifact:
         if expected_role not in {
             ArtifactRole.HIERARCHY_ASSIGNMENT,
             ArtifactRole.HIERARCHY_PREPARATION_RESULT,
         }:
             raise ValueError("hierarchy download requires a hierarchy artifact role")
-        expected_publisher = normalize_nf_instance_id(expected_publisher_nf_instance_id)
+        expected_publisher = (
+            normalize_nf_instance_id(expected_publisher_nf_instance_id)
+            if expected_publisher_nf_instance_id is not None
+            else None
+        )
         intended_recipient = normalize_nf_instance_id(intended_recipient_nf_instance_id)
         normalized_plan_id = (
             normalize_plan_id(expected_plan_id) if expected_plan_id is not None else None
@@ -253,11 +295,17 @@ class FLWorkspace:
                 raise FLArtifactContractError(
                     "FL hierarchy artifact role does not match expectation"
                 )
-            if metadata.message_type is not expected_message_type:
+            if (
+                expected_message_type is not None
+                and metadata.message_type is not expected_message_type
+            ):
                 raise FLArtifactContractError(
                     "FL hierarchy message type does not match expectation"
                 )
-            if metadata.publisher_nf_instance_id != expected_publisher:
+            if (
+                expected_publisher is not None
+                and metadata.publisher_nf_instance_id != expected_publisher
+            ):
                 raise FLArtifactIdentityError(
                     "FL hierarchy publisher does not match expected peer"
                 )

@@ -119,16 +119,15 @@ class NwdafMLModelTrainNotif(StandardModel):
     def validate_result_combination(self) -> "NwdafMLModelTrainNotif":
         has_delay = self.delay_event_notification is not None
         has_models = bool(self.ml_model_infos)
-        has_status = self.status_report is not None
         has_termination = bool(self.termination_request)
-        if not has_delay and not has_models and not has_status and not has_termination:
+
+        if not has_delay and not has_models and not has_termination:
             raise ValueError(
-                "at least one of delayEventNotif, mLModelInfos, statusReport or "
-                "termTrainReq is required"
+                "at least one of delayEventNotif, mLModelInfos or termTrainReq is required"
             )
-        if has_delay and (has_models or has_status or has_termination):
+        if has_delay and (has_models or has_termination):
             raise ValueError(
-                "delayEventNotif cannot coexist with mLModelInfos, statusReport or termTrainReq"
+                "delayEventNotif cannot coexist with mLModelInfos or termTrainReq"
             )
         return self
 

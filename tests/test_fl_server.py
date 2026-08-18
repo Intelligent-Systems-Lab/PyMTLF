@@ -286,7 +286,7 @@ def test_hierarchy_preparation_attaches_root_process_and_uses_branch_bundle_urls
     )
     targets = tuple(
         HierarchyPreparationTarget(
-            branch_nf_instance_id=branch_id,
+            participant_nf_instance_id=branch_id,
             candidate=FLClientCandidate(
                 target=SelectedTarget(
                     nfInstanceId=branch_id,
@@ -330,7 +330,10 @@ def test_hierarchy_preparation_attaches_root_process_and_uses_branch_bundle_urls
         assert payload["mLPreFlag"] is True
         assert payload["mlCorreId"] == process.process_id
         assert payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] == target.assignment_url
-        assert request.headers["X-NWDAF-Target-Nf-Instance-Id"] == target.branch_nf_instance_id
+        assert (
+            request.headers["X-NWDAF-Target-Nf-Instance-Id"]
+            == target.participant_nf_instance_id
+        )
 
     orchestrator.cancel_hierarchy_preparation(process.process_id, "test cleanup")
     orchestrator.close()
@@ -369,7 +372,7 @@ def test_hierarchy_preparation_rolls_back_partial_dispatch(tmp_path):
     )
     targets = tuple(
         HierarchyPreparationTarget(
-            branch_nf_instance_id=branch_id,
+            participant_nf_instance_id=branch_id,
             candidate=FLClientCandidate(
                 target=SelectedTarget(
                     nfInstanceId=branch_id,
@@ -408,7 +411,7 @@ def test_hierarchy_preparation_rolls_back_partial_dispatch(tmp_path):
     assert process.state is FLServerState.FAILED
     assert process.hierarchy_cleanup_complete is True
     assert calls[-1] == ("DELETE", "http://go.example/subscriptions/first")
-    assert registry.active().server_process_id == process.process_id
+    assert registry.active().server_process_id is None
     orchestrator.close()
     client.close()
 
@@ -493,6 +496,307 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
         assert participant.accepted_delay_notification_digest == first_digest
         assert process.failure == ""
     finally:
+        orchestrator.close()
+
+
+def test_preparation_model_callback_is_stage_aware_success(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="preparation-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(process_id="process-1", intent=Mock())
+    process.state = FLServerState.PREPARATION_WAITING
+    process.participants = [participant]
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    notification = NwdafMLModelTrainNotif.model_validate(
+        {
+            "notifCorreId": participant.notification_correlation_id,
+            "mlCorreId": process.process_id,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {"mLModelUrl": "http://server.example/base.tar.gz"},
+                }
+            ],
+        }
+    )
+    try:
+        orchestrator.receive_notification(notification)
+
+        assert participant.preparation_complete is True
+        assert participant.preparation_notification == notification
+        assert participant.notification is None
+        assert process.failure == ""
+    finally:
+        orchestrator.close()
+
+
+def test_preparation_result_is_recorded_before_termination(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="preparation-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+    )
+    process.state = FLServerState.PREPARATION_WAITING
+    process.participants = [participant]
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    notification = NwdafMLModelTrainNotif.model_validate(
+        {
+            "notifCorreId": participant.notification_correlation_id,
+            "mlCorreId": process.process_id,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://branch.example/preparation-result.tar.gz"
+                    },
+                }
+            ],
+            "termTrainReq": "NOT_AVAILABLE_ML_TRAIN",
+        }
+    )
+    try:
+        orchestrator.receive_notification(notification)
+
+        assert participant.preparation_notification == notification
+        assert participant.preparation_complete is True
+        assert participant.preparation_notification.termination_request == (
+            "NOT_AVAILABLE_ML_TRAIN"
+        )
+        assert process.failure == ""
+    finally:
+        orchestrator.close()
+
+
+def test_flat_preparation_termination_still_fails_the_process(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="preparation-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(process_id="process-1", intent=Mock())
+    process.state = FLServerState.PREPARATION_WAITING
+    process.participants = [participant]
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    try:
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif(
+                notifCorreId=participant.notification_correlation_id,
+                mlCorreId=process.process_id,
+                termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+            )
+        )
+
+        assert participant.preparation_complete is True
+        assert "NOT_AVAILABLE_ML_TRAIN" in process.failure
+    finally:
+        orchestrator.close()
+
+
+def test_hierarchy_collection_waits_for_every_leaf_after_first_failure(tmp_path):
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"preparation-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate((first_id, second_id), start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+    )
+    process.state = FLServerState.PREPARATION_WAITING
+    process.participants = participants
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(preparation_timeout_seconds=2),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    completed = threading.Event()
+    result = []
+
+    def collect():
+        result.append(orchestrator.collect_hierarchy_preparation(process.process_id))
+        completed.set()
+
+    thread = threading.Thread(target=collect)
+    thread.start()
+    try:
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif(
+                notifCorreId=participants[0].notification_correlation_id,
+                mlCorreId=process.process_id,
+                termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+            )
+        )
+        assert completed.wait(0.05) is False
+
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participants[1].notification_correlation_id,
+                    "mlCorreId": process.process_id,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://branch.example/leaf-assignment"
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        assert completed.wait(1) is True
+        assert result[0].timed_out_participant_nf_instance_ids == ()
+        assert [
+            item.notification.termination_request if item.notification is not None else None
+            for item in result[0].participants
+        ] == ["NOT_AVAILABLE_ML_TRAIN", None]
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participants[1].notification_correlation_id,
+                    "mlCorreId": process.process_id,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://branch.example/leaf-assignment"
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        assert process.state is FLServerState.PREPARATION_EVALUATING
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+
+
+def test_hierarchy_cancellation_wakes_collection_and_late_callback_is_rejected(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="preparation-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+    )
+    process.state = FLServerState.PREPARATION_WAITING
+    process.participants = [participant]
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(
+            preparation_timeout_seconds=30,
+            cleanup={"max_attempts": 1},
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    completed = threading.Event()
+    failures = []
+
+    def collect():
+        try:
+            orchestrator.collect_hierarchy_preparation(process.process_id)
+        except RuntimeError as error:
+            failures.append(str(error))
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=collect)
+    thread.start()
+    try:
+        orchestrator.cancel_hierarchy_preparation(process.process_id, "parent cancelled")
+        assert completed.wait(1) is True
+        assert failures == ["parent cancelled"]
+
+        process.state = FLServerState.READY
+        process.failure = ""
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+        with pytest.raises(ValueError, match="after the active stage"):
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(
+                    notifCorreId=participant.notification_correlation_id,
+                    mlCorreId=process.process_id,
+                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+                )
+            )
+        assert process.failure == ""
+    finally:
+        thread.join(timeout=1)
         orchestrator.close()
 
 

@@ -11,7 +11,9 @@ from py_mtlf.config import (
     FLClientSettings,
     NotificationSettings,
 )
+from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetJobState
+from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
     FLClientEngine,
@@ -20,6 +22,13 @@ from py_mtlf.core.fl_client import (
     _termination,
 )
 from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
+from py_mtlf.core.fl_hierarchy import HierarchyMessageType, PreparationOutcome
+from py_mtlf.core.fl_workspace import ValidatedArchive, ValidatedHierarchyArtifact
+from py_mtlf.core.nwdaf_context import (
+    FLCapabilityType,
+    MLAnalyticsCapability,
+    NwdafContext,
+)
 from py_mtlf.core.trainer import LocalTrainer
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model_training import (
@@ -205,15 +214,16 @@ def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
         service.close()
 
 
-def test_delete_preserves_bound_resource_until_experiment_cleanup(tmp_path, monkeypatch):
+def test_delete_cancels_bound_leaf_and_is_idempotent(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
+    workspace = Mock()
     service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
         NotificationSettings(),
         Mock(),
         Mock(),
-        Mock(),
+        workspace,
         experiments=registry,
     )
     monkeypatch.setattr(service, "_start_operation", Mock())
@@ -226,15 +236,38 @@ def test_delete_preserves_bound_resource_until_experiment_cleanup(tmp_path, monk
         plan_id = "11111111-1111-4111-8111-111111111111"
         registry.bind_plan(active.reservation_id, plan_id, ExperimentRole.LEAF)
 
-        with pytest.raises(RuntimeError, match="cleanup"):
-            service.delete(resource.subscription_id)
-        assert service.get(resource.subscription_id).subscription_id == resource.subscription_id
-
-        registry.mark_terminal(active.reservation_id, "COMPLETE")
-        registry.begin_cleanup(active.reservation_id)
         service.delete(resource.subscription_id)
-        assert registry.active().upper_client_subscription_ids == frozenset()
-        registry.release(active.reservation_id)
+        service.delete(resource.subscription_id)
+
+        with pytest.raises(KeyError):
+            service.get(resource.subscription_id)
+        assert registry.active() is None
+        assert registry.is_retired(plan_id)
+        workspace.release_plan.assert_called_once_with(plan_id)
+    finally:
+        service.close()
+
+
+def test_delete_still_rejects_in_progress_flat_preparation(tmp_path, monkeypatch):
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
+        service._resources[resource.subscription_id].state = FLClientState.PREPARING
+
+        with pytest.raises(RuntimeError, match="ML_TRAINING_NOT_COMPLETE"):
+            service.delete(resource.subscription_id)
+        assert service.get(resource.subscription_id).state is FLClientState.PREPARING
     finally:
         service.close()
 
@@ -345,6 +378,323 @@ def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
         assert updated.state is FLClientState.FAILED
         assert "minNumSamples" in updated.last_error
         service._enqueue_delivery.assert_called_once()
+    finally:
+        service.close()
+
+
+def test_preparation_success_returns_validated_input_model_url(tmp_path):
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.PREPARING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+    )
+    service._resources[resource.subscription_id] = resource
+    service._dataset_builder = Mock()
+    service._dataset_builder.build.return_value.training_scopes = (
+        Mock(training_sample_count=1),
+    )
+    service._enqueue_delivery = Mock()
+    snapshot = Mock(records=[Mock()])
+    job = Mock(state=DatasetJobState.READY, snapshot=snapshot, failure="")
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._preparation_complete(
+            resource.subscription_id,
+            resource.revision,
+            job,
+            {"analytics_event": "UE_COMMUNICATION"},
+            "model-contract",
+            "preprocessing-contract",
+        )
+
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.round_indicator is None
+        assert notification.status_report is None
+        assert len(notification.ml_model_infos or ()) == 1
+        address = notification.ml_model_infos[0].model_file_address
+        assert address is not None
+        assert str(address.model_url) == "http://server.example/base.tar.gz"
+    finally:
+        service.close()
+
+
+def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
+    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    plan_id = "11111111-1111-4111-8111-111111111111"
+    assignment_url = "http://branch.example/artifacts/" + "a" * 64
+    payload = preparation_payload()
+    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment_url
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    contract = HierarchyAssignmentArtifact.model_validate(
+        {
+            "artifact_role": "HIERARCHY_ASSIGNMENT",
+            "bundle_schema_version": "1.0",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "hierarchy_metadata": {
+                "contract_version": "1.0",
+                "message_type": HierarchyMessageType.LEAF_ASSIGNMENT,
+                "plan_id": plan_id,
+                "publisher_nf_instance_id": branch_id,
+                "intended_recipient_nf_instance_id": leaf_id,
+                "parent_branch_nf_instance_id": branch_id,
+                "strategy": {
+                    "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+                    "participant_selection": "all",
+                    "waiting_policy": "all",
+                    "aggregation": "sample_weighted",
+                },
+            },
+        }
+    )
+    generic_path = tmp_path / "generic-assignment.tar.gz"
+    generic_path.write_bytes(b"validated archive")
+    generic = ArtifactMetadata(
+        key="a" * 64,
+        size_bytes=generic_path.stat().st_size,
+        path=generic_path,
+        url=assignment_url,
+    )
+    admitted_path = tmp_path / "admitted-assignment.tar.gz"
+    admitted_path.write_bytes(b"admitted archive")
+    admitted_metadata = ArtifactMetadata(
+        key="a" * 64,
+        size_bytes=admitted_path.stat().st_size,
+        path=admitted_path,
+        url=assignment_url,
+    )
+    manifest = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+    }
+    admitted = ValidatedHierarchyArtifact(
+        metadata=admitted_metadata,
+        manifest=manifest,
+        contract=contract,
+    )
+    workspace = Mock()
+    workspace.download.return_value = generic
+    workspace.inspect_artifact.return_value = ValidatedArchive(
+        manifest=manifest,
+        contract=contract,
+    )
+    workspace.download_assignment.return_value = admitted
+    context_client = Mock()
+    context_client.get.return_value = NwdafContext(
+        nf_instance_id=leaf_id,
+        api_root="http://leaf.example",
+        internal_api_root="http://leaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("UE_COMMUNICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    datasets = Mock()
+    datasets.submit_external.return_value = "dataset-job-1"
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context_client,
+        datasets,
+        workspace,
+        experiments=registry,
+    )
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.PREPARING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        experiment_reservation_id=reservation.reservation_id,
+    )
+    service._resources[resource.subscription_id] = resource
+    service._loader = Mock()
+    service._enqueue_delivery = Mock()
+    service._loader.load.return_value.manifest = manifest
+    try:
+        service._run_preparation(
+            resource.subscription_id,
+            resource.revision,
+            Mock(),
+            Mock(),
+        )
+
+        active = registry.active()
+        updated = service.get(resource.subscription_id)
+        assert active is not None
+        assert active.plan_id == plan_id
+        assert active.assigned_role is ExperimentRole.LEAF
+        assert updated.hierarchy_assignment == admitted
+        assert updated.preparation_base_artifact == admitted_metadata
+        datasets.submit_external.assert_called_once()
+        assert not generic_path.exists()
+        workspace.download_assignment.assert_called_once_with(
+            assignment_url,
+            intended_recipient_nf_instance_id=leaf_id,
+        )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("branch_outcome", "expected_termination"),
+    [
+        (PreparationOutcome.READY, None),
+        (PreparationOutcome.FAILED, "NOT_AVAILABLE_ML_TRAIN"),
+    ],
+)
+def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
+    tmp_path,
+    branch_outcome,
+    expected_termination,
+):
+    root_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    plan_id = "11111111-1111-4111-8111-111111111111"
+    assignment_url = "http://root.example/artifacts/" + "a" * 64
+    payload = preparation_payload()
+    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment_url
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    contract = HierarchyAssignmentArtifact.model_validate(
+        {
+            "artifact_role": "HIERARCHY_ASSIGNMENT",
+            "bundle_schema_version": "1.0",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "hierarchy_metadata": {
+                "contract_version": "1.0",
+                "message_type": HierarchyMessageType.BRANCH_ASSIGNMENT,
+                "plan_id": plan_id,
+                "publisher_nf_instance_id": root_id,
+                "intended_recipient_nf_instance_id": branch_id,
+                "assigned_leaf_nf_instance_ids": [leaf_id],
+                "admission": {"mode": "complete_required"},
+                "strategy": {
+                    "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+                    "participant_selection": "all",
+                    "waiting_policy": "all",
+                    "aggregation": "sample_weighted",
+                },
+            },
+        }
+    )
+    generic_path = tmp_path / "generic-branch.tar.gz"
+    generic_path.write_bytes(b"generic")
+    admitted_path = tmp_path / "admitted-branch.tar.gz"
+    admitted_path.write_bytes(b"admitted")
+    generic = ArtifactMetadata(
+        key="a" * 64,
+        size_bytes=generic_path.stat().st_size,
+        path=generic_path,
+        url=assignment_url,
+    )
+    admitted = ValidatedHierarchyArtifact(
+        metadata=ArtifactMetadata(
+            key="a" * 64,
+            size_bytes=admitted_path.stat().st_size,
+            path=admitted_path,
+            url=assignment_url,
+        ),
+        manifest={
+            "analytics_event": "UE_COMMUNICATION",
+            "model_interoperability": "001122",
+        },
+        contract=contract,
+    )
+    workspace = Mock()
+    workspace.download.return_value = generic
+    workspace.inspect_artifact.return_value = ValidatedArchive(
+        manifest=admitted.manifest,
+        contract=contract,
+    )
+    workspace.download_assignment.return_value = admitted
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id=branch_id,
+        api_root="http://branch.example",
+        internal_api_root="http://branch-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("UE_COMMUNICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    datasets = Mock()
+    branch = Mock()
+    branch.prepare.return_value = Mock(
+        execution=Mock(process_id="lower-process"),
+        artifact=Mock(url="http://branch.example/preparation-result"),
+        outcome=branch_outcome,
+    )
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        datasets,
+        workspace,
+        experiments=registry,
+        branch_coordinator=branch,
+    )
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.PREPARING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        experiment_reservation_id=reservation.reservation_id,
+    )
+    service._resources[resource.subscription_id] = resource
+    service._loader = Mock()
+    service._enqueue_delivery = Mock()
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_preparation(resource.subscription_id, resource.revision, Mock(), Mock())
+
+        active = registry.active()
+        updated = service.get(resource.subscription_id)
+        assert active is not None
+        assert active.plan_id == plan_id
+        assert active.assigned_role is ExperimentRole.BRANCH
+        assert updated.branch_process_id == "lower-process"
+        assert updated.hierarchy_assignment == admitted
+        branch.prepare.assert_called_once_with(
+            assignment=admitted,
+            representation=value,
+            reservation_id=reservation.reservation_id,
+        )
+        datasets.submit_external.assert_not_called()
+        service._loader.load.assert_not_called()
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.termination_request == expected_termination
+        assert (
+            str(notification.ml_model_infos[0].model_file_address.model_url)
+            == "http://branch.example/preparation-result"
+        )
     finally:
         service.close()
 
@@ -608,7 +958,14 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
             {
                 "notifCorreId": "prep-client-a",
                 "mlCorreId": "fl-process-001",
-                "statusReport": {"trainInDataInfo": {"samplRatio": 100}},
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {
+                            "mLModelUrl": "http://server.example/base.tar.gz"
+                        },
+                    }
+                ],
             }
         )
         service._enqueue_delivery(resource, notification, FLClientState.PREPARED)

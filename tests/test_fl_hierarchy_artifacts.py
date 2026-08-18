@@ -173,6 +173,7 @@ def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_pa
             leaf_assignment.contract.hierarchy_metadata.intended_recipient_nf_instance_id
             == LEAF_A
         )
+        assert leaf_assignment.contract.file_digests == root_assignment.contract.file_digests
         assert "assigned_leaf_nf_instance_ids" not in leaf_assignment.manifest["hierarchy_metadata"]
 
         result = branch_service.publish_preparation_result(
@@ -187,6 +188,7 @@ def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_pa
         )
         assert isinstance(result.contract, HierarchyPreparationResultArtifact)
         assert result.contract.hierarchy_metadata.outcome is PreparationOutcome.FAILED
+        assert result.contract.file_digests == root_assignment.contract.file_digests
 
         loader = TrustedBundleLoader()
         root_model = loader.load(metadata(root_assignment))
@@ -342,6 +344,44 @@ def test_hierarchy_download_binds_url_header_body_and_identity(tmp_path) -> None
             leaf_assignment.contract.hierarchy_metadata.intended_recipient_nf_instance_id
             == LEAF_A
         )
+    finally:
+        root_workspace.close()
+        branch_workspace.close()
+        client.close()
+
+
+def test_assignment_ingress_discovers_typed_message_without_expected_publisher(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    root_assignment = publish_root_assignment(root_workspace)
+    content = root_assignment.path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=content,
+            headers={"X-Artifact-SHA256": root_assignment.digest},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    branch_workspace = workspace(
+        tmp_path / "branch",
+        "http://branch.example",
+        client=client,
+        allowed_origins=("http://root.example",),
+    )
+    try:
+        downloaded = branch_workspace.download_assignment(
+            root_assignment.url,
+            intended_recipient_nf_instance_id=BRANCH,
+        )
+
+        assert isinstance(downloaded.contract, HierarchyAssignmentArtifact)
+        assert downloaded.contract.hierarchy_metadata.message_type is (
+            HierarchyMessageType.BRANCH_ASSIGNMENT
+        )
+        assert downloaded.contract.hierarchy_metadata.publisher_nf_instance_id == ROOT
+        assert downloaded.contract.hierarchy_metadata.plan_id == PLAN
     finally:
         root_workspace.close()
         branch_workspace.close()

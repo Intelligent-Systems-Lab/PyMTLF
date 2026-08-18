@@ -222,6 +222,19 @@ class FLExperimentRegistry:
             record.server_process_id = process_id
             return self._snapshot(record)
 
+    def detach_server(
+        self,
+        reservation_id: str,
+        process_id: str,
+    ) -> ExperimentSnapshot:
+        process_id = _required_identity(process_id, "process_id")
+        with self._lock:
+            record = self._required(reservation_id)
+            if record.server_process_id != process_id:
+                raise ExperimentStateError("server process is not attached")
+            record.server_process_id = None
+            return self._snapshot(record)
+
     def mark_terminal(
         self,
         reservation_id: str,

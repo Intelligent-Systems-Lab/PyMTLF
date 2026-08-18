@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -6,7 +7,10 @@ from uuid import UUID
 import pytest
 
 from py_mtlf.config import FederatedStrategySettings
+from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.fl_artifacts import HierarchyPreparationResultArtifact
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
+from py_mtlf.core.fl_hierarchy import PreparationOutcome
 from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyDiscoveryError,
     HierarchyNodeRole,
@@ -17,12 +21,18 @@ from py_mtlf.core.fl_root import (
     RootRequestConflictError,
     RootRequestState,
 )
+from py_mtlf.core.fl_server import (
+    HierarchyParticipantPreparationOutcome,
+    HierarchyPreparationCollection,
+)
 from py_mtlf.core.fl_topology import StaticTopologyPlanner
+from py_mtlf.core.fl_workspace import ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
     MLAnalyticsCapability,
     NwdafContext,
 )
+from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
 from py_mtlf.wire.private import SelectedTarget
 
 ROOT_ID = "00000000-0000-4000-8000-000000000001"
@@ -112,6 +122,17 @@ branches:
         return SimpleNamespace(process_id="server-process")
 
     server.start_hierarchy_preparation.side_effect = start_hierarchy_preparation
+    collection_cancelled = threading.Event()
+
+    def collect_hierarchy_preparation(_process_id):
+        collection_cancelled.wait()
+        raise RuntimeError("test hierarchy collection cancelled")
+
+    def cancel_hierarchy_preparation(_process_id, _reason):
+        collection_cancelled.set()
+
+    server.collect_hierarchy_preparation.side_effect = collect_hierarchy_preparation
+    server.cancel_hierarchy_preparation.side_effect = cancel_hierarchy_preparation
     policy = Mock()
     policy.take_intents.return_value = ()
     loader = Mock()
@@ -188,7 +209,7 @@ def test_root_request_validates_tree_publishes_assignment_and_waits(tmp_path):
         dispatched = server.start_hierarchy_preparation.call_args.kwargs
         assert dispatched["plan_id"] == accepted.plan_id
         assert dispatched["reservation_id"] == registry.active().reservation_id
-        assert dispatched["targets"][0].branch_nf_instance_id == BRANCH_ID
+        assert dispatched["targets"][0].participant_nf_instance_id == BRANCH_ID
         assert dispatched["targets"][0].assignment_url.endswith("/branch")
         assert registry.active().server_process_id == "server-process"
     finally:
@@ -342,6 +363,38 @@ def test_root_status_does_not_expose_peer_response_body(tmp_path):
         coordinator.close()
 
 
+def test_root_classifies_post_dispatch_collection_failure(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        _artifacts,
+        _workspace,
+        server,
+        _registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    server.collect_hierarchy_preparation.side_effect = RuntimeError(
+        "lower collection failed"
+    )
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        failed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert failed.failure_cause == "PREPARATION_FAILED"
+        assert failed.failure_detail == "one or more Branch preparations failed"
+    finally:
+        coordinator.close()
+
+
 def test_root_rejects_base_model_change_after_assignment_publication(tmp_path):
     (
         coordinator,
@@ -397,5 +450,191 @@ def test_root_rejects_generated_plan_identity_retired_in_this_process(tmp_path, 
                 model_family_id="ue-communication-default",
             )
         assert coordinator.requests() == ()
+    finally:
+        coordinator.close()
+
+
+def _configure_branch_result(
+    *,
+    tmp_path,
+    artifacts,
+    workspace,
+    server,
+    registry,
+    outcome: PreparationOutcome,
+):
+    file_digests = {
+        "model.py": "1" * 64,
+        "model.npy": "2" * 64,
+        "scaler.pkl": "3" * 64,
+    }
+    artifacts.publish_branch_assignment.return_value = SimpleNamespace(
+        url="http://root.example/assignments/branch",
+        contract=SimpleNamespace(file_digests=file_digests),
+    )
+    result_url = "http://branch.example/artifacts/" + "d" * 64
+
+    def collect(_process_id):
+        plan_id = registry.active().plan_id
+        notification = {
+            "notifCorreId": "branch-result",
+            "mlCorreId": "server-process",
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {"mLModelUrl": result_url},
+                }
+            ],
+        }
+        if outcome is PreparationOutcome.FAILED:
+            notification["termTrainReq"] = "NOT_AVAILABLE_ML_TRAIN"
+        return HierarchyPreparationCollection(
+            process_id="server-process",
+            plan_id=plan_id,
+            participants=(
+                HierarchyParticipantPreparationOutcome(
+                    participant_nf_instance_id=BRANCH_ID,
+                    resource_location="http://root.example/subscriptions/branch",
+                    assignment_url=result_url,
+                    notification=NwdafMLModelTrainNotif.model_validate(notification),
+                    failure="",
+                    delay_extensions=0,
+                    granted_extension_seconds=0,
+                ),
+            ),
+            timed_out_participant_nf_instance_ids=(),
+        )
+
+    def download_result(_url, **kwargs):
+        plan_id = kwargs["expected_plan_id"]
+        prepared = (
+            [{"nf_instance_id": LEAF_A_ID}, {"nf_instance_id": LEAF_B_ID}]
+            if outcome is PreparationOutcome.READY
+            else [{"nf_instance_id": LEAF_A_ID}]
+        )
+        failed = (
+            []
+            if outcome is PreparationOutcome.READY
+            else [
+                {
+                    "nf_instance_id": LEAF_B_ID,
+                    "cause": "NOT_AVAILABLE_ML_TRAIN",
+                }
+            ]
+        )
+        contract = HierarchyPreparationResultArtifact.model_validate(
+            {
+                "artifact_role": "HIERARCHY_PREPARATION_RESULT",
+                "bundle_schema_version": "1.0",
+                "file_digests": file_digests,
+                "hierarchy_metadata": {
+                    "contract_version": "1.0",
+                    "message_type": "PREPARATION_RESULT",
+                    "plan_id": plan_id,
+                    "publisher_nf_instance_id": BRANCH_ID,
+                    "intended_recipient_nf_instance_id": ROOT_ID,
+                    "outcome": outcome.value,
+                    "assigned_client_nf_instance_ids": [LEAF_A_ID, LEAF_B_ID],
+                    "prepared_clients": prepared,
+                    "failed_clients": failed,
+                    "timed_out_client_nf_instance_ids": [],
+                },
+            }
+        )
+        path = tmp_path / f"result-{outcome.value}.tar.gz"
+        path.write_bytes(b"result")
+        return ValidatedHierarchyArtifact(
+            metadata=ArtifactMetadata(
+                key="d" * 64,
+                size_bytes=path.stat().st_size,
+                path=path,
+                url=result_url,
+            ),
+            manifest={},
+            contract=contract,
+        )
+
+    server.collect_hierarchy_preparation.side_effect = collect
+    workspace.download_hierarchy.side_effect = download_result
+
+
+def test_root_admits_only_complete_ready_branch_results(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        admitted = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.ADMITTED, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert admitted.state is RootRequestState.ADMITTED
+        assert admitted.admission is not None
+        assert admitted.admission.plan_id == admitted.plan_id
+        assert admitted.admission.branches[0].branch_nf_instance_id == BRANCH_ID
+        assert admitted.admission.branches[0].prepared_leaf_nf_instance_ids == (
+            LEAF_A_ID,
+            LEAF_B_ID,
+        )
+        assert registry.active() is not None
+    finally:
+        coordinator.close()
+
+
+def test_root_validates_failure_result_before_rejecting_admission(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.FAILED,
+    )
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        failed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert failed.failure_cause == "ADMISSION_REJECTED"
+        workspace.download_hierarchy.assert_called_once()
+        assert registry.active() is None
     finally:
         coordinator.close()

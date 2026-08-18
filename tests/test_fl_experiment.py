@@ -90,6 +90,11 @@ def test_branch_attaches_one_lower_server_process_to_the_same_plan():
     with pytest.raises(ExperimentStateError):
         registry.attach_server(reservation.reservation_id, str(uuid4()), "server-b")
 
+    detached = registry.detach_server(reservation.reservation_id, "server-a")
+    assert detached.server_process_id is None
+    with pytest.raises(ExperimentStateError):
+        registry.detach_server(reservation.reservation_id, "server-a")
+
 
 def test_leaf_rejects_server_attachment_and_root_accepts_it():
     leaf_registry = FLExperimentRegistry()

@@ -26,6 +26,7 @@ from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetCoordinator
+from py_mtlf.core.fl_branch import FLBranchPreparationCoordinator
 from py_mtlf.core.fl_client import FLClientEngine
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
@@ -188,19 +189,6 @@ def create_app(
         if local_training is not None
         else None
     )
-    fl_client = (
-        FLClientEngine(
-            settings.federated_learning,
-            fl_client_settings,
-            settings.notification,
-            nwdaf_context,
-            dataset_coordinator,
-            fl_workspace,
-            experiments=fl_experiments,
-        )
-        if fl_client_settings is not None
-        else None
-    )
     fl_client_resolver = (
         FLClientResolver(
             settings.federated_learning,
@@ -227,6 +215,31 @@ def create_app(
     )
     if fl_server is not None:
         fl_server_holder["server"] = fl_server
+    fl_branch = None
+    if fl_client_settings is not None and fl_server is not None:
+        fl_branch = FLBranchPreparationCoordinator(
+            resolver=HierarchyNodeResolver(
+                settings.federated_learning,
+                nwdaf_context,
+            ),
+            nwdaf_context=nwdaf_context,
+            artifact_service=HierarchyArtifactService(fl_workspace),
+            server=fl_server,
+        )
+    fl_client = (
+        FLClientEngine(
+            settings.federated_learning,
+            fl_client_settings,
+            settings.notification,
+            nwdaf_context,
+            dataset_coordinator,
+            fl_workspace,
+            experiments=fl_experiments,
+            branch_coordinator=fl_branch,
+        )
+        if fl_client_settings is not None
+        else None
+    )
     topology_settings = settings.federated_learning.topology
     strategy_settings = settings.federated_learning.strategy
     fl_root = None
@@ -276,6 +289,8 @@ def create_app(
             runtime.accepting_requests = False
             if fl_root is not None:
                 fl_root.close()
+            if fl_branch is not None:
+                fl_branch.close()
             fl_experiments.shutdown()
             if training_coordinator is not None:
                 training_coordinator.shutdown()
@@ -316,6 +331,7 @@ def create_app(
     app.state.fl_workspace = fl_workspace
     app.state.fl_client = fl_client
     app.state.fl_server = fl_server
+    app.state.fl_branch = fl_branch
     app.state.fl_root = fl_root
     app.state.fl_experiments = fl_experiments
     app.state.publication = publication

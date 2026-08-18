@@ -64,6 +64,7 @@ class FLServerState(StrEnum):
     DISCOVERING = "DISCOVERING"
     PREPARATION_CREATING = "PREPARATION_CREATING"
     PREPARATION_WAITING = "PREPARATION_WAITING"
+    PREPARATION_EVALUATING = "PREPARATION_EVALUATING"
     READY = "READY"
     ROUND_DISPATCH = "ROUND_DISPATCH"
     ROUND_WAITING = "ROUND_WAITING"
@@ -87,7 +88,7 @@ class FLClientCandidate:
 
 @dataclass(frozen=True)
 class HierarchyPreparationTarget:
-    branch_nf_instance_id: str
+    participant_nf_instance_id: str
     candidate: FLClientCandidate
     assignment_url: str
 
@@ -99,6 +100,8 @@ class FLParticipant:
     notification_correlation_id: str
     resource_location: str = ""
     preparation_complete: bool = False
+    preparation_notification: NwdafMLModelTrainNotif | None = None
+    preparation_failure: str = ""
     expected_round: int | None = None
     notification: NwdafMLModelTrainNotif | None = None
     delay_extensions: int = 0
@@ -138,12 +141,31 @@ class FLProcess:
     published_model_id: int | None = None
     experiment_reservation_id: str = ""
     hierarchy_plan_id: str = ""
-    hierarchy_family_key: FamilyKey = ""
+    hierarchy_family_key: FamilyKey | None = None
     hierarchy_active_scopes: tuple[ScopeReference, ...] = ()
     hierarchy_cleanup_complete: bool = False
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
+
+
+@dataclass(frozen=True)
+class HierarchyParticipantPreparationOutcome:
+    participant_nf_instance_id: str
+    resource_location: str
+    assignment_url: str
+    notification: NwdafMLModelTrainNotif | None
+    failure: str
+    delay_extensions: int
+    granted_extension_seconds: int
+
+
+@dataclass(frozen=True)
+class HierarchyPreparationCollection:
+    process_id: str
+    plan_id: str
+    participants: tuple[HierarchyParticipantPreparationOutcome, ...]
+    timed_out_participant_nf_instance_ids: tuple[str, ...]
 
 
 class FLClientResolver:
@@ -360,8 +382,8 @@ class FLServerEngine:
         *,
         plan_id: str,
         reservation_id: str,
-        family_key: FamilyKey,
-        model_id: int,
+        family_key: FamilyKey | None,
+        model_id: int | None,
         ml_event: str,
         ml_event_filter: dict,
         target_ue: dict | None,
@@ -372,15 +394,21 @@ class FLServerEngine:
         if self._closing.is_set():
             raise RuntimeError("FL Server is closing")
         if not targets:
-            raise ValueError("hierarchy preparation requires at least one Branch target")
-        branch_ids = tuple(item.branch_nf_instance_id for item in targets)
-        if branch_ids != tuple(sorted(branch_ids)) or len(branch_ids) != len(set(branch_ids)):
-            raise ValueError("hierarchy Branch targets must be unique and canonically ordered")
+            raise ValueError("hierarchy preparation requires at least one participant target")
+        participant_ids = tuple(item.participant_nf_instance_id for item in targets)
+        if participant_ids != tuple(sorted(participant_ids)) or len(participant_ids) != len(
+            set(participant_ids)
+        ):
+            raise ValueError(
+                "hierarchy participant targets must be unique and canonically ordered"
+            )
         for target in targets:
-            if target.candidate.target.nf_instance_id != target.branch_nf_instance_id:
-                raise ValueError("hierarchy Branch target identity does not match its candidate")
+            if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
+                raise ValueError(
+                    "hierarchy participant target identity does not match its candidate"
+                )
             if not target.assignment_url.strip():
-                raise ValueError("hierarchy Branch assignment URL must not be blank")
+                raise ValueError("hierarchy participant assignment URL must not be blank")
 
         process = FLProcess(
             process_id=str(uuid4()),
@@ -394,9 +422,9 @@ class FLServerEngine:
         process.participants = [
             FLParticipant(
                 scope=ScopeReference(
-                    scope_key=f"hierarchy:{plan_id}:{target.branch_nf_instance_id}",
-                    consumer_id=target.branch_nf_instance_id,
-                    model_ids=(model_id,),
+                    scope_key=f"hierarchy:{plan_id}:{target.participant_nf_instance_id}",
+                    consumer_id=target.participant_nf_instance_id,
+                    model_ids=(model_id,) if model_id is not None else (),
                     ml_event=ml_event,
                     ml_event_filter=dict(ml_event_filter),
                     target_ue=dict(target_ue) if target_ue is not None else None,
@@ -422,16 +450,17 @@ class FLServerEngine:
                 )
             process.state = FLServerState.PREPARATION_WAITING
             logger.info(
-                "Hierarchy preparation dispatched plan_id=%s process_id=%s branches=%s",
+                "Hierarchy preparation dispatched plan_id=%s process_id=%s participants=%s",
                 plan_id,
                 process.process_id,
-                branch_ids,
+                participant_ids,
             )
             return process
         except Exception as error:
             process.state = FLServerState.FAILED
             process.failure = str(error)
             self._cleanup_hierarchy_process(process)
+            self._experiments.detach_server(reservation_id, process.process_id)
             raise
 
     def cancel_hierarchy_preparation(self, process_id: str, reason: str) -> None:
@@ -441,10 +470,18 @@ class FLServerEngine:
             raise KeyError(process_id)
         if process.hierarchy_cleanup_complete:
             return
-        process.state = FLServerState.FAILED
-        if not process.failure:
-            process.failure = reason
+        with process.condition:
+            process.state = FLServerState.FAILED
+            if not process.failure:
+                process.failure = reason
+            process.condition.notify_all()
         self._cleanup_hierarchy_process(process)
+        active = self._experiments.for_server_process(process.process_id)
+        if active is not None:
+            self._experiments.detach_server(
+                process.experiment_reservation_id,
+                process.process_id,
+            )
 
     def receive_notification(self, notification: NwdafMLModelTrainNotif) -> None:
         with self._lock:
@@ -493,22 +530,62 @@ class FLServerEngine:
                 FLServerState.FINAL_VALIDATION_DISPATCH,
                 FLServerState.FINAL_VALIDATION_WAITING,
             }
-            if (
-                notification.status_report is not None
-                and not active_preparation
-                and participant.accepted_notification_digest != digest
-            ):
-                process.failure = "preparation callback arrived outside the expected stage"
+            if process.hierarchy_plan_id and not (active_preparation or active_round):
+                if digest in {
+                    participant.accepted_notification_digest,
+                    participant.accepted_delay_notification_digest,
+                }:
+                    return
+                raise ValueError("hierarchy callback arrived after the active stage")
+            if active_preparation:
+                if notification.round_indicator is not None:
+                    participant.preparation_failure = (
+                        "preparation callback must not include roundInd"
+                    )
+                    if not process.hierarchy_plan_id:
+                        process.failure = participant.preparation_failure
+                    participant.preparation_complete = True
+                    process.condition.notify_all()
+                    raise ValueError(participant.preparation_failure)
+                if notification.delay_event_notification is not None:
+                    if participant.accepted_delay_notification_digest == digest:
+                        return
+                    participant.accepted_delay_notification_digest = digest
+                    participant.requested_extension = (
+                        notification.delay_event_notification.expected_completion_time or 0
+                    )
+                    process.condition.notify_all()
+                    return
+                if not notification.ml_model_infos and not notification.termination_request:
+                    participant.preparation_failure = (
+                        "notification does not contain a preparation outcome"
+                    )
+                    if not process.hierarchy_plan_id:
+                        process.failure = participant.preparation_failure
+                    participant.preparation_complete = True
+                    process.condition.notify_all()
+                    raise ValueError(participant.preparation_failure)
+                if participant.preparation_notification is not None:
+                    if participant.accepted_notification_digest == digest:
+                        return
+                    participant.preparation_failure = (
+                        "conflicting duplicate preparation callback"
+                    )
+                    if not process.hierarchy_plan_id:
+                        process.failure = participant.preparation_failure
+                    participant.preparation_complete = True
+                    process.condition.notify_all()
+                    raise ValueError(participant.preparation_failure)
+                participant.preparation_notification = notification.model_copy(deep=True)
+                participant.preparation_complete = True
+                participant.accepted_notification_digest = digest
+                if notification.termination_request and not process.hierarchy_plan_id:
+                    process.failure = (
+                        "participant terminated training: "
+                        f"{notification.termination_request}"
+                    )
                 process.condition.notify_all()
-                raise ValueError(process.failure)
-            if (
-                notification.ml_model_infos
-                and not active_round
-                and participant.accepted_notification_digest != digest
-            ):
-                process.failure = "round callback arrived outside the expected stage"
-                process.condition.notify_all()
-                raise ValueError(process.failure)
+                return
             if notification.delay_event_notification is not None:
                 if participant.accepted_delay_notification_digest == digest:
                     return
@@ -520,26 +597,31 @@ class FLServerEngine:
                 participant.requested_extension = (
                     notification.delay_event_notification.expected_completion_time or 0
                 )
-            elif notification.termination_request:
+            if notification.ml_model_infos:
+                if active_round:
+                    if participant.notification is not None:
+                        if participant.accepted_notification_digest != digest:
+                            process.failure = "conflicting duplicate round callback"
+                            raise ValueError(process.failure)
+                        return
+                    participant.notification = notification.model_copy(deep=True)
+                    participant.accepted_notification_digest = digest
+                else:
+                    process.failure = "model callback arrived outside the expected stage"
+                    process.condition.notify_all()
+                    raise ValueError(process.failure)
+            if notification.termination_request:
+                if not active_round:
+                    process.failure = "termination callback arrived outside the expected stage"
+                    process.condition.notify_all()
+                    raise ValueError(process.failure)
                 process.failure = (
                     f"participant terminated training: {notification.termination_request}"
                 )
-            elif notification.status_report is not None:
-                if participant.preparation_complete:
-                    if participant.accepted_notification_digest != digest:
-                        process.failure = "conflicting duplicate preparation callback"
-                        raise ValueError(process.failure)
-                    return
-                participant.preparation_complete = True
-                participant.accepted_notification_digest = digest
-            elif notification.ml_model_infos:
-                if participant.notification is not None:
-                    if participant.accepted_notification_digest != digest:
-                        process.failure = "conflicting duplicate round callback"
-                        raise ValueError(process.failure)
-                    return
-                participant.notification = notification.model_copy(deep=True)
-                participant.accepted_notification_digest = digest
+            elif notification.delay_event_notification is None and not notification.ml_model_infos:
+                process.failure = "notification does not contain a stage outcome"
+                process.condition.notify_all()
+                raise ValueError(process.failure)
             process.condition.notify_all()
 
     def discard_restored_routes(self, subscription_ids: tuple[str, ...]) -> None:
@@ -553,6 +635,111 @@ class FLServerEngine:
     def processes(self) -> tuple[FLProcess, ...]:
         with self._lock:
             return tuple(self._processes.values())
+
+    def collect_hierarchy_preparation(
+        self,
+        process_id: str,
+    ) -> HierarchyPreparationCollection:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        deadline = time.monotonic() + self._server_settings.preparation_timeout_seconds
+        while True:
+            extension_participant: FLParticipant | None = None
+            extension_seconds = 0
+            with process.condition:
+                if self._closing.is_set():
+                    raise RuntimeError("FL Server is shutting down")
+                if process.failure:
+                    raise RuntimeError(process.failure)
+                if all(item.preparation_complete for item in process.participants):
+                    break
+                for participant in process.participants:
+                    if not participant.requested_extension:
+                        continue
+                    remaining_budget = (
+                        self._server_settings.delay_policy.max_extension_seconds
+                        - participant.granted_extension_seconds
+                    )
+                    if (
+                        participant.delay_extensions
+                        >= self._server_settings.delay_policy.max_extensions
+                        or remaining_budget <= 0
+                    ):
+                        participant.preparation_failure = (
+                            "participant delay extension budget is exhausted"
+                        )
+                        participant.preparation_complete = True
+                        participant.requested_extension = 0
+                        continue
+                    extension_participant = participant
+                    extension_seconds = min(
+                        participant.requested_extension,
+                        self._server_settings.preparation_timeout_seconds,
+                        remaining_budget,
+                    )
+                    participant.requested_extension = 0
+                    break
+                if extension_participant is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    process.condition.wait(timeout=remaining)
+                    continue
+            try:
+                self._grant_extension(extension_participant, extension_seconds)
+            except Exception as error:
+                with process.condition:
+                    extension_participant.preparation_failure = str(error)
+                    extension_participant.preparation_complete = True
+                    process.condition.notify_all()
+            else:
+                with process.condition:
+                    extension_participant.delay_extensions += 1
+                    extension_participant.granted_extension_seconds += extension_seconds
+                    deadline = max(deadline, time.monotonic() + extension_seconds)
+                    process.condition.notify_all()
+
+        with process.condition:
+            process.state = FLServerState.PREPARATION_EVALUATING
+            participants = tuple(
+                HierarchyParticipantPreparationOutcome(
+                    participant_nf_instance_id=item.candidate.target.nf_instance_id,
+                    resource_location=item.resource_location,
+                    assignment_url=str(
+                        item.preparation_notification.ml_model_infos[0]
+                        .model_file_address.model_url
+                    )
+                    if (
+                        item.preparation_notification is not None
+                        and item.preparation_notification.ml_model_infos
+                        and item.preparation_notification.ml_model_infos[0].model_file_address
+                        is not None
+                    )
+                    else "",
+                    notification=(
+                        item.preparation_notification.model_copy(deep=True)
+                        if item.preparation_notification is not None
+                        else None
+                    ),
+                    failure=item.preparation_failure,
+                    delay_extensions=item.delay_extensions,
+                    granted_extension_seconds=item.granted_extension_seconds,
+                )
+                for item in process.participants
+            )
+            timed_out = tuple(
+                item.participant_nf_instance_id
+                for item in participants
+                if item.notification is None and not item.failure
+            )
+        return HierarchyPreparationCollection(
+            process_id=process.process_id,
+            plan_id=process.hierarchy_plan_id,
+            participants=participants,
+            timed_out_participant_nf_instance_ids=timed_out,
+        )
 
     def mark_scope_adopted(
         self,
