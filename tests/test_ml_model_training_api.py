@@ -9,7 +9,7 @@ def test_training_requirements_failure_identifies_invalid_parameters(
     tmp_path,
 ):
     payload = settings.model_dump(mode="python")
-    payload["runtime"] = {"mode": "fl_client"}
+    payload["runtime"] = {"mode": "federated"}
     payload["local_training"] = None
     payload["federated_learning"] = FederatedLearningSettings(
         workspace_root=tmp_path / "fl-client",

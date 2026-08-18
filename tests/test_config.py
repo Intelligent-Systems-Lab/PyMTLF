@@ -116,14 +116,18 @@ def test_adrf_configured_endpoint_is_normalized():
     assert settings.configured_endpoint == "http://adrf.example:9888"
 
 
-@pytest.mark.parametrize("mode", ["local", "fl_server", "fl_client"])
+@pytest.mark.parametrize("mode", ["local", "federated"])
 def test_runtime_accepts_supported_modes(mode):
     assert RuntimeSettings(mode=mode.upper()).mode == mode
 
 
-def test_runtime_rejects_unknown_mode():
+@pytest.mark.parametrize(
+    "mode",
+    ["coordinator", "fl_server", "fl_client", "root", "branch", "leaf"],
+)
+def test_runtime_rejects_unknown_and_role_modes(mode):
     with pytest.raises(ValidationError, match="runtime.mode"):
-        RuntimeSettings(mode="coordinator")
+        RuntimeSettings(mode=mode)
 
 
 @pytest.mark.parametrize(
@@ -156,27 +160,46 @@ def test_federated_learning_settings_fail_fast(payload):
 
 
 @pytest.mark.parametrize(
-    ("mode", "federated_learning", "local_training"),
+    ("mode", "server", "client", "local_training", "valid"),
     [
-        ("fl_server", {}, None),
-        ("fl_client", {}, None),
-        ("local", {"server": FLServerSettings()}, {}),
-        ("fl_server", {"server": FLServerSettings(), "client": FLClientSettings()}, None),
-        ("fl_client", {"client": FLClientSettings()}, {}),
+        ("local", None, None, {}, True),
+        ("local", FLServerSettings(), None, None, False),
+        ("local", None, FLClientSettings(), None, False),
+        ("federated", None, None, None, False),
+        ("federated", FLServerSettings(), None, None, True),
+        ("federated", None, FLClientSettings(), None, True),
+        ("federated", FLServerSettings(), FLClientSettings(), None, True),
+        ("federated", FLServerSettings(), None, {}, False),
     ],
 )
-def test_runtime_rejects_missing_or_conflicting_role_settings(
+def test_runtime_engine_configuration_matrix(
     mode,
-    federated_learning,
+    server,
+    client,
     local_training,
+    valid,
 ):
-    with pytest.raises(ValidationError):
-        Settings.model_validate(
-            {
-                "runtime": {"mode": mode},
-                "federated_learning": federated_learning,
-                "local_training": local_training,
-            }
+    payload = {
+        "runtime": {"mode": mode},
+        "federated_learning": {"server": server, "client": client},
+        "local_training": local_training,
+    }
+    if valid:
+        settings = Settings.model_validate(payload)
+        assert (settings.federated_learning.server is not None) is (server is not None)
+        assert (settings.federated_learning.client is not None) is (client is not None)
+    else:
+        with pytest.raises(ValidationError):
+            Settings.model_validate(payload)
+
+
+def test_federated_server_requires_single_active_process():
+    with pytest.raises(ValidationError, match="max_active_processes"):
+        Settings(
+            runtime=RuntimeSettings(mode="federated"),
+            federated_learning=FederatedLearningSettings(
+                server=FLServerSettings(max_active_processes=2),
+            ),
         )
 
 
@@ -184,11 +207,12 @@ def test_runtime_rejects_missing_or_conflicting_role_settings(
     ("profile", "mode"),
     [
         ("local.yaml", "local"),
-        ("fl-server.yaml", "fl_server"),
-        ("fl-client.yaml", "fl_client"),
+        ("fl-server.yaml", "federated"),
+        ("fl-client.yaml", "federated"),
+        ("fl-server-client.yaml", "federated"),
     ],
 )
-def test_tracked_role_profiles_are_valid(profile, mode):
+def test_tracked_engine_profiles_are_valid(profile, mode):
     path = Path(__file__).parents[1] / "config" / profile
 
     assert load_settings(path).runtime.mode == mode

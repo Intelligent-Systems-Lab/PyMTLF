@@ -20,7 +20,7 @@ from py_mtlf.api import (
     ml_model_training,
     training_data,
 )
-from py_mtlf.config import FLClientSettings, FLServerSettings, LocalTrainingSettings, Settings
+from py_mtlf.config import Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
@@ -98,9 +98,9 @@ def create_app(
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
     adrf_resolver = AdrfResolver(settings.adrf, nwdaf_context)
     fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
-    local_training = settings.local_training or LocalTrainingSettings()
-    fl_client_settings = settings.federated_learning.client or FLClientSettings()
-    fl_server_settings = settings.federated_learning.server or FLServerSettings()
+    local_training = settings.local_training
+    fl_client_settings = settings.federated_learning.client
+    fl_server_settings = settings.federated_learning.server
 
     def resume_published_cutover(publication_record, model) -> None:
         family_key = seed_catalog.family_key_for_id(publication_record.family_id)
@@ -162,39 +162,56 @@ def create_app(
         accuracy_policy,
         adrf_resolver,
     )
-    training_coordinator = TrainingCoordinator(
-        local_training,
-        dataset_coordinator,
-        seed_catalog,
-        artifact_repository,
-        provision_store,
-        provision_notifications,
-        accuracy_policy,
+    training_coordinator = (
+        TrainingCoordinator(
+            local_training,
+            dataset_coordinator,
+            seed_catalog,
+            artifact_repository,
+            provision_store,
+            provision_notifications,
+            accuracy_policy,
+        )
+        if local_training is not None
+        else None
     )
-    fl_client_resolver = FLClientResolver(
-        settings.federated_learning,
-        nwdaf_context,
+    fl_client = (
+        FLClientService(
+            settings.federated_learning,
+            fl_client_settings,
+            settings.notification,
+            nwdaf_context,
+            dataset_coordinator,
+            fl_workspace,
+        )
+        if fl_client_settings is not None
+        else None
     )
-    fl_client = FLClientService(
-        settings.federated_learning,
-        fl_client_settings,
-        settings.notification,
-        nwdaf_context,
-        dataset_coordinator,
-        fl_workspace,
+    fl_client_resolver = (
+        FLClientResolver(
+            settings.federated_learning,
+            nwdaf_context,
+        )
+        if fl_server_settings is not None
+        else None
     )
-    fl_server = FLServerOrchestrator(
-        settings.federated_learning,
-        fl_server_settings,
-        nwdaf_context,
-        accuracy_policy,
-        seed_catalog,
-        fl_workspace,
-        fl_client_resolver,
-        publication=publication,
-        provision_notifications=provision_notifications,
+    fl_server = (
+        FLServerOrchestrator(
+            settings.federated_learning,
+            fl_server_settings,
+            nwdaf_context,
+            accuracy_policy,
+            seed_catalog,
+            fl_workspace,
+            fl_client_resolver,
+            publication=publication,
+            provision_notifications=provision_notifications,
+        )
+        if fl_server_settings is not None and fl_client_resolver is not None
+        else None
     )
-    fl_server_holder["server"] = fl_server
+    if fl_server is not None:
+        fl_server_holder["server"] = fl_server
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -208,25 +225,27 @@ def create_app(
             durable_state = model_state.open(_initial_model_state(seed_catalog))
             seed_catalog.restore(durable_state)
             publication.open()
-            if settings.runtime.mode in {"local", "fl_server"}:
+            if settings.runtime.mode == "local" or fl_server is not None:
                 provision_notifications.open()
                 monitor_reconciler.open()
-            if settings.runtime.mode == "local":
+            if training_coordinator is not None:
                 training_coordinator.open()
             runtime.artifact_status = "ready"
             runtime.accepting_requests = True
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
-            if settings.runtime.mode == "local":
+            if training_coordinator is not None:
                 training_coordinator.shutdown()
-            fl_client.close()
+            if fl_client is not None:
+                fl_client.close()
+            if fl_server is not None:
+                fl_server.close()
             publication.close()
-            fl_server.close()
             fl_workspace.close()
             dataset_coordinator.shutdown()
             adrf_resolver.close()
-            if settings.runtime.mode in {"local", "fl_server"}:
+            if settings.runtime.mode == "local" or fl_server is not None:
                 monitor_reconciler.shutdown()
                 provision_notifications.shutdown()
             nwdaf_monitor_resolver.close()
@@ -261,10 +280,10 @@ def create_app(
     app.include_router(artifacts.router)
     app.include_router(training_data.router)
     app.include_router(adrf.router)
-    if settings.runtime.mode in {"local", "fl_server"}:
+    if settings.runtime.mode == "local" or fl_server is not None:
         app.include_router(ml_model_provision.router)
         app.include_router(ml_model_monitor.router)
-    if settings.runtime.mode in {"fl_client", "fl_server"}:
+    if fl_client is not None or fl_server is not None:
         app.include_router(ml_model_training.router)
 
     @app.exception_handler(RequestValidationError)

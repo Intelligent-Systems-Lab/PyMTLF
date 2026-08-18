@@ -7,9 +7,8 @@ server:
   port: 9092
 
 runtime:
-  # Allowed values: "local", "fl_server", or "fl_client".
-  # This profile intentionally selects the FL Server role.
-  mode: "fl_server"
+  # Federated engine presence is selected by the server/client sections below.
+  mode: "federated"
 
 containing_nwdaf:
   internal_api_root: "http://127.0.0.1:8091"

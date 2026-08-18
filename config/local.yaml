@@ -8,7 +8,7 @@ server:
 
 # Standalone MTLF runtime with bounded local retraining.
 runtime:
-  # Allowed values: "local", "fl_server", or "fl_client".
+  # Allowed values: "local" or "federated".
   # This profile intentionally selects the local role.
   mode: "local"
 

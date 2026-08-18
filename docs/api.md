@@ -14,16 +14,20 @@ The implementation is authoritative:
 
 FastAPI exposes `/docs`, `/redoc`, and `/openapi.json` while running.
 
-Route availability depends on `runtime.mode`:
+Route availability depends on `runtime.mode` and the enabled federated engine
+sections:
 
-| Mode | Provision/Monitor routes | Local trainer | Training routes |
-| --- | --- | --- | --- |
-| `local` | yes | yes | no |
-| `fl_server` | yes | no | yes; also coordinates peer clients |
-| `fl_client` | no | no | yes |
+| Mode | Enabled engines | Provision/Monitor routes | Local trainer | Training handler availability |
+| --- | --- | --- | --- | --- |
+| `local` | none | yes | yes | none |
+| `federated` | Server | yes | no | notification ingress only |
+| `federated` | Client | no | no | subscription CRUD only |
+| `federated` | Server + Client | yes | no | notification ingress and subscription CRUD |
 
 Readiness, artifact, incremental training-data descriptor, and ADRF callback
-routes remain available in all three modes.
+routes remain available in both modes. The shared Model Training router is
+mounted when either FL engine is enabled; each handler returns service
+unavailable when its required engine is disabled.
 
 ## Endpoint Summary
 

@@ -34,7 +34,7 @@ def create_training_subscription(
     payload: NwdafMLModelTrainSubsc,
     request: Request,
 ) -> Response:
-    if request.app.state.runtime.mode != "fl_client":
+    if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
     try:
         resource = request.app.state.fl_client.create(payload)
@@ -76,7 +76,7 @@ def replace_training_subscription(
     payload: NwdafMLModelTrainSubsc,
     request: Request,
 ) -> Response:
-    if request.app.state.runtime.mode != "fl_client":
+    if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
     try:
         resource = request.app.state.fl_client.replace(subscription_id, payload)
@@ -107,7 +107,7 @@ def patch_training_subscription(
     payload: NwdafMLModelTrainSubscPatch,
     request: Request,
 ) -> Response:
-    if request.app.state.runtime.mode != "fl_client":
+    if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
     try:
         resource = request.app.state.fl_client.patch(subscription_id, payload)
@@ -137,7 +137,7 @@ def patch_training_subscription(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 def delete_training_subscription(subscription_id: str, request: Request) -> Response:
-    if request.app.state.runtime.mode != "fl_client":
+    if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
     try:
         request.app.state.fl_client.delete(subscription_id)
@@ -158,7 +158,7 @@ def receive_training_notification(
     payload: NwdafMLModelTrainNotif,
     request: Request,
 ) -> Response:
-    if request.app.state.runtime.mode != "fl_server":
+    if request.app.state.fl_server is None:
         return _role_unavailable("FL Server")
     try:
         request.app.state.fl_server.receive_notification(payload)

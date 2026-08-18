@@ -81,8 +81,8 @@ class RuntimeSettings(FrozenSettings):
     @classmethod
     def validate_mode(cls, value: str) -> str:
         value = value.strip().lower()
-        if value not in {"local", "fl_server", "fl_client"}:
-            raise ValueError("runtime.mode must be 'local', 'fl_server', or 'fl_client'")
+        if value not in {"local", "federated"}:
+            raise ValueError("runtime.mode must be 'local' or 'federated'")
         return value
 
 
@@ -479,19 +479,19 @@ class Settings(FrozenSettings):
                 raise ValueError("local mode must not configure FL server or client settings")
             if self.local_training is None:
                 object.__setattr__(self, "local_training", LocalTrainingSettings())
-        elif mode == "fl_server":
-            if self.federated_learning.server is None:
-                raise ValueError("fl_server mode requires federated_learning.server")
-            if self.federated_learning.client is not None or self.local_training is not None:
+        elif mode == "federated":
+            server = self.federated_learning.server
+            client = self.federated_learning.client
+            if server is None and client is None:
                 raise ValueError(
-                    "fl_server mode must not configure client or local training settings"
+                    "federated mode requires federated_learning.server or "
+                    "federated_learning.client"
                 )
-        elif mode == "fl_client":
-            if self.federated_learning.client is None:
-                raise ValueError("fl_client mode requires federated_learning.client")
-            if self.federated_learning.server is not None or self.local_training is not None:
+            if self.local_training is not None:
+                raise ValueError("federated mode must not configure local training settings")
+            if server is not None and server.max_active_processes != 1:
                 raise ValueError(
-                    "fl_client mode must not configure server or local training settings"
+                    "federated_learning.server.max_active_processes must be 1"
                 )
         return self
 

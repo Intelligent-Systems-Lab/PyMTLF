@@ -1,0 +1,69 @@
+# Combined FL Server and Client engine profile. The containing NWDAF advertises
+# FL_SERVER_AND_CLIENT; hierarchy role is assigned later by the Root process.
+server:
+  binding_host: "127.0.0.1"
+  port: 9092
+
+runtime:
+  mode: "federated"
+
+containing_nwdaf:
+  internal_api_root: "http://127.0.0.1:8091"
+  request_timeout_seconds: 30
+
+storage:
+  artifact_root: "data/artifacts"
+model_state:
+  directory: "data/model-state"
+publication:
+  directory: "data/publications"
+
+artifact:
+  public_base_url: "http://127.0.0.1:9092"
+
+federated_learning:
+  workspace_root: "data/fl-workspaces"
+  workspace_ttl_seconds: 3600
+  public_base_url: "http://127.0.0.1:9092"
+  request_timeout_seconds: 300
+  artifact_download:
+    allowed_origins:
+      - "http://127.0.0.1:9091"
+      - "http://127.0.0.1:9093"
+    timeout_seconds: 300
+  server:
+    callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
+    preparation_timeout_seconds: 300
+    preparation_data_window_seconds: 3600
+    round_timeout_seconds: 300
+    round_count: 2
+    # Hierarchical FL V1 admits one top-level experiment per PyMTLF process.
+    max_active_processes: 1
+  client:
+    callback_deadline_margin_seconds: 5
+    callback_queue_size: 256
+    max_concurrent_jobs: 2
+    model_interoperability_ids:
+      - "001122"
+    fallback_deadlines:
+      preparation_timeout_seconds: 300
+      round_timeout_seconds: 300
+    training:
+      device: "cpu"
+      batch_size: 32
+      learning_rate: 0.001
+      epochs: 18
+      validation_ratio: 0.10
+      random_seed: 42
+
+notification:
+  request_timeout_seconds: 5
+  max_attempts: 3
+  initial_backoff_seconds: 0.2
+  max_backoff_seconds: 2
+
+adrf:
+  mode: "nrf"
+
+log:
+  level: "INFO"

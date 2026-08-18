@@ -53,7 +53,8 @@ The default listener is `127.0.0.1:9092`. Runtime state is stored below
 `seed_models/`; PyAnLF is only a provisioned artifact consumer and does not
 provide the initial model source.
 
-Choose one annotated profile rather than combining unrelated role settings:
+Choose the annotated profile whose engine sections match the containing NWDAF's
+advertised FL capability:
 
 - `config/local.yaml` keeps the single-NWDAF provision, monitor, dataset, and
   bounded local-training lifecycle. Its fitting and validation settings are
@@ -64,10 +65,15 @@ Choose one annotated profile rather than combining unrelated role settings:
 - `config/fl-client.yaml` owns ADRF dataset preparation, local round fitting,
   final validation work, and outbound callbacks. Client-only controls are under
   `federated_learning.client`.
+- `config/fl-server-client.yaml` enables both engines in one standard PyMTLF
+  process. Hierarchy role is assigned by the Root at runtime; it is not a
+  configuration mode.
 
-The loader rejects unknown keys and incompatible role branches. For example,
-`fl_server` requires `federated_learning.server` and rejects client or local
-training settings. Every role validates that
+The loader accepts only `local` and `federated` runtime modes. Federated mode
+requires at least one `federated_learning.server` or
+`federated_learning.client` section, permits both, and rejects local-training
+settings. The first federated Server implementation requires
+`max_active_processes: 1`. Every profile validates that
 `federated_learning.workspace_root` is writable at startup, and readiness
 includes `runtimeMode`.
 
