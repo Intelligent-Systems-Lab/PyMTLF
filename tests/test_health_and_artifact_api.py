@@ -1,3 +1,4 @@
+import hashlib
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -65,6 +66,34 @@ def test_unknown_and_malformed_artifact_keys_are_not_found(settings):
     assert unknown.json()["code"] == "ARTIFACT_NOT_FOUND"
     assert malformed.status_code == 404
     assert malformed.json()["code"] == "ARTIFACT_NOT_FOUND"
+
+
+def test_hierarchy_fl_artifact_uses_existing_serving_route(settings, bundle_path):
+    content = bundle_path.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    process_id = "11111111-1111-4111-8111-111111111111"
+    participant_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    role = "HIERARCHY_ASSIGNMENT"
+    path = (
+        settings.federated_learning.workspace_root
+        / process_id
+        / participant_id
+        / "0"
+        / role
+        / f"{digest}.tar.gz"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            f"/internal/v1/fl-artifacts/{process_id}/{participant_id}/0/{role}/{digest}"
+        )
+
+    assert response.status_code == 200
+    assert response.content == content
+    assert response.headers["x-artifact-sha256"] == digest
+    assert response.headers["etag"] == f'"sha256:{digest}"'
 
 
 def test_contract_only_routes_are_not_registered(settings):

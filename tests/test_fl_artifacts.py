@@ -5,9 +5,12 @@ from pydantic import ValidationError
 
 from py_mtlf.core.fl_artifacts import (
     FinalModelArtifact,
+    HierarchyAssignmentArtifact,
+    HierarchyPreparationResultArtifact,
     TensorStateEntry,
     WapeComponents,
     validate_fl_artifact,
+    validate_fl_artifact_manifest,
     validate_tensor_compatibility,
     wape,
 )
@@ -17,6 +20,9 @@ DIGEST_B = "b" * 64
 DIGEST_C = "c" * 64
 CLIENT_A = "00000000-0000-4000-8000-000000000001"
 CLIENT_B = "00000000-0000-4000-8000-000000000002"
+ROOT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+BRANCH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+PLAN = "11111111-1111-4111-8111-111111111111"
 FILE_DIGESTS = {
     "model.py": DIGEST_A,
     "model.npy": DIGEST_C,
@@ -32,6 +38,15 @@ def common_metadata() -> dict[str, object]:
         "preprocessing_contract_digest": DIGEST_B,
         "base_weights_digest": DIGEST_A,
         "weights_digest": DIGEST_C,
+    }
+
+
+def hierarchy_strategy() -> dict[str, object]:
+    return {
+        "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+        "participant_selection": "all",
+        "waiting_policy": "all",
+        "aggregation": "sample_weighted",
     }
 
 
@@ -291,6 +306,112 @@ def test_unknown_artifact_schema_and_incomplete_digest_inventory_fail() -> None:
                 "file_digests": {"model.npy": DIGEST_C},
             }
         )
+
+
+def test_hierarchy_assignment_artifact_uses_nested_message_discriminator() -> None:
+    base = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "HIERARCHY_ASSIGNMENT",
+        "file_digests": FILE_DIGESTS,
+    }
+    branch = validate_fl_artifact(
+        {
+            **base,
+            "hierarchy_metadata": {
+                "contract_version": "1.0",
+                "message_type": "BRANCH_ASSIGNMENT",
+                "plan_id": PLAN,
+                "publisher_nf_instance_id": ROOT,
+                "intended_recipient_nf_instance_id": BRANCH,
+                "assigned_leaf_nf_instance_ids": [CLIENT_A, CLIENT_B],
+                "admission": {"mode": "complete_required"},
+                "strategy": hierarchy_strategy(),
+            },
+        }
+    )
+    assert isinstance(branch, HierarchyAssignmentArtifact)
+    assert branch.hierarchy_metadata.message_type == "BRANCH_ASSIGNMENT"
+
+    leaf = validate_fl_artifact(
+        {
+            **base,
+            "hierarchy_metadata": {
+                "contract_version": "1.0",
+                "message_type": "LEAF_ASSIGNMENT",
+                "plan_id": PLAN,
+                "publisher_nf_instance_id": BRANCH,
+                "intended_recipient_nf_instance_id": CLIENT_A,
+                "parent_branch_nf_instance_id": BRANCH,
+                "strategy": hierarchy_strategy(),
+            },
+        }
+    )
+    assert isinstance(leaf, HierarchyAssignmentArtifact)
+    assert leaf.hierarchy_metadata.message_type == "LEAF_ASSIGNMENT"
+
+
+def test_hierarchy_result_role_requires_result_metadata() -> None:
+    result = validate_fl_artifact(
+        {
+            "bundle_schema_version": "1.0",
+            "artifact_role": "HIERARCHY_PREPARATION_RESULT",
+            "file_digests": FILE_DIGESTS,
+            "hierarchy_metadata": {
+                "contract_version": "1.0",
+                "message_type": "PREPARATION_RESULT",
+                "plan_id": PLAN,
+                "publisher_nf_instance_id": BRANCH,
+                "intended_recipient_nf_instance_id": ROOT,
+                "outcome": "READY",
+                "assigned_client_nf_instance_ids": [CLIENT_A, CLIENT_B],
+                "prepared_clients": [
+                    {"nf_instance_id": CLIENT_A},
+                    {"nf_instance_id": CLIENT_B},
+                ],
+                "failed_clients": [],
+                "timed_out_client_nf_instance_ids": [],
+            },
+        }
+    )
+    assert isinstance(result, HierarchyPreparationResultArtifact)
+
+    with pytest.raises(ValidationError):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "HIERARCHY_PREPARATION_RESULT",
+                "file_digests": FILE_DIGESTS,
+                "hierarchy_metadata": {
+                    "contract_version": "1.0",
+                    "message_type": "LEAF_ASSIGNMENT",
+                    "plan_id": PLAN,
+                    "publisher_nf_instance_id": BRANCH,
+                    "intended_recipient_nf_instance_id": CLIENT_A,
+                    "parent_branch_nf_instance_id": BRANCH,
+                    "strategy": hierarchy_strategy(),
+                },
+            }
+        )
+
+
+def test_complete_manifest_projection_rejects_incompatible_role_fields() -> None:
+    manifest = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "HIERARCHY_ASSIGNMENT",
+        "file_digests": FILE_DIGESTS,
+        "fl_metadata": {},
+        "hierarchy_metadata": {
+            "contract_version": "1.0",
+            "message_type": "LEAF_ASSIGNMENT",
+            "plan_id": PLAN,
+            "publisher_nf_instance_id": BRANCH,
+            "intended_recipient_nf_instance_id": CLIENT_A,
+            "parent_branch_nf_instance_id": BRANCH,
+            "strategy": hierarchy_strategy(),
+        },
+    }
+    with pytest.raises(ValueError, match="incompatible fields"):
+        validate_fl_artifact_manifest(manifest)
 
 
 def test_tensor_compatibility_allows_float_updates_but_rejects_non_float_changes() -> None:

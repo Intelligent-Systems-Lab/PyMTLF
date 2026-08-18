@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
@@ -14,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from py_mtlf.core.fl_hierarchy import AssignmentMetadata, PreparationResultMetadata
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
 
 Sha256 = Annotated[str, Field(pattern=SHA256_PATTERN.pattern)]
@@ -27,6 +29,8 @@ class ArtifactRole(StrEnum):
     ROUND_LOCAL = "ROUND_LOCAL"
     ROUND_GLOBAL = "ROUND_GLOBAL"
     FINAL_MODEL = "FINAL_MODEL"
+    HIERARCHY_ASSIGNMENT = "HIERARCHY_ASSIGNMENT"
+    HIERARCHY_PREPARATION_RESULT = "HIERARCHY_PREPARATION_RESULT"
 
 
 class RoundLocalResultType(StrEnum):
@@ -236,8 +240,22 @@ class FinalModelArtifact(ArtifactContractBase):
     fl_metadata: FinalModelMetadata
 
 
+class HierarchyAssignmentArtifact(ArtifactContractBase):
+    artifact_role: Literal[ArtifactRole.HIERARCHY_ASSIGNMENT]
+    hierarchy_metadata: AssignmentMetadata
+
+
+class HierarchyPreparationResultArtifact(ArtifactContractBase):
+    artifact_role: Literal[ArtifactRole.HIERARCHY_PREPARATION_RESULT]
+    hierarchy_metadata: PreparationResultMetadata
+
+
 FLArtifactContract = Annotated[
-    RoundLocalArtifact | RoundGlobalArtifact | FinalModelArtifact,
+    RoundLocalArtifact
+    | RoundGlobalArtifact
+    | FinalModelArtifact
+    | HierarchyAssignmentArtifact
+    | HierarchyPreparationResultArtifact,
     Field(discriminator="artifact_role"),
 ]
 
@@ -248,6 +266,45 @@ def validate_fl_artifact(value: object) -> FLArtifactContract:
     """Validate a role-aware training artifact projection without publishing it."""
 
     return _ARTIFACT_ADAPTER.validate_python(value)
+
+
+def fl_artifact_projection(manifest: Mapping[str, object]) -> dict[str, object]:
+    """Extract one strict role-specific projection from a complete model manifest."""
+
+    try:
+        role = ArtifactRole(manifest["artifact_role"])
+    except (KeyError, ValueError) as error:
+        raise ValueError("FL artifact role is missing or unsupported") from error
+
+    base_fields = {"bundle_schema_version", "file_digests", "artifact_role"}
+    role_fields = {
+        ArtifactRole.ROUND_LOCAL: {"result_type", "fl_metadata"},
+        ArtifactRole.ROUND_GLOBAL: {"fl_metadata"},
+        ArtifactRole.FINAL_MODEL: {"model_identity", "fl_metadata"},
+        ArtifactRole.HIERARCHY_ASSIGNMENT: {"hierarchy_metadata"},
+        ArtifactRole.HIERARCHY_PREPARATION_RESULT: {"hierarchy_metadata"},
+    }[role]
+    known_role_fields = {
+        "result_type",
+        "fl_metadata",
+        "model_identity",
+        "hierarchy_metadata",
+    }
+    unexpected = sorted((known_role_fields - role_fields).intersection(manifest))
+    if unexpected:
+        raise ValueError(f"FL artifact role contains incompatible fields: {unexpected}")
+
+    required = base_fields | role_fields
+    missing = sorted(required - manifest.keys())
+    if missing:
+        raise ValueError(f"FL artifact role is missing required fields: {missing}")
+    return {key: manifest[key] for key in required}
+
+
+def validate_fl_artifact_manifest(manifest: Mapping[str, object]) -> FLArtifactContract:
+    """Validate the role-aware projection contained in a complete model manifest."""
+
+    return validate_fl_artifact(fl_artifact_projection(manifest))
 
 
 def wape(components: WapeComponents) -> float | None:

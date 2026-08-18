@@ -7,6 +7,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -17,9 +18,40 @@ import torch
 
 from py_mtlf.config import ArtifactSettings, FederatedLearningSettings
 from py_mtlf.core.artifacts import REQUIRED_BUNDLE_FILES, ArtifactMetadata
-from py_mtlf.core.fl_artifacts import validate_fl_artifact
+from py_mtlf.core.fl_artifacts import (
+    ArtifactRole,
+    FLArtifactContract,
+    HierarchyAssignmentArtifact,
+    HierarchyPreparationResultArtifact,
+    validate_fl_artifact_manifest,
+)
+from py_mtlf.core.fl_hierarchy import (
+    HierarchyMessageType,
+    normalize_nf_instance_id,
+    normalize_plan_id,
+)
 from py_mtlf.core.trainer import LoadedBundle
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
+
+
+class FLWorkspaceError(RuntimeError):
+    pass
+
+
+class FLArtifactUnavailableError(FLWorkspaceError):
+    pass
+
+
+class FLArtifactIntegrityError(FLWorkspaceError):
+    pass
+
+
+class FLArtifactContractError(FLWorkspaceError):
+    pass
+
+
+class FLArtifactIdentityError(FLWorkspaceError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -31,6 +63,21 @@ class FLWorkspaceArtifact:
     digest: str
     path: Path
     url: str
+    manifest: dict[str, object]
+    contract: FLArtifactContract
+
+
+@dataclass(frozen=True)
+class ValidatedArchive:
+    manifest: dict[str, object]
+    contract: FLArtifactContract | None
+
+
+@dataclass(frozen=True)
+class ValidatedHierarchyArtifact:
+    metadata: ArtifactMetadata
+    manifest: dict[str, object]
+    contract: HierarchyAssignmentArtifact | HierarchyPreparationResultArtifact
 
 
 class FLWorkspace:
@@ -60,6 +107,14 @@ class FLWorkspace:
     def cleanup_expired(self) -> None:
         cutoff = time.time() - self._settings.workspace_ttl_seconds
         for child in self._root.iterdir() if self._root.exists() else ():
+            if child.name == ".staging":
+                for staged in child.iterdir() if child.is_dir() else ():
+                    if staged.stat().st_mtime < cutoff:
+                        if staged.is_dir():
+                            shutil.rmtree(staged, ignore_errors=True)
+                        else:
+                            staged.unlink(missing_ok=True)
+                continue
             if child.is_dir() and child.stat().st_mtime < cutoff:
                 shutil.rmtree(child, ignore_errors=True)
 
@@ -98,7 +153,140 @@ class FLWorkspace:
             url=url,
         )
 
-    def _validate_archive(self, path: Path) -> None:
+    def download_hierarchy(
+        self,
+        url: str,
+        *,
+        expected_role: ArtifactRole,
+        expected_message_type: HierarchyMessageType,
+        expected_publisher_nf_instance_id: str,
+        intended_recipient_nf_instance_id: str,
+        expected_plan_id: str | None = None,
+    ) -> ValidatedHierarchyArtifact:
+        if expected_role not in {
+            ArtifactRole.HIERARCHY_ASSIGNMENT,
+            ArtifactRole.HIERARCHY_PREPARATION_RESULT,
+        }:
+            raise ValueError("hierarchy download requires a hierarchy artifact role")
+        expected_publisher = normalize_nf_instance_id(expected_publisher_nf_instance_id)
+        intended_recipient = normalize_nf_instance_id(intended_recipient_nf_instance_id)
+        normalized_plan_id = normalize_plan_id(expected_plan_id) if expected_plan_id else None
+
+        allowed = set(self._settings.artifact_download.allowed_origins)
+        try:
+            origin = _origin(url)
+            expected_digest = _artifact_url_digest(url)
+        except RuntimeError as error:
+            raise FLArtifactIntegrityError(str(error)) from error
+        if allowed and origin not in allowed:
+            raise FLArtifactIdentityError("FL artifact origin is not allowed")
+        staging = self._root / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".hierarchy-download-",
+            suffix=".tar.gz",
+            dir=staging,
+        )
+        os.close(file_descriptor)
+        temporary = Path(temporary_name)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self._client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise FLArtifactUnavailableError(
+                        f"FL artifact download failed with {response.status_code}"
+                    )
+                digest_headers = response.headers.get_list("X-Artifact-SHA256")
+                if len(digest_headers) != 1 or not SHA256_PATTERN.fullmatch(digest_headers[0]):
+                    raise FLArtifactIntegrityError(
+                        "FL artifact digest response header is invalid"
+                    )
+                response_digest = digest_headers[0]
+                if response_digest != expected_digest:
+                    raise FLArtifactIntegrityError(
+                        "FL artifact URL and response digest do not match"
+                    )
+                with temporary.open("wb") as output:
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > self._artifact_settings.max_compressed_bytes:
+                            raise FLArtifactIntegrityError(
+                                "FL artifact download exceeds the configured limit"
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+            if size == 0:
+                raise FLArtifactIntegrityError("FL artifact download is empty")
+            if digest.hexdigest() != expected_digest:
+                raise FLArtifactIntegrityError(
+                    "FL artifact downloaded archive digest does not match"
+                )
+
+            validated = self._validate_archive(temporary)
+            contract = validated.contract
+            if not isinstance(
+                contract,
+                (HierarchyAssignmentArtifact, HierarchyPreparationResultArtifact),
+            ):
+                raise FLArtifactContractError("FL artifact is not a hierarchy artifact")
+            metadata = contract.hierarchy_metadata
+            if contract.artifact_role is not expected_role:
+                raise FLArtifactContractError(
+                    "FL hierarchy artifact role does not match expectation"
+                )
+            if metadata.message_type is not expected_message_type:
+                raise FLArtifactContractError(
+                    "FL hierarchy message type does not match expectation"
+                )
+            if metadata.publisher_nf_instance_id != expected_publisher:
+                raise FLArtifactIdentityError(
+                    "FL hierarchy publisher does not match expected peer"
+                )
+            if metadata.intended_recipient_nf_instance_id != intended_recipient:
+                raise FLArtifactIdentityError(
+                    "FL hierarchy artifact has the wrong intended recipient"
+                )
+            if normalized_plan_id is not None and metadata.plan_id != normalized_plan_id:
+                raise FLArtifactIdentityError(
+                    "FL hierarchy plan ID does not match expectation"
+                )
+
+            directory = self._root / metadata.plan_id / "downloads"
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / f"{expected_digest}.tar.gz"
+            if destination.exists():
+                if _hash_file(destination) != expected_digest:
+                    raise FLArtifactIntegrityError(
+                        "existing FL hierarchy download conflicts with digest"
+                    )
+            else:
+                os.replace(temporary, destination)
+            artifact_metadata = ArtifactMetadata(
+                key=expected_digest,
+                size_bytes=size,
+                path=destination,
+                url=url,
+            )
+            return ValidatedHierarchyArtifact(
+                metadata=artifact_metadata,
+                manifest=validated.manifest,
+                contract=contract,
+            )
+        except httpx.HTTPError as error:
+            raise FLArtifactUnavailableError("FL artifact transport failed") from error
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def release_plan(self, plan_id: str) -> None:
+        normalized = normalize_plan_id(plan_id)
+        directory = self._root / normalized
+        if directory.is_file():
+            raise FLWorkspaceError("FL plan workspace path is not a directory")
+        with suppress(FileNotFoundError):
+            shutil.rmtree(directory)
+
+    def _validate_archive(self, path: Path) -> ValidatedArchive:
         extracted = 0
         names = set()
         manifest_bytes: bytes | None = None
@@ -147,24 +335,12 @@ class FLWorkspace:
                 ModelIdentity.model_validate(manifest["model_identity"])
             except (KeyError, ValueError) as error:
                 raise RuntimeError("completed FL input model identity is invalid") from error
-            return
+            return ValidatedArchive(manifest=manifest, contract=None)
         try:
-            projection = {
-                key: manifest[key]
-                for key in (
-                    "bundle_schema_version",
-                    "file_digests",
-                    "artifact_role",
-                    "fl_metadata",
-                )
-            }
-            if "result_type" in manifest:
-                projection["result_type"] = manifest["result_type"]
-            if "model_identity" in manifest:
-                projection["model_identity"] = manifest["model_identity"]
-            validate_fl_artifact(projection)
-        except (KeyError, ValueError) as error:
+            contract = validate_fl_artifact_manifest(manifest)
+        except ValueError as error:
             raise RuntimeError("FL artifact role contract is invalid") from error
+        return ValidatedArchive(manifest=manifest, contract=contract)
 
     def publish(
         self,
@@ -198,26 +374,20 @@ class FLWorkspace:
                 name: (temp / name).read_bytes() for name in ("model.py", "model.npy", "scaler.pkl")
             }
             manifest = dict(base.manifest)
-            manifest.pop("model_identity", None)
+            for key in (
+                "artifact_role",
+                "fl_metadata",
+                "hierarchy_metadata",
+                "model_identity",
+                "result_type",
+            ):
+                manifest.pop(key, None)
             manifest.update(metadata)
             manifest["bundle_schema_version"] = "1.0"
             manifest["file_digests"] = {
                 name: hashlib.sha256(content).hexdigest() for name, content in components.items()
             }
-            projection = {
-                key: manifest[key]
-                for key in (
-                    "bundle_schema_version",
-                    "file_digests",
-                    "artifact_role",
-                    "fl_metadata",
-                )
-            }
-            if "result_type" in manifest:
-                projection["result_type"] = manifest["result_type"]
-            if "model_identity" in manifest:
-                projection["model_identity"] = manifest["model_identity"]
-            validate_fl_artifact(projection)
+            contract = validate_fl_artifact_manifest(manifest)
             files = {
                 "config.json": json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
                 **components,
@@ -234,7 +404,15 @@ class FLWorkspace:
             f"{quote(_safe(participant_id))}/{round_indicator}/{quote(_safe(role))}/{digest}"
         )
         return FLWorkspaceArtifact(
-            process_id, participant_id, round_indicator, role, digest, destination, url
+            process_id=process_id,
+            participant_id=participant_id,
+            round_indicator=round_indicator,
+            role=role,
+            digest=digest,
+            path=destination,
+            url=url,
+            manifest=manifest,
+            contract=contract,
         )
 
     def resolve(
@@ -318,6 +496,18 @@ def _origin(url: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}{port}"
 
 
+def _artifact_url_digest(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    if parsed.query or parsed.fragment:
+        raise RuntimeError("FL artifact URL contains unsupported components")
+    digest = parsed.path.rsplit("/", 1)[-1]
+    if not SHA256_PATTERN.fullmatch(digest):
+        raise RuntimeError("FL artifact URL has an invalid digest")
+    return digest
+
+
 def _safe(value: str) -> str:
     value = value.strip()
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -330,6 +520,14 @@ def _digest_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validated_manifest(
