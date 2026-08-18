@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from datetime import datetime
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ from nwdaf_context import context_client
 
 from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
+from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
     FLClientResolver,
@@ -167,6 +169,120 @@ def test_fl_client_discovery_requests_training_capability_for_scope_tai():
         ),
     )
     client.close()
+
+
+def test_server_process_reserves_shared_slot_until_cleanup_finishes(tmp_path):
+    registry = FLExperimentRegistry()
+    policy = Mock()
+    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
+    policy.take_intents.return_value = (intent,)
+    catalog = Mock()
+    catalog_entered = threading.Event()
+    catalog_release = threading.Event()
+
+    def current(_family_key):
+        catalog_entered.set()
+        assert catalog_release.wait(timeout=2)
+        return None
+
+    catalog.current.side_effect = current
+    orchestrator = FLServerOrchestrator(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        policy,
+        catalog,
+        Mock(),
+        Mock(),
+        client=Mock(),
+        experiments=registry,
+    )
+
+    try:
+        orchestrator.accept_policy_intents()
+        assert catalog_entered.wait(timeout=2)
+        process = orchestrator.processes()[0]
+        active = registry.active()
+        assert active is not None
+        assert active.server_process_id == process.process_id
+
+        catalog_release.set()
+        orchestrator.close()
+
+        assert process.state is FLServerState.FAILED
+        assert registry.active() is None
+        policy.complete_retrain.assert_called_once_with(intent.family_key)
+    finally:
+        catalog_release.set()
+        if not orchestrator._closing.is_set():
+            orchestrator.close()
+
+
+def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
+    registry = FLExperimentRegistry()
+    registry.reserve_client("subscription-a", "correlation-a")
+    policy = Mock()
+    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
+    policy.take_intents.return_value = (intent,)
+    orchestrator = FLServerOrchestrator(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        policy,
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+        experiments=registry,
+    )
+
+    try:
+        orchestrator.accept_policy_intents()
+
+        process = orchestrator.processes()[0]
+        assert process.state is FLServerState.FAILED
+        assert "top-level experiment" in process.failure
+        assert registry.active().upper_client_subscription_ids == frozenset(
+            {"subscription-a"}
+        )
+        policy.complete_retrain.assert_called_once_with(intent.family_key)
+    finally:
+        orchestrator.close()
+
+
+def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_path):
+    registry = FLExperimentRegistry()
+    policy = Mock()
+    publication = Mock()
+    publication.mark_scope_adopted.return_value = True
+    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
+    process = FLProcess(process_id="process-1", intent=intent)
+    process.state = FLServerState.CUTOVER_PENDING
+    process.published_model_id = 7
+    reservation = registry.reserve_server(process.process_id)
+    process.experiment_reservation_id = reservation.reservation_id
+    orchestrator = FLServerOrchestrator(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        policy,
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+        publication=publication,
+        experiments=registry,
+    )
+    orchestrator._processes[process.process_id] = process
+
+    try:
+        assert registry.active() is not None
+        assert orchestrator.mark_scope_adopted(intent.family_key, 7, "scope-a") is True
+        assert process.state is FLServerState.COMPLETE
+        assert registry.active() is None
+        policy.complete_retrain.assert_called_once_with(intent.family_key)
+    finally:
+        orchestrator.close()
 
 
 def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_path):

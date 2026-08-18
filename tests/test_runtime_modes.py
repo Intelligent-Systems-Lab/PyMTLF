@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from nwdaf_context import verified_capability_checker
@@ -12,6 +13,7 @@ from py_mtlf.config import (
     FLServerSettings,
 )
 from py_mtlf.core.accuracy_policy import PolicyDecision
+from py_mtlf.core.fl_experiment import ExperimentRole
 
 
 def with_engines(
@@ -108,6 +110,8 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
         assert app.state.fl_server is not None
         assert app.state.fl_client is not None
+        assert app.state.fl_client._experiments is app.state.fl_experiments
+        assert app.state.fl_server._experiments is app.state.fl_experiments
         assert app.state.training_coordinator is None
         paths = app.openapi()["paths"]
         assert "/internal/v1/ml-model-provision/subscriptions" in paths
@@ -128,11 +132,61 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
     assert app.state.fl_client._closing.is_set()
 
 
-def test_server_engine_stops_before_publication_dependency(settings, tmp_path):
+def test_combined_profile_exposes_upper_client_lower_server_pairing_seam(
+    settings, tmp_path
+):
+    app = create_app(
+        with_engines(settings, tmp_path / "combined", server=True, client=True),
+        capability_checker=verified_capability_checker(server=True, client=True),
+    )
+    with TestClient(app):
+        reservation = app.state.fl_experiments.reserve_client(
+            "upper-subscription", "upper-correlation"
+        )
+        plan_id = str(uuid4())
+        app.state.fl_experiments.bind_plan(
+            reservation.reservation_id,
+            plan_id,
+            ExperimentRole.BRANCH,
+        )
+        attached = app.state.fl_experiments.attach_server(
+            reservation.reservation_id,
+            plan_id,
+            "lower-process",
+        )
+
+        assert attached.upper_client_subscription_ids == frozenset(
+            {"upper-subscription"}
+        )
+        assert attached.server_process_id == "lower-process"
+
+
+def test_new_app_construction_uses_a_fresh_experiment_registry(settings, tmp_path):
+    first = create_app(
+        with_engines(settings, tmp_path / "first", client=True),
+        capability_checker=verified_capability_checker(client=True),
+    )
+    with TestClient(first):
+        first.state.fl_experiments.reserve_client("subscription-a", "correlation-a")
+    second = create_app(
+        with_engines(settings, tmp_path / "second", client=True),
+        capability_checker=verified_capability_checker(client=True),
+    )
+    with TestClient(second):
+        assert second.state.fl_experiments is not first.state.fl_experiments
+        assert second.state.fl_experiments.active() is None
+
+
+def test_registry_fences_admission_before_server_and_publication_stop(settings, tmp_path):
     app = create_app(with_engines(settings, tmp_path / "server", server=True))
     shutdown_order = []
+    shutdown_registry = app.state.fl_experiments.shutdown
     close_server = app.state.fl_server.close
     close_publication = app.state.publication.close
+
+    def record_registry_shutdown():
+        shutdown_order.append("registry")
+        shutdown_registry()
 
     def record_server_close():
         shutdown_order.append("server")
@@ -142,13 +196,14 @@ def test_server_engine_stops_before_publication_dependency(settings, tmp_path):
         shutdown_order.append("publication")
         close_publication()
 
+    app.state.fl_experiments.shutdown = record_registry_shutdown
     app.state.fl_server.close = record_server_close
     app.state.publication.close = record_publication_close
 
     with TestClient(app):
         pass
 
-    assert shutdown_order == ["server", "publication"]
+    assert shutdown_order == ["registry", "server", "publication"]
 
 
 def test_only_local_mode_dispatches_current_dataset_training_path():

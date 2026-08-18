@@ -119,6 +119,32 @@ class FLExperimentRegistry:
                 return None
             return self._snapshot(record)
 
+    def remove_client(
+        self,
+        reservation_id: str,
+        subscription_id: str,
+    ) -> ExperimentSnapshot | None:
+        subscription_id = _required_identity(subscription_id, "subscription_id")
+        with self._lock:
+            record = self._required(reservation_id)
+            if subscription_id not in record.upper_client_subscription_ids:
+                raise ExperimentStateError("client subscription is not reserved")
+            if (
+                record.lifecycle is ExperimentLifecycle.PROVISIONAL
+                and record.plan_id is None
+            ):
+                record.upper_client_subscription_ids.remove(subscription_id)
+                if not record.upper_client_subscription_ids:
+                    self._active = None
+                    return None
+                return self._snapshot(record)
+            if record.lifecycle is not ExperimentLifecycle.CLEANING:
+                raise ExperimentStateError(
+                    "bound client removal requires experiment cleanup"
+                )
+            record.upper_client_subscription_ids.remove(subscription_id)
+            return self._snapshot(record)
+
     def bind_plan(
         self,
         reservation_id: str,
@@ -131,6 +157,7 @@ class FLExperimentRegistry:
         if role not in {ExperimentRole.BRANCH, ExperimentRole.LEAF}:
             raise ExperimentStateError("an upper client group can only bind BRANCH or LEAF")
         with self._lock:
+            self._ensure_admission_open()
             record = self._required(reservation_id)
             if plan_id in self._retired_plan_ids:
                 raise ExperimentConflictError("plan_id is retired in this process")
@@ -182,6 +209,7 @@ class FLExperimentRegistry:
         plan_id = _uuid4_identity(plan_id, "plan_id")
         process_id = _required_identity(process_id, "process_id")
         with self._lock:
+            self._ensure_admission_open()
             record = self._required(reservation_id)
             if record.lifecycle is not ExperimentLifecycle.ACTIVE:
                 raise ExperimentStateError("server attachment requires an active experiment")

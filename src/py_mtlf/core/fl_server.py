@@ -23,6 +23,10 @@ from py_mtlf.core.fl_artifacts import (
     validate_fl_artifact,
     wape,
 )
+from py_mtlf.core.fl_experiment import (
+    ExperimentRegistryError,
+    FLExperimentRegistry,
+)
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     model_contract_digest,
@@ -125,6 +129,7 @@ class FLProcess:
     gate_rejection_reasons: tuple[str, ...] = ()
     candidate_artifact: ArtifactMetadata | None = None
     published_model_id: int | None = None
+    experiment_reservation_id: str = ""
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -251,6 +256,7 @@ class FLServerOrchestrator:
         client: httpx.Client | None = None,
         publication: PublicationCoordinator | None = None,
         provision_notifications: ProvisionNotificationDispatcher | None = None,
+        experiments: FLExperimentRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._server_settings = server_settings
@@ -261,6 +267,7 @@ class FLServerOrchestrator:
         self._resolver = resolver
         self._publication = publication
         self._provision_notifications = provision_notifications
+        self._experiments = experiments or FLExperimentRegistry()
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds, follow_redirects=False
@@ -293,6 +300,16 @@ class FLServerOrchestrator:
             return
         for intent in self._policy.take_intents():
             process = FLProcess(process_id=str(uuid4()), intent=intent)
+            try:
+                reservation = self._experiments.reserve_server(process.process_id)
+                process.experiment_reservation_id = reservation.reservation_id
+            except ExperimentRegistryError as error:
+                process.state = FLServerState.FAILED
+                process.failure = str(error)
+                with self._lock:
+                    self._processes[process.process_id] = process
+                self._policy.complete_retrain(intent.family_key)
+                continue
             with self._lock:
                 self._processes[process.process_id] = process
                 active = sum(
@@ -306,12 +323,20 @@ class FLServerOrchestrator:
                     }
                     for item in self._processes.values()
                 )
-                if active > self._server_settings.max_active_processes:
-                    process.state = FLServerState.FAILED
-                    process.failure = "FL Server process capacity is exhausted"
-                    self._policy.complete_retrain(intent.family_key)
-                    continue
-            future = self._executor.submit(self._run, process)
+            if active > self._server_settings.max_active_processes:
+                process.state = FLServerState.FAILED
+                process.failure = "FL Server process capacity is exhausted"
+                self._finish_experiment(process)
+                self._policy.complete_retrain(intent.family_key)
+                continue
+            try:
+                future = self._executor.submit(self._run, process)
+            except Exception as error:
+                process.state = FLServerState.FAILED
+                process.failure = str(error)
+                self._finish_experiment(process)
+                self._policy.complete_retrain(intent.family_key)
+                raise
             with self._lock:
                 self._futures.add(future)
             future.add_done_callback(self._future_done)
@@ -446,6 +471,7 @@ class FLServerOrchestrator:
             )
         if process is not None:
             process.state = FLServerState.COMPLETE
+            self._finish_experiment(process)
         self._policy.complete_retrain(family_key)
         logger.info(
             "Federated model cutover complete model_id=%s family=%s",
@@ -643,6 +669,9 @@ class FLServerOrchestrator:
                 process.condition.notify_all()
             logger.exception("Federated process failed process_id=%s", process.process_id)
         finally:
+            release_experiment = process.state is not FLServerState.CUTOVER_PENDING
+            if release_experiment:
+                self._begin_experiment_cleanup(process)
             for participant in process.participants:
                 if participant.resource_location:
                     failure = self._cleanup_participant(process, participant)
@@ -655,6 +684,23 @@ class FLServerOrchestrator:
                     self._correlations.pop(participant.notification_correlation_id, None)
             if process.state is not FLServerState.CUTOVER_PENDING:
                 self._policy.complete_retrain(process.intent.family_key)
+            if release_experiment:
+                self._release_experiment(process)
+
+    def _begin_experiment_cleanup(self, process: FLProcess) -> None:
+        reservation_id = process.experiment_reservation_id
+        if not reservation_id:
+            return
+        self._experiments.mark_terminal(reservation_id, process.state.value)
+        self._experiments.begin_cleanup(reservation_id)
+
+    def _release_experiment(self, process: FLProcess) -> None:
+        if process.experiment_reservation_id:
+            self._experiments.release(process.experiment_reservation_id)
+
+    def _finish_experiment(self, process: FLProcess) -> None:
+        self._begin_experiment_cleanup(process)
+        self._release_experiment(process)
 
     def _create_preparation(
         self,

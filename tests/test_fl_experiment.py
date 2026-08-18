@@ -185,6 +185,48 @@ def test_shutdown_blocks_new_admission_but_allows_existing_cleanup():
     assert registry.active() is None
 
 
+def test_shutdown_blocks_plan_binding_and_server_attachment():
+    binding_registry = FLExperimentRegistry()
+    provisional = binding_registry.reserve_client("subscription-a", "correlation-a")
+    binding_registry.shutdown()
+
+    with pytest.raises(ExperimentStateError, match="shutting down"):
+        binding_registry.bind_plan(
+            provisional.reservation_id,
+            str(uuid4()),
+            ExperimentRole.BRANCH,
+        )
+
+    attachment_registry = FLExperimentRegistry()
+    plan_id = str(uuid4())
+    branch = attachment_registry.reserve_client("subscription-a", "correlation-a")
+    attachment_registry.bind_plan(branch.reservation_id, plan_id, ExperimentRole.BRANCH)
+    attachment_registry.shutdown()
+
+    with pytest.raises(ExperimentStateError, match="shutting down"):
+        attachment_registry.attach_server(branch.reservation_id, plan_id, "server-a")
+
+
+def test_client_removal_requires_provisional_rollback_or_active_cleanup():
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("subscription-a", "correlation-a")
+    plan_id = str(uuid4())
+    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.LEAF)
+
+    with pytest.raises(ExperimentStateError, match="cleanup"):
+        registry.remove_client(reservation.reservation_id, "subscription-a")
+
+    registry.mark_terminal(reservation.reservation_id, "COMPLETE")
+    registry.begin_cleanup(reservation.reservation_id)
+    cleaning = registry.remove_client(reservation.reservation_id, "subscription-a")
+
+    assert cleaning is not None
+    assert cleaning.lifecycle is ExperimentLifecycle.CLEANING
+    assert cleaning.upper_client_subscription_ids == frozenset()
+    registry.release(reservation.reservation_id)
+    assert registry.active() is None
+
+
 def test_concurrent_admission_allows_only_one_top_level_experiment():
     registry = FLExperimentRegistry()
     barrier = threading.Barrier(3)

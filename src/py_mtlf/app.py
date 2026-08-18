@@ -26,6 +26,7 @@ from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.fl_client import FLClientService
+from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_server import FLClientResolver, FLServerOrchestrator
 from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.model_records import (
@@ -107,6 +108,7 @@ def create_app(
     local_training = settings.local_training
     fl_client_settings = settings.federated_learning.client
     fl_server_settings = settings.federated_learning.server
+    fl_experiments = FLExperimentRegistry()
 
     def resume_published_cutover(publication_record, model) -> None:
         family_key = seed_catalog.family_key_for_id(publication_record.family_id)
@@ -189,6 +191,7 @@ def create_app(
             nwdaf_context,
             dataset_coordinator,
             fl_workspace,
+            experiments=fl_experiments,
         )
         if fl_client_settings is not None
         else None
@@ -212,6 +215,7 @@ def create_app(
             fl_client_resolver,
             publication=publication,
             provision_notifications=provision_notifications,
+            experiments=fl_experiments,
         )
         if fl_server_settings is not None and fl_client_resolver is not None
         else None
@@ -241,6 +245,7 @@ def create_app(
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
+            fl_experiments.shutdown()
             if training_coordinator is not None:
                 training_coordinator.shutdown()
             if fl_client is not None:
@@ -281,6 +286,7 @@ def create_app(
     app.state.fl_workspace = fl_workspace
     app.state.fl_client = fl_client
     app.state.fl_server = fl_server
+    app.state.fl_experiments = fl_experiments
     app.state.publication = publication
     app.state.state_lock = state_lock
     app.include_router(health.router)

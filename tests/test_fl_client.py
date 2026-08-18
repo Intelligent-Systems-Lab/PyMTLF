@@ -13,11 +13,13 @@ from py_mtlf.config import (
 )
 from py_mtlf.core.dataset import DatasetJobState
 from py_mtlf.core.fl_client import (
+    FLClientCapacityError,
     FLClientResource,
     FLClientService,
     FLClientState,
     _termination,
 )
+from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
 from py_mtlf.core.trainer import LocalTrainer
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model_training import (
@@ -104,8 +106,135 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
     try:
         resource = service.create(NwdafMLModelTrainSubsc.model_validate(preparation_payload()))
         assert resource.state is FLClientState.PREPARING
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            resource = service.get(resource.subscription_id)
+            if resource.dataset_job_id:
+                break
+            time.sleep(0.01)
         assert resource.dataset_job_id == "dataset-job-1"
         datasets.submit_external.assert_called_once()
+    finally:
+        service.close()
+
+
+def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, monkeypatch):
+    registry = FLExperimentRegistry()
+    service = FLClientService(
+        fl_settings(tmp_path),
+        FLClientSettings(
+            model_interoperability_ids=("001122",),
+            max_concurrent_jobs=3,
+        ),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+    first_payload = preparation_payload()
+    second_payload = preparation_payload()
+    second_payload["notifCorreId"] = "prep-client-b"
+    conflict_payload = preparation_payload()
+    conflict_payload["notifCorreId"] = "prep-client-c"
+    conflict_payload["mlCorreId"] = "fl-process-002"
+
+    try:
+        first = service.create(NwdafMLModelTrainSubsc.model_validate(first_payload))
+        second = service.create(NwdafMLModelTrainSubsc.model_validate(second_payload))
+
+        active = registry.active()
+        assert active is not None
+        assert active.upper_client_subscription_ids == frozenset(
+            {first.subscription_id, second.subscription_id}
+        )
+        with pytest.raises(FLClientCapacityError, match="top-level experiment"):
+            service.create(NwdafMLModelTrainSubsc.model_validate(conflict_payload))
+    finally:
+        service.close()
+
+
+def test_create_failure_rolls_back_experiment_reservation(tmp_path, monkeypatch):
+    registry = FLExperimentRegistry()
+    service = FLClientService(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    monkeypatch.setattr(
+        service,
+        "_start_operation",
+        Mock(side_effect=RuntimeError("start failed")),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="start failed"):
+            service.create(
+                NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            )
+        assert registry.active() is None
+    finally:
+        service.close()
+
+
+def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
+    registry = FLExperimentRegistry()
+    service = FLClientService(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
+        service.delete(resource.subscription_id)
+        assert registry.active() is None
+    finally:
+        service.close()
+
+
+def test_delete_preserves_bound_resource_until_experiment_cleanup(tmp_path, monkeypatch):
+    registry = FLExperimentRegistry()
+    service = FLClientService(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
+        active = registry.active()
+        plan_id = "11111111-1111-4111-8111-111111111111"
+        registry.bind_plan(active.reservation_id, plan_id, ExperimentRole.LEAF)
+
+        with pytest.raises(RuntimeError, match="cleanup"):
+            service.delete(resource.subscription_id)
+        assert service.get(resource.subscription_id).subscription_id == resource.subscription_id
+
+        registry.mark_terminal(active.reservation_id, "COMPLETE")
+        registry.begin_cleanup(active.reservation_id)
+        service.delete(resource.subscription_id)
+        assert registry.active().upper_client_subscription_ids == frozenset()
+        registry.release(active.reservation_id)
     finally:
         service.close()
 

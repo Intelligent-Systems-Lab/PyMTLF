@@ -15,6 +15,10 @@ from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
 from py_mtlf.core.federated_trainer import FederatedTrainer
+from py_mtlf.core.fl_experiment import (
+    ExperimentRegistryError,
+    FLExperimentRegistry,
+)
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     model_contract_digest,
@@ -76,6 +80,7 @@ class FLClientResource:
     expected_model_contract_digest: str = ""
     expected_preprocessing_contract_digest: str = ""
     preparation_base_artifact: ArtifactMetadata | None = None
+    experiment_reservation_id: str = ""
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -106,6 +111,7 @@ class FLClientService:
         datasets: DatasetCoordinator,
         workspace: FLWorkspace,
         client: httpx.Client | None = None,
+        experiments: FLExperimentRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._client_settings = client_settings
@@ -113,6 +119,7 @@ class FLClientService:
         self._nwdaf_context = nwdaf_context
         self._datasets = datasets
         self._workspace = workspace
+        self._experiments = experiments or FLExperimentRegistry()
         self._trainer = FederatedTrainer(client_settings.training)
         self._device = resolve_device(client_settings.training.device)
         self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
@@ -124,6 +131,7 @@ class FLClientService:
         self._owns_client = client is None
         self._lock = threading.RLock()
         self._resources: dict[str, FLClientResource] = {}
+        self._deleting: set[str] = set()
         self._executor = ThreadPoolExecutor(
             max_workers=client_settings.max_concurrent_jobs,
             thread_name_prefix="fl-client",
@@ -161,13 +169,23 @@ class FLClientService:
             self._capacity.release()
             raise FLClientCapacityError("FL client callback outbox is full")
         resource_id = ""
+        reservation_id = ""
         try:
             resource_id = str(uuid4())
+            try:
+                reservation = self._experiments.reserve_client(
+                    resource_id,
+                    value.ml_correlation_id or "",
+                )
+            except ExperimentRegistryError as error:
+                raise FLClientCapacityError(str(error)) from error
+            reservation_id = reservation.reservation_id
             resource = FLClientResource(
                 subscription_id=resource_id,
                 representation=value.model_copy(deep=True),
                 state=FLClientState.PROVISIONAL,
                 scope=TrainingScopeDescriptor.from_training_request(value, 0),
+                experiment_reservation_id=reservation_id,
             )
             with self._lock:
                 if any(
@@ -184,6 +202,8 @@ class FLClientService:
                 if resource_id:
                     self._cancel_delay(resource_id)
                     self._resources.pop(resource_id, None)
+            if reservation_id:
+                self._experiments.rollback_client(reservation_id, resource_id)
             self._capacity.release()
             self._outbox_capacity.release()
             raise
@@ -271,8 +291,19 @@ class FLClientService:
                 FLClientState.PREPARATION_RESULT_PENDING,
             }:
                 raise RuntimeError("ML_TRAINING_NOT_COMPLETE")
+            reservation_id = resource.experiment_reservation_id
+            self._deleting.add(subscription_id)
+        try:
+            if reservation_id:
+                self._experiments.remove_client(reservation_id, subscription_id)
+        except Exception:
+            with self._lock:
+                self._deleting.discard(subscription_id)
+            raise
+        with self._lock:
             self._cancel_delay(subscription_id)
-            del self._resources[subscription_id]
+            self._resources.pop(subscription_id, None)
+            self._deleting.discard(subscription_id)
 
     def get(self, subscription_id: str) -> FLClientResource:
         with self._lock:
@@ -966,6 +997,8 @@ class FLClientService:
             self._futures.discard(future)
 
     def _required(self, subscription_id: str) -> FLClientResource:
+        if subscription_id in self._deleting:
+            raise KeyError(subscription_id)
         resource = self._resources.get(subscription_id)
         if resource is None:
             raise KeyError(subscription_id)
