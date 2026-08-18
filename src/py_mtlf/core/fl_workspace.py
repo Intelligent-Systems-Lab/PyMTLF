@@ -170,25 +170,43 @@ class FLWorkspace:
             raise ValueError("hierarchy download requires a hierarchy artifact role")
         expected_publisher = normalize_nf_instance_id(expected_publisher_nf_instance_id)
         intended_recipient = normalize_nf_instance_id(intended_recipient_nf_instance_id)
-        normalized_plan_id = normalize_plan_id(expected_plan_id) if expected_plan_id else None
+        normalized_plan_id = (
+            normalize_plan_id(expected_plan_id) if expected_plan_id is not None else None
+        )
 
-        allowed = set(self._settings.artifact_download.allowed_origins)
         try:
+            allowed = {
+                _origin(value) for value in self._settings.artifact_download.allowed_origins
+            }
             origin = _origin(url)
             expected_digest = _artifact_url_digest(url)
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             raise FLArtifactIntegrityError(str(error)) from error
         if allowed and origin not in allowed:
             raise FLArtifactIdentityError("FL artifact origin is not allowed")
         staging = self._root / ".staging"
-        staging.mkdir(parents=True, exist_ok=True)
-        file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".hierarchy-download-",
-            suffix=".tar.gz",
-            dir=staging,
-        )
-        os.close(file_descriptor)
-        temporary = Path(temporary_name)
+        file_descriptor: int | None = None
+        temporary: Path | None = None
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".hierarchy-download-",
+                suffix=".tar.gz",
+                dir=staging,
+            )
+            temporary = Path(temporary_name)
+            os.close(file_descriptor)
+            file_descriptor = None
+        except OSError as error:
+            if file_descriptor is not None:
+                with suppress(OSError):
+                    os.close(file_descriptor)
+            if temporary is not None:
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+            raise FLWorkspaceError("FL hierarchy download staging is unavailable") from error
+        if temporary is None:
+            raise FLWorkspaceError("FL hierarchy download staging was not created")
         digest = hashlib.sha256()
         size = 0
         try:
@@ -275,16 +293,21 @@ class FLWorkspace:
             )
         except httpx.HTTPError as error:
             raise FLArtifactUnavailableError("FL artifact transport failed") from error
+        except OSError as error:
+            raise FLWorkspaceError("FL hierarchy workspace operation failed") from error
         finally:
-            temporary.unlink(missing_ok=True)
+            _remove_hierarchy_staging(temporary)
 
     def release_plan(self, plan_id: str) -> None:
         normalized = normalize_plan_id(plan_id)
         directory = self._root / normalized
-        if directory.is_file():
-            raise FLWorkspaceError("FL plan workspace path is not a directory")
-        with suppress(FileNotFoundError):
-            shutil.rmtree(directory)
+        try:
+            if directory.is_file():
+                raise FLWorkspaceError("FL plan workspace path is not a directory")
+            with suppress(FileNotFoundError):
+                shutil.rmtree(directory)
+        except OSError as error:
+            raise FLWorkspaceError("FL plan workspace release failed") from error
 
     def _validate_archive(self, path: Path) -> ValidatedArchive:
         extracted = 0
@@ -295,7 +318,7 @@ class FLWorkspace:
             with tarfile.open(path, "r:gz") as archive:
                 members = archive.getmembers()
                 if len(members) > self._artifact_settings.max_entries:
-                    raise RuntimeError("FL artifact has too many entries")
+                    raise FLArtifactIntegrityError("FL artifact has too many entries")
                 for member in members:
                     if (
                         not member.isreg()
@@ -303,29 +326,37 @@ class FLWorkspace:
                         or member.name.startswith(".")
                         or member.name in names
                     ):
-                        raise RuntimeError("FL artifact contains an unsafe entry")
+                        raise FLArtifactIntegrityError("FL artifact contains an unsafe entry")
                     names.add(member.name)
                     extracted += member.size
                     if member.size > self._artifact_settings.max_single_file_bytes:
-                        raise RuntimeError("FL artifact entry exceeds the configured limit")
+                        raise FLArtifactIntegrityError(
+                            "FL artifact entry exceeds the configured limit"
+                        )
                     if extracted > self._artifact_settings.max_extracted_bytes:
-                        raise RuntimeError("FL artifact exceeds the extracted size limit")
+                        raise FLArtifactIntegrityError(
+                            "FL artifact exceeds the extracted size limit"
+                        )
                     stream = archive.extractfile(member)
                     if stream is None:
-                        raise RuntimeError("FL artifact entry cannot be read")
+                        raise FLArtifactIntegrityError("FL artifact entry cannot be read")
                     content = stream.read(self._artifact_settings.max_single_file_bytes + 1)
                     if len(content) != member.size:
-                        raise RuntimeError("FL artifact entry size does not match archive metadata")
+                        raise FLArtifactIntegrityError(
+                            "FL artifact entry size does not match archive metadata"
+                        )
                     if member.name == "config.json":
                         manifest_bytes = content
                     else:
                         component_digests[member.name] = hashlib.sha256(content).hexdigest()
         except (OSError, tarfile.TarError) as error:
-            raise RuntimeError("FL artifact is not a valid gzip tar archive") from error
+            raise FLArtifactIntegrityError(
+                "FL artifact is not a valid gzip tar archive"
+            ) from error
         if names != REQUIRED_BUNDLE_FILES:
             missing = sorted(REQUIRED_BUNDLE_FILES - names)
             unexpected = sorted(names - REQUIRED_BUNDLE_FILES)
-            raise RuntimeError(
+            raise FLArtifactIntegrityError(
                 f"FL artifact file set is invalid; missing={missing}, unexpected={unexpected}"
             )
         manifest = _validated_manifest(manifest_bytes, component_digests)
@@ -334,12 +365,14 @@ class FLWorkspace:
             try:
                 ModelIdentity.model_validate(manifest["model_identity"])
             except (KeyError, ValueError) as error:
-                raise RuntimeError("completed FL input model identity is invalid") from error
+                raise FLArtifactContractError(
+                    "completed FL input model identity is invalid"
+                ) from error
             return ValidatedArchive(manifest=manifest, contract=None)
         try:
             contract = validate_fl_artifact_manifest(manifest)
         except ValueError as error:
-            raise RuntimeError("FL artifact role contract is invalid") from error
+            raise FLArtifactContractError("FL artifact role contract is invalid") from error
         return ValidatedArchive(manifest=manifest, contract=contract)
 
     def publish(
@@ -353,6 +386,37 @@ class FLWorkspace:
         model: torch.nn.Module,
         metadata: dict[str, object],
     ) -> FLWorkspaceArtifact:
+        weights = np.empty(len(model.state_dict()), dtype=object)
+        weights[:] = [value.detach().cpu().numpy() for value in model.state_dict().values()]
+        weights_stream = io.BytesIO()
+        np.save(weights_stream, weights, allow_pickle=True)
+        if not base.scaler_source:
+            raise RuntimeError("FL base bundle has no preserved scaler source")
+        components = {
+            "model.py": base.model_source,
+            "model.npy": weights_stream.getvalue(),
+            "scaler.pkl": base.scaler_source,
+        }
+        manifest = dict(base.manifest)
+        for key in (
+            "artifact_role",
+            "fl_metadata",
+            "hierarchy_metadata",
+            "model_identity",
+            "result_type",
+        ):
+            manifest.pop(key, None)
+        manifest.update(metadata)
+        manifest["bundle_schema_version"] = "1.0"
+        manifest["file_digests"] = {
+            name: hashlib.sha256(content).hexdigest() for name, content in components.items()
+        }
+        contract = validate_fl_artifact_manifest(manifest)
+        files = {
+            "config.json": json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
+            **components,
+        }
+
         directory = (
             self._root
             / _safe(process_id)
@@ -360,44 +424,25 @@ class FLWorkspace:
             / str(round_indicator)
             / _safe(role)
         )
-        directory.mkdir(parents=True, exist_ok=True)
-        weights = np.empty(len(model.state_dict()), dtype=object)
-        weights[:] = [value.detach().cpu().numpy() for value in model.state_dict().values()]
-        with tempfile.TemporaryDirectory(dir=directory) as temporary:
-            temp = Path(temporary)
-            (temp / "model.py").write_bytes(base.model_source)
-            np.save(temp / "model.npy", weights, allow_pickle=True)
-            if not base.scaler_source:
-                raise RuntimeError("FL base bundle has no preserved scaler source")
-            (temp / "scaler.pkl").write_bytes(base.scaler_source)
-            components = {
-                name: (temp / name).read_bytes() for name in ("model.py", "model.npy", "scaler.pkl")
-            }
-            manifest = dict(base.manifest)
-            for key in (
-                "artifact_role",
-                "fl_metadata",
-                "hierarchy_metadata",
-                "model_identity",
-                "result_type",
-            ):
-                manifest.pop(key, None)
-            manifest.update(metadata)
-            manifest["bundle_schema_version"] = "1.0"
-            manifest["file_digests"] = {
-                name: hashlib.sha256(content).hexdigest() for name, content in components.items()
-            }
-            contract = validate_fl_artifact_manifest(manifest)
-            files = {
-                "config.json": json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
-                **components,
-            }
-            candidate = temp / "artifact.tar.gz"
-            _write_bundle(candidate, files)
-            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            destination = directory / f"{digest}.tar.gz"
-            if not destination.exists():
-                os.replace(candidate, destination)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=directory) as temporary:
+                temp = Path(temporary)
+                candidate = temp / "artifact.tar.gz"
+                _write_bundle(candidate, files)
+                digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                destination = directory / f"{digest}.tar.gz"
+                if destination.exists():
+                    if _hash_file(destination) != digest:
+                        raise FLArtifactIntegrityError(
+                            "existing FL artifact publication conflicts with digest"
+                        )
+                else:
+                    os.replace(candidate, destination)
+        except (OSError, tarfile.TarError) as error:
+            raise FLWorkspaceError(
+                "FL artifact publication workspace operation failed"
+            ) from error
         base_url = self._settings.public_base_url.rstrip("/")
         url = (
             f"{base_url}/internal/v1/fl-artifacts/{quote(_safe(process_id))}/"
@@ -492,8 +537,13 @@ def _origin(url: str) -> str:
         raise RuntimeError("FL artifact URL is invalid")
     if parsed.username or parsed.password or parsed.fragment:
         raise RuntimeError("FL artifact URL contains unsupported components")
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
+    try:
+        parsed_port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("FL artifact URL has an invalid port") from error
+    port = f":{parsed_port}" if parsed_port else ""
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{hostname}{port}"
 
 
 def _artifact_url_digest(url: str) -> str:
@@ -530,47 +580,54 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _remove_hierarchy_staging(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise FLWorkspaceError("FL hierarchy download staging cleanup failed") from error
+
+
 def _validated_manifest(
     manifest_bytes: bytes | None,
     component_digests: dict[str, str],
 ) -> dict[str, object]:
     if manifest_bytes is None:
-        raise RuntimeError("FL artifact is missing config.json")
+        raise FLArtifactIntegrityError("FL artifact is missing config.json")
     try:
         manifest = json.loads(manifest_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("FL artifact config.json is invalid") from error
+        raise FLArtifactContractError("FL artifact config.json is invalid") from error
     if not isinstance(manifest, dict):
-        raise RuntimeError("FL artifact config.json must contain an object")
+        raise FLArtifactContractError("FL artifact config.json must contain an object")
     if manifest.get("bundle_schema_version") != "1.0":
-        raise RuntimeError("FL artifact bundle schema version is unsupported")
+        raise FLArtifactContractError("FL artifact bundle schema version is unsupported")
     if not isinstance(manifest.get("analytics_event"), str) or not manifest["analytics_event"]:
-        raise RuntimeError("FL artifact analytics_event is required")
+        raise FLArtifactContractError("FL artifact analytics_event is required")
     if (
         not isinstance(manifest.get("model_interoperability"), str)
         or not manifest["model_interoperability"].strip()
     ):
-        raise RuntimeError("FL artifact model_interoperability is required")
+        raise FLArtifactContractError("FL artifact model_interoperability is required")
     if not isinstance(manifest.get("runtime_compatibility"), dict):
-        raise RuntimeError("FL artifact runtime_compatibility is required")
+        raise FLArtifactContractError("FL artifact runtime_compatibility is required")
     if not isinstance(manifest.get("model"), dict):
-        raise RuntimeError("FL artifact model contract is required")
+        raise FLArtifactContractError("FL artifact model contract is required")
     if not isinstance(manifest.get("inference"), dict):
-        raise RuntimeError("FL artifact inference contract is required")
+        raise FLArtifactContractError("FL artifact inference contract is required")
     expected_names = {
         manifest.get("MODEL_SCRIPT"),
         manifest.get("MODEL_PATH"),
         manifest.get("SCALER_PATH"),
     }
     if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
-        raise RuntimeError("FL artifact component filenames are invalid")
+        raise FLArtifactContractError("FL artifact component filenames are invalid")
     declared = manifest.get("file_digests")
     if not isinstance(declared, dict) or set(declared) != set(component_digests):
-        raise RuntimeError("FL artifact component digest inventory is invalid")
+        raise FLArtifactIntegrityError("FL artifact component digest inventory is invalid")
     for name, actual in component_digests.items():
         expected = declared.get(name)
         if not isinstance(expected, str) or not SHA256_PATTERN.fullmatch(expected):
-            raise RuntimeError("FL artifact component digest is invalid")
+            raise FLArtifactIntegrityError("FL artifact component digest is invalid")
         if expected != actual:
-            raise RuntimeError(f"FL artifact component digest mismatch: {name}")
+            raise FLArtifactIntegrityError(f"FL artifact component digest mismatch: {name}")
     return manifest

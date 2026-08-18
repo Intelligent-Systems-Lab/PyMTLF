@@ -170,6 +170,17 @@ def test_preparation_result_accepts_ready_and_failed_partitions() -> None:
         FailedClient(nf_instance_id=LEAF_B, cause="REQUIREMENTS_NOT_MET"),
     )
 
+    timed_out = PreparationResultMetadata.model_validate(
+        {
+            **common,
+            "outcome": "FAILED",
+            "prepared_clients": [{"nf_instance_id": LEAF_A}],
+            "failed_clients": [],
+            "timed_out_client_nf_instance_ids": [LEAF_B],
+        }
+    )
+    assert timed_out.timed_out_client_nf_instance_ids == (LEAF_B,)
+
 
 @pytest.mark.parametrize(
     "changes",
@@ -229,6 +240,16 @@ def test_preparation_result_rejects_unknown_cause_and_noncanonical_lists() -> No
     with pytest.raises(ValidationError):
         PreparationResultMetadata.model_validate(value)
 
+    value["failed_clients"] = [
+        {
+            "nf_instance_id": LEAF_B,
+            "cause": "INTERNAL_ERROR",
+            "error": "raw exception text",
+        }
+    ]
+    with pytest.raises(ValidationError):
+        PreparationResultMetadata.model_validate(value)
+
     value["assigned_client_nf_instance_ids"] = [LEAF_B, LEAF_A]
     value["failed_clients"] = [
         {"nf_instance_id": LEAF_B, "cause": "INTERNAL_ERROR"}
@@ -241,3 +262,5 @@ def test_hierarchy_metadata_union_is_discriminated_and_fail_closed() -> None:
     assert isinstance(validate_hierarchy_metadata(branch_assignment()), BranchAssignmentMetadata)
     with pytest.raises(ValidationError):
         validate_hierarchy_metadata({**branch_assignment(), "message_type": "UNKNOWN"})
+    with pytest.raises(ValidationError):
+        validate_hierarchy_metadata({**branch_assignment(), "contract_version": "2.0"})
