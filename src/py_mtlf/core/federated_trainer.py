@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from py_mtlf.config import FittingSettings
+from py_mtlf.config import FittingRuntimeSettings
 from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, TrainingError, resolve_device
 from py_mtlf.core.training_data import TrainingDataset
 
@@ -23,7 +23,7 @@ class FederatedTrainingResult:
 class FederatedTrainer:
     """Train full local weights while preserving the Server-provided scaler."""
 
-    def __init__(self, settings: FittingSettings) -> None:
+    def __init__(self, settings: FittingRuntimeSettings) -> None:
         self._settings = settings
         self._device = resolve_device(settings.device)
 
@@ -31,13 +31,25 @@ class FederatedTrainer:
         self,
         base: LoadedBundle,
         dataset: TrainingDataset,
+        *,
+        epochs: int,
+        proximal_mu: float | None = None,
     ) -> FederatedTrainingResult:
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs <= 0:
+            raise ValueError("epochs must be a positive integer")
+        if proximal_mu is not None and (not math.isfinite(proximal_mu) or proximal_mu <= 0):
+            raise ValueError("proximal_mu must be finite and positive")
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         np.random.seed(self._settings.random_seed)
         torch.manual_seed(self._settings.random_seed)
         torch.use_deterministic_algorithms(True, warn_only=True)
         inputs, targets = LocalTrainer._training_tensors(dataset, base.scaler)
         model = copy.deepcopy(base.model).to(self._device)
+        global_reference = {
+            name: value.detach().clone().to(self._device)
+            for name, value in model.named_parameters()
+            if value.requires_grad
+        }
         try:
             model.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=self._settings.learning_rate)
@@ -51,7 +63,7 @@ class FederatedTrainer:
                 generator=generator,
             )
             final_loss = math.nan
-            for _epoch in range(self._settings.epochs):
+            for _epoch in range(epochs):
                 for features, expected in loader:
                     features = features.to(self._device)
                     expected = expected.to(self._device)
@@ -60,6 +72,13 @@ class FederatedTrainer:
                     if actual.shape != expected.shape:
                         raise TrainingError("federated model output shape is incompatible")
                     loss = loss_function(actual, expected)
+                    if proximal_mu is not None:
+                        penalty = sum(
+                            torch.sum((parameter - global_reference[name]) ** 2)
+                            for name, parameter in model.named_parameters()
+                            if parameter.requires_grad
+                        )
+                        loss = loss + (proximal_mu / 2) * penalty
                     if not torch.isfinite(loss):
                         raise TrainingError("federated training loss is not finite")
                     loss.backward()

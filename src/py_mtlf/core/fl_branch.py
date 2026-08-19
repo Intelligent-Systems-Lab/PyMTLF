@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 
-from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact
+from py_mtlf.core.fl_artifacts import (
+    HierarchyAssignmentArtifact,
+    RoundGlobalArtifact,
+    RoundLocalResultType,
+)
 from py_mtlf.core.fl_hierarchy import (
     BranchAssignmentMetadata,
     FailedClient,
@@ -25,6 +30,7 @@ from py_mtlf.core.fl_server import (
 )
 from py_mtlf.core.fl_workspace import FLWorkspaceArtifact, ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
+from py_mtlf.core.trainer import LoadedBundle
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainSubsc
 
 
@@ -42,6 +48,30 @@ class BranchPreparationResult:
     artifact: FLWorkspaceArtifact
     outcome: PreparationOutcome
     execution: BranchPreparationExecution | None
+
+
+class BranchRoundState(StrEnum):
+    RUNNING = "RUNNING"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class BranchRoundExecution:
+    plan_id: str
+    upper_client_subscription_id: str
+    upper_resource_revision: int
+    upper_ml_corre_id: str
+    upper_round_indicator: int
+    upper_input_artifact_digest: str
+    upper_scope_digest: str
+    lower_server_process_id: str
+    lower_ml_corre_id: str
+    lower_round_indicator: int
+    lower_input_artifact_digest: str = ""
+    state: BranchRoundState = BranchRoundState.RUNNING
+    upper_result: FLWorkspaceArtifact | None = None
+    failure: str = ""
 
 
 class BranchPreDispatchError(RuntimeError):
@@ -76,7 +106,10 @@ class FLBranchPreparationCoordinator:
         self._artifact_service = artifact_service
         self._server = server
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._executions: dict[str, BranchPreparationExecution] = {}
+        self._rounds: dict[tuple[str, str, int], BranchRoundExecution] = {}
+        self._next_lower_round: dict[str, int] = {}
         self._cancelled_plan_ids: set[str] = set()
         self._closing = False
 
@@ -293,6 +326,147 @@ class FLBranchPreparationCoordinator:
             execution=execution,
         )
 
+    def execute_round(
+        self,
+        *,
+        assignment: ValidatedHierarchyArtifact,
+        representation: NwdafMLModelTrainSubsc,
+        upper_input: LoadedBundle,
+        upper_client_subscription_id: str,
+        upper_resource_revision: int,
+        upper_input_artifact_digest: str,
+        upper_scope_digest: str,
+        callback_margin_seconds: int,
+    ) -> FLWorkspaceArtifact:
+        metadata = assignment.contract.hierarchy_metadata
+        if not isinstance(metadata, BranchAssignmentMetadata):
+            raise ValueError("Branch round requires a BRANCH_ASSIGNMENT")
+        upper_process_id = representation.ml_correlation_id or ""
+        upper_round = representation.round_indicator
+        if not upper_process_id or upper_round is None:
+            raise ValueError("Branch round requires upper process and round identities")
+        if not upper_client_subscription_id or upper_resource_revision <= 0:
+            raise ValueError("Branch round requires upper resource identity")
+        if len(upper_input_artifact_digest) != 64:
+            raise ValueError("Branch round requires the upper input artifact digest")
+        key = (metadata.plan_id, upper_process_id, upper_round)
+        report = representation.ml_training_report_info
+        parent_budget = report.maximum_response_time if report is not None else None
+        if parent_budget is None or parent_budget <= callback_margin_seconds:
+            raise RuntimeError("Branch upper round budget cannot contain lower execution")
+        context = self._nwdaf_context.get(refresh=True)
+        if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
+            raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
+        epochs = _round_epochs(upper_input)
+        conflicting = False
+        lower_round = -1
+        with self._condition:
+            self._ensure_dispatch_active(metadata.plan_id)
+            execution = self._executions.get(metadata.plan_id)
+            if execution is None:
+                raise RuntimeError("Branch lower process is unavailable")
+            while True:
+                existing = self._rounds.get(key)
+                if existing is None:
+                    lower_round = self._next_lower_round.get(metadata.plan_id, 0)
+                    self._next_lower_round[metadata.plan_id] = lower_round + 1
+                    self._rounds[key] = BranchRoundExecution(
+                        plan_id=metadata.plan_id,
+                        upper_client_subscription_id=upper_client_subscription_id,
+                        upper_resource_revision=upper_resource_revision,
+                        upper_ml_corre_id=upper_process_id,
+                        upper_round_indicator=upper_round,
+                        upper_input_artifact_digest=upper_input_artifact_digest,
+                        upper_scope_digest=upper_scope_digest,
+                        lower_server_process_id=execution.process_id,
+                        lower_ml_corre_id=execution.process_id,
+                        lower_round_indicator=lower_round,
+                    )
+                    break
+                if not _same_round_command(
+                    existing,
+                    upper_client_subscription_id=upper_client_subscription_id,
+                    upper_resource_revision=upper_resource_revision,
+                    upper_input_artifact_digest=upper_input_artifact_digest,
+                    upper_scope_digest=upper_scope_digest,
+                ):
+                    conflicting = True
+                    break
+                if existing.state is BranchRoundState.COMPLETE:
+                    if existing.upper_result is None:
+                        raise RuntimeError("completed Branch round has no upper result")
+                    return existing.upper_result
+                if existing.state is BranchRoundState.FAILED:
+                    raise RuntimeError(existing.failure or "Branch round execution failed")
+                self._condition.wait()
+                self._ensure_dispatch_active(metadata.plan_id)
+        if conflicting:
+            failure = "conflicting duplicate Branch upper round command"
+            self.cancel(metadata.plan_id, failure)
+            raise RuntimeError(failure)
+
+        try:
+            with self._condition:
+                self._ensure_dispatch_active(metadata.plan_id)
+                current = self._rounds.get(key)
+                if current is None:
+                    raise RuntimeError("Branch round mapping disappeared")
+                lower_input = self._artifact_service.publish_round_input(
+                    base=upper_input,
+                    process_id=execution.process_id,
+                    server_nf_instance_id=context.nf_instance_id,
+                    round_indicator=lower_round,
+                    epochs=epochs,
+                )
+                self._rounds[key] = replace(
+                    current,
+                    lower_input_artifact_digest=lower_input.digest,
+                )
+            lower_global = self._server.execute_hierarchy_round(
+                process_id=execution.process_id,
+                round_indicator=lower_round,
+                round_input_url=lower_input.url,
+                expected_result_type=RoundLocalResultType.TRAINING,
+                timeout_seconds=parent_budget - callback_margin_seconds,
+            )
+            if (
+                not isinstance(lower_global.contract, RoundGlobalArtifact)
+                or lower_global.contract.fl_metadata.ml_corre_id != execution.process_id
+                or lower_global.contract.fl_metadata.round_ind != lower_round
+            ):
+                raise RuntimeError("Branch lower result does not match the mapped lower round")
+            with self._condition:
+                self._ensure_dispatch_active(metadata.plan_id)
+                current = self._rounds.get(key)
+                if current is None:
+                    raise RuntimeError("Branch round mapping disappeared")
+                upper_result = self._artifact_service.publish_hierarchy_aggregate(
+                    upper_input=upper_input,
+                    lower_global=lower_global,
+                    upper_process_id=upper_process_id,
+                    branch_nf_instance_id=context.nf_instance_id,
+                    upper_round_indicator=upper_round,
+                    upper_scope_digest=upper_scope_digest,
+                )
+                self._rounds[key] = replace(
+                    current,
+                    state=BranchRoundState.COMPLETE,
+                    upper_result=upper_result,
+                )
+                self._condition.notify_all()
+            return upper_result
+        except Exception as error:
+            with self._condition:
+                current = self._rounds.get(key)
+                if current is not None:
+                    self._rounds[key] = replace(
+                        current,
+                        state=BranchRoundState.FAILED,
+                        failure=str(error),
+                    )
+                self._condition.notify_all()
+            raise
+
     @staticmethod
     def _classify(
         execution: BranchPreparationExecution,
@@ -346,21 +520,54 @@ class FLBranchPreparationCoordinator:
                 raise BranchPreparationCancelled("Branch preparation was cancelled")
 
     def cancel(self, plan_id: str, reason: str) -> None:
-        with self._lock:
+        with self._condition:
             self._cancelled_plan_ids.add(plan_id)
             execution = self._executions.pop(plan_id, None)
+            self._rounds = {
+                key: value for key, value in self._rounds.items() if key[0] != plan_id
+            }
+            self._next_lower_round.pop(plan_id, None)
+            self._condition.notify_all()
         if execution is not None:
             self._server.cancel_hierarchy_preparation(execution.process_id, reason)
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
             self._closing = True
             executions = tuple(self._executions.values())
             self._cancelled_plan_ids.update(self._executions)
             self._executions.clear()
+            self._rounds.clear()
+            self._next_lower_round.clear()
+            self._condition.notify_all()
         for execution in executions:
             self._server.cancel_hierarchy_preparation(
                 execution.process_id,
                 "Branch preparation coordinator is closing",
             )
         self._resolver.close()
+
+
+def _round_epochs(bundle: LoadedBundle) -> int:
+    metadata = bundle.manifest.get("fl_metadata")
+    directive = metadata.get("client_training") if isinstance(metadata, dict) else None
+    epochs = directive.get("epochs") if isinstance(directive, dict) else None
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs <= 0:
+        raise ValueError("ROUND_INPUT client training epochs are invalid")
+    return epochs
+
+
+def _same_round_command(
+    execution: BranchRoundExecution,
+    *,
+    upper_client_subscription_id: str,
+    upper_resource_revision: int,
+    upper_input_artifact_digest: str,
+    upper_scope_digest: str,
+) -> bool:
+    return (
+        execution.upper_client_subscription_id == upper_client_subscription_id
+        and execution.upper_resource_revision == upper_resource_revision
+        and execution.upper_input_artifact_digest == upper_input_artifact_digest
+        and execution.upper_scope_digest == upper_scope_digest
+    )

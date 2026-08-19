@@ -253,6 +253,7 @@ def create_app(
         )
         fl_root = FLRootCoordinator(
             strategy=strategy_settings,
+            server_settings=fl_server_settings,
             planner=topology_planner,
             resolver=hierarchy_resolver,
             nwdaf_context=nwdaf_context,

@@ -71,8 +71,6 @@ federated_learning:
       batch_size: 32
       # Adam learning rate for each local fitting round.
       learning_rate: 0.001
-      # Full local-dataset passes performed per fitting round.
-      epochs: 18
       # Oldest share of retained sliding-window samples used for validation.
       validation_ratio: 0.10
       # Deterministic split, shuffle, and fitting seed.

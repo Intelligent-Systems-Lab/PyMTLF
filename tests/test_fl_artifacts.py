@@ -7,6 +7,8 @@ from py_mtlf.core.fl_artifacts import (
     FinalModelArtifact,
     HierarchyAssignmentArtifact,
     HierarchyPreparationResultArtifact,
+    RoundInputArtifact,
+    RoundLocalArtifact,
     TensorStateEntry,
     WapeComponents,
     validate_fl_artifact,
@@ -48,6 +50,103 @@ def hierarchy_strategy() -> dict[str, object]:
         "waiting_policy": "all",
         "aggregation": "sample_weighted",
     }
+
+
+def round_input() -> dict[str, object]:
+    return {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_INPUT",
+        "file_digests": FILE_DIGESTS,
+        "fl_metadata": {
+            "contract_version": "1.0",
+            "ml_corre_id": "fl-process-001",
+            "round_ind": 0,
+            "model_contract_digest": DIGEST_A,
+            "preprocessing_contract_digest": DIGEST_B,
+            "weights_digest": DIGEST_C,
+            "client_training": {"epochs": 3},
+        },
+    }
+
+
+def test_round_input_requires_server_controlled_positive_epochs() -> None:
+    artifact = validate_fl_artifact(round_input())
+    assert isinstance(artifact, RoundInputArtifact)
+    assert artifact.fl_metadata.client_training.epochs == 3
+
+    for invalid in (0, -1, 1.5, "3", None):
+        value = round_input()
+        value["fl_metadata"]["client_training"]["epochs"] = invalid
+        with pytest.raises(ValidationError):
+            validate_fl_artifact(value)
+
+    missing = round_input()
+    del missing["fl_metadata"]["client_training"]
+    with pytest.raises(ValidationError):
+        validate_fl_artifact(missing)
+
+
+def test_hierarchy_aggregate_requires_canonical_subordinates_and_exact_sum() -> None:
+    metadata = common_metadata()
+    metadata.update(
+        {
+            "round_ind": 2,
+            "participant_nf_instance_id": BRANCH,
+            "scope_digest": DIGEST_B,
+            "input_global_weights_digest": DIGEST_A,
+            "training_sample_count": 200,
+            "lower_round_ind": 7,
+            "lower_global_artifact_digest": DIGEST_C,
+            "subordinate_participants": [
+                {
+                    "participant_nf_instance_id": CLIENT_A,
+                    "training_sample_count": 120,
+                    "local_artifact_digest": DIGEST_A,
+                },
+                {
+                    "participant_nf_instance_id": CLIENT_B,
+                    "training_sample_count": 80,
+                    "local_artifact_digest": DIGEST_B,
+                },
+            ],
+        }
+    )
+    artifact = validate_fl_artifact(
+        {
+            "bundle_schema_version": "1.0",
+            "artifact_role": "ROUND_LOCAL",
+            "result_type": "HIERARCHY_AGGREGATE",
+            "fl_metadata": metadata,
+            "file_digests": FILE_DIGESTS,
+        }
+    )
+    assert isinstance(artifact, RoundLocalArtifact)
+    assert artifact.fl_metadata.training_sample_count == 200
+
+    metadata["training_sample_count"] = 199
+    with pytest.raises(ValidationError, match="subordinate sample counts"):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "HIERARCHY_AGGREGATE",
+                "fl_metadata": metadata,
+                "file_digests": FILE_DIGESTS,
+            }
+        )
+
+    metadata["training_sample_count"] = 200
+    metadata["subordinate_participants"].reverse()
+    with pytest.raises(ValidationError, match="canonical"):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "HIERARCHY_AGGREGATE",
+                "fl_metadata": metadata,
+                "file_digests": FILE_DIGESTS,
+            }
+        )
 
 
 def test_round_local_contract_has_no_formal_model_identity() -> None:

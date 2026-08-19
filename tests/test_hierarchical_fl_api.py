@@ -35,7 +35,16 @@ def snapshot(state=RootRequestState.ACCEPTED) -> RootRequestSnapshot:
 def test_private_hierarchy_request_returns_async_resource_and_status():
     coordinator = Mock()
     coordinator.submit_manual.return_value = snapshot()
-    coordinator.get.return_value = snapshot(RootRequestState.PREPARATION_WAITING)
+    coordinator.get.return_value = RootRequestSnapshot(
+        request_id=REQUEST_ID,
+        plan_id=PLAN_ID,
+        model_family_id="ue-communication-default",
+        state=RootRequestState.CANDIDATE_READY,
+        current_round=1,
+        completed_rounds=2,
+        candidate_url="http://root.example/round-global/1",
+        candidate_digest="a" * 64,
+    )
 
     with TestClient(app_with(coordinator)) as client:
         created = client.post(
@@ -55,7 +64,16 @@ def test_private_hierarchy_request_returns_async_resource_and_status():
         "state": "ACCEPTED",
     }
     assert status.status_code == 200
-    assert status.json()["state"] == "PREPARATION_WAITING"
+    assert status.json() == {
+        "requestId": REQUEST_ID,
+        "planId": PLAN_ID,
+        "modelFamilyId": "ue-communication-default",
+        "state": "CANDIDATE_READY",
+        "currentRound": 1,
+        "completedRounds": 2,
+        "candidateUrl": "http://root.example/round-global/1",
+        "candidateDigest": "a" * 64,
+    }
     coordinator.submit_manual.assert_called_once_with(
         request_id=REQUEST_ID,
         model_family_id="ue-communication-default",

@@ -508,6 +508,38 @@ class FLWorkspace:
             contract=contract,
         )
 
+    def publish_round_input(
+        self,
+        *,
+        process_id: str,
+        server_nf_instance_id: str,
+        round_indicator: int,
+        base: LoadedBundle,
+        epochs: int,
+    ) -> FLWorkspaceArtifact:
+        return self.publish(
+            process_id=process_id,
+            participant_id=server_nf_instance_id,
+            round_indicator=round_indicator,
+            role="ROUND_INPUT",
+            base=base,
+            model=base.model,
+            metadata={
+                "artifact_role": "ROUND_INPUT",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": process_id,
+                    "round_ind": round_indicator,
+                    "model_contract_digest": model_contract_digest(base.manifest),
+                    "preprocessing_contract_digest": preprocessing_contract_digest(
+                        base.manifest
+                    ),
+                    "weights_digest": weights_digest(base.model),
+                    "client_training": {"epochs": epochs},
+                },
+            },
+        )
+
     def resolve(
         self,
         process_id: str,

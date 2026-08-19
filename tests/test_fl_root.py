@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 
-from py_mtlf.config import FederatedStrategySettings
+from py_mtlf.config import FederatedStrategySettings, FLServerSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import HierarchyPreparationResultArtifact
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
@@ -22,6 +22,7 @@ from py_mtlf.core.fl_root import (
     RootRequestState,
 )
 from py_mtlf.core.fl_server import (
+    FLServerState,
     HierarchyParticipantPreparationOutcome,
     HierarchyPreparationCollection,
 )
@@ -43,7 +44,12 @@ REQUEST_A_ID = "00000000-0000-4000-8000-000000000701"
 REQUEST_B_ID = "00000000-0000-4000-8000-000000000702"
 
 
-def root_coordinator(tmp_path: Path, *, resolver_side_effect=None):
+def root_coordinator(
+    tmp_path: Path,
+    *,
+    resolver_side_effect=None,
+    round_count: int = 1,
+):
     topology_path = tmp_path / "topology.yaml"
     topology_path.write_text(
         f"""
@@ -145,6 +151,10 @@ branches:
                 "waiting_policy": "all",
                 "aggregation": "sample_weighted",
             }
+        ),
+        server_settings=FLServerSettings(
+            round_count=round_count,
+            client_training={"epochs": 3},
         ),
         planner=planner,
         resolver=resolver,
@@ -556,6 +566,17 @@ def _configure_branch_result(
 
     server.collect_hierarchy_preparation.side_effect = collect
     workspace.download_hierarchy.side_effect = download_result
+    artifacts.publish_round_input.return_value = SimpleNamespace(
+        url="http://root.example/round-input/0",
+        digest="e" * 64,
+    )
+    aggregate_path = tmp_path / "root-round-global.tar.gz"
+    aggregate_path.write_bytes(b"root-global")
+    server.execute_hierarchy_round.return_value = SimpleNamespace(
+        digest="f" * 64,
+        path=aggregate_path,
+        url="http://root.example/round-global/0",
+    )
 
 
 def test_root_admits_only_complete_ready_branch_results(tmp_path):
@@ -578,6 +599,23 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         registry=registry,
         outcome=PreparationOutcome.READY,
     )
+    aggregate = server.execute_hierarchy_round.return_value
+    observed_round_states = []
+
+    def execute_round(**kwargs):
+        observer = kwargs["state_observer"]
+        for state in (
+            FLServerState.ROUND_DISPATCH,
+            FLServerState.ROUND_WAITING,
+            FLServerState.ROUND_EVALUATING,
+            FLServerState.AGGREGATING,
+        ):
+            observer(state)
+            snapshot = coordinator.get(REQUEST_A_ID)
+            observed_round_states.append((snapshot.state, snapshot.current_round))
+        return aggregate
+
+    server.execute_hierarchy_round.side_effect = execute_round
     try:
         coordinator.submit_manual(
             request_id=REQUEST_A_ID,
@@ -585,11 +623,11 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         )
         admitted = coordinator.wait_for_state(
             REQUEST_A_ID,
-            {RootRequestState.ADMITTED, RootRequestState.FAILED},
+            {RootRequestState.CANDIDATE_READY, RootRequestState.FAILED},
             timeout=2,
         )
 
-        assert admitted.state is RootRequestState.ADMITTED
+        assert admitted.state is RootRequestState.CANDIDATE_READY
         assert admitted.admission is not None
         assert admitted.admission.plan_id == admitted.plan_id
         assert admitted.admission.branches[0].branch_nf_instance_id == BRANCH_ID
@@ -598,8 +636,216 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
             LEAF_B_ID,
         )
         assert registry.active() is not None
+        assert admitted.completed_rounds == 1
+        assert admitted.current_round == 0
+        assert admitted.candidate_digest == "f" * 64
+        assert observed_round_states == [
+            (RootRequestState.ROUND_DISPATCH, 0),
+            (RootRequestState.ROUND_WAITING, 0),
+            (RootRequestState.ROUND_WAITING, 0),
+            (RootRequestState.AGGREGATING, 0),
+        ]
+        round_input = artifacts.publish_round_input.call_args.kwargs
+        assert round_input["epochs"] == 3
+        upper_round = server.execute_hierarchy_round.call_args.kwargs
+        assert upper_round["expected_subordinates"] == {
+            BRANCH_ID: (LEAF_A_ID, LEAF_B_ID)
+        }
     finally:
         coordinator.close()
+
+
+def test_root_reuses_upper_process_and_feeds_previous_global_into_next_round(
+    tmp_path,
+):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path, round_count=2)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    initial_base = SimpleNamespace(name="initial-base")
+    first_global = SimpleNamespace(name="round-0-global")
+    final_global = SimpleNamespace(name="round-1-global")
+    coordinator._loader.load.side_effect = [
+        initial_base,
+        first_global,
+        final_global,
+    ]
+    artifacts.publish_round_input.side_effect = [
+        SimpleNamespace(url="http://root.example/round-input/0", digest="e" * 64),
+        SimpleNamespace(url="http://root.example/round-input/1", digest="1" * 64),
+    ]
+    aggregates = []
+    for round_indicator, digest in enumerate(("f" * 64, "2" * 64)):
+        path = tmp_path / f"root-round-global-{round_indicator}.tar.gz"
+        path.write_bytes(f"root-global-{round_indicator}".encode())
+        aggregates.append(
+            SimpleNamespace(
+                digest=digest,
+                path=path,
+                url=f"http://root.example/round-global/{round_indicator}",
+            )
+        )
+    server.execute_hierarchy_round.side_effect = aggregates
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        completed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.CANDIDATE_READY, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert completed.state is RootRequestState.CANDIDATE_READY
+        assert completed.completed_rounds == 2
+        assert completed.current_round == 1
+        assert completed.candidate_url.endswith("/round-global/1")
+        assert completed.candidate_digest == "2" * 64
+        publications = artifacts.publish_round_input.call_args_list
+        assert [item.kwargs["base"] for item in publications] == [
+            initial_base,
+            first_global,
+        ]
+        assert [item.kwargs["round_indicator"] for item in publications] == [0, 1]
+        assert [item.kwargs["epochs"] for item in publications] == [3, 3]
+        executions = server.execute_hierarchy_round.call_args_list
+        assert [item.kwargs["process_id"] for item in executions] == [
+            "server-process",
+            "server-process",
+        ]
+        assert [item.kwargs["round_indicator"] for item in executions] == [0, 1]
+        server.start_hierarchy_preparation.assert_called_once()
+    finally:
+        coordinator.close()
+
+
+def test_root_round_failure_cancels_upper_tier_and_releases_experiment(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    server.execute_hierarchy_round.side_effect = RuntimeError(
+        "required hierarchy participants terminated"
+    )
+    try:
+        accepted = coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        failed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert failed.failure_cause == "ROUND_FAILED"
+        assert failed.completed_rounds == 0
+        assert failed.candidate_url == ""
+        server.cancel_hierarchy_preparation.assert_called_once_with(
+            "server-process",
+            "required hierarchy participants terminated",
+        )
+        workspace.release_plan.assert_called_once_with(accepted.plan_id)
+        assert registry.active() is None
+    finally:
+        coordinator.close()
+
+
+def test_root_shutdown_wakes_round_waiter_while_branch_callback_is_pending(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    round_waiting = threading.Event()
+    cancellation_received = threading.Event()
+    close_completed = threading.Event()
+
+    def execute_round(**_kwargs):
+        round_waiting.set()
+        if not cancellation_received.wait(1):
+            raise AssertionError("Root shutdown did not cancel the upper Server process")
+        raise RuntimeError("Root coordinator is closing")
+
+    def cancel_round(_process_id, _reason):
+        cancellation_received.set()
+
+    server.execute_hierarchy_round.side_effect = execute_round
+    server.cancel_hierarchy_preparation.side_effect = cancel_round
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    assert round_waiting.wait(1) is True
+
+    def close_root():
+        coordinator.close()
+        close_completed.set()
+
+    thread = threading.Thread(target=close_root)
+    thread.start()
+    try:
+        assert close_completed.wait(1) is True
+        thread.join(timeout=1)
+        snapshot = coordinator.get(REQUEST_A_ID)
+
+        assert not thread.is_alive()
+        assert snapshot.state is RootRequestState.FAILED
+        assert snapshot.failure_cause == "SHUTDOWN"
+        assert cancellation_received.is_set()
+        assert any(
+            call.args == ("server-process", "Root coordinator is closing")
+            for call in server.cancel_hierarchy_preparation.call_args_list
+        )
+        assert registry.active() is None
+    finally:
+        cancellation_received.set()
+        thread.join(timeout=1)
 
 
 def test_root_validates_failure_result_before_rejecting_admission(tmp_path):

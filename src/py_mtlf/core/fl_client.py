@@ -16,7 +16,12 @@ from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
 from py_mtlf.core.federated_trainer import FederatedTrainer
-from py_mtlf.core.fl_artifacts import ArtifactRole, HierarchyAssignmentArtifact
+from py_mtlf.core.fl_artifacts import (
+    ArtifactRole,
+    HierarchyAssignmentArtifact,
+    RoundInputArtifact,
+    validate_fl_artifact_manifest,
+)
 from py_mtlf.core.fl_experiment import (
     ExperimentLifecycle,
     ExperimentRegistryError,
@@ -37,7 +42,13 @@ from py_mtlf.core.fl_workspace import (
     weights_digest,
 )
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
-from py_mtlf.core.trainer import LocalTrainer, TrustedBundleLoader, resolve_device, wape
+from py_mtlf.core.trainer import (
+    LoadedBundle,
+    LocalTrainer,
+    TrustedBundleLoader,
+    resolve_device,
+    wape,
+)
 from py_mtlf.core.training_data import TrainingDatasetBuilder
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
@@ -98,6 +109,19 @@ class BranchPreparationDispatcher(Protocol):
     ) -> BranchPreparationResultView: ...
 
     def cancel(self, plan_id: str, reason: str) -> None: ...
+
+    def execute_round(
+        self,
+        *,
+        assignment: ValidatedHierarchyArtifact,
+        representation: NwdafMLModelTrainSubsc,
+        upper_input: LoadedBundle,
+        upper_client_subscription_id: str,
+        upper_resource_revision: int,
+        upper_input_artifact_digest: str,
+        upper_scope_digest: str,
+        callback_margin_seconds: int,
+    ) -> BranchArtifactView: ...
 
 
 @dataclass
@@ -632,6 +656,12 @@ class FLClientEngine:
                             return
                         current.preparation_base_artifact = artifact
                         current.hierarchy_assignment = hierarchy_assignment
+                        current.expected_model_contract_digest = model_contract_digest(
+                            hierarchy_assignment.manifest
+                        )
+                        current.expected_preprocessing_contract_digest = (
+                            preprocessing_contract_digest(hierarchy_assignment.manifest)
+                        )
                     result = self._branch_coordinator.prepare(
                         assignment=hierarchy_assignment,
                         representation=value,
@@ -801,8 +831,8 @@ class FLClientEngine:
         try:
             with self._lock:
                 resource = self._required(subscription_id)
-                if resource.revision != revision or resource.dataset_snapshot is None:
-                    raise RuntimeError("FL round has no prepared ADRF dataset")
+                if resource.revision != revision:
+                    raise RuntimeError("FL round resource revision is stale")
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
             model_info = value.ml_model_infos[0]
@@ -814,21 +844,87 @@ class FLClientEngine:
                 f"round-{value.round_indicator}-input",
             )
             base = self._loader.load(artifact)
+            round_input = validate_fl_artifact_manifest(base.manifest)
+            if not isinstance(round_input, RoundInputArtifact):
+                raise RuntimeError("FL round input is not a ROUND_INPUT artifact")
             if (
-                model_contract_digest(base.manifest) != resource.expected_model_contract_digest
+                round_input.fl_metadata.ml_corre_id != value.ml_correlation_id
+                or round_input.fl_metadata.round_ind != value.round_indicator
+                or round_input.fl_metadata.weights_digest != weights_digest(base.model)
+                or round_input.fl_metadata.model_contract_digest
+                != model_contract_digest(base.manifest)
+                or round_input.fl_metadata.preprocessing_contract_digest
+                != preprocessing_contract_digest(base.manifest)
+                or model_contract_digest(base.manifest)
+                != resource.expected_model_contract_digest
                 or preprocessing_contract_digest(base.manifest)
                 != resource.expected_preprocessing_contract_digest
             ):
                 raise RuntimeError(
                     "FL round input changed the prepared model or preprocessing contract"
                 )
+            hierarchy_metadata = (
+                resource.hierarchy_assignment.contract.hierarchy_metadata
+                if resource.hierarchy_assignment is not None
+                else None
+            )
+            if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
+                if self._branch_coordinator is None:
+                    raise RuntimeError("Branch hierarchy round requires the Branch coordinator")
+                published = self._branch_coordinator.execute_round(
+                    assignment=resource.hierarchy_assignment,
+                    representation=value,
+                    upper_input=base,
+                    upper_client_subscription_id=subscription_id,
+                    upper_resource_revision=revision,
+                    upper_input_artifact_digest=artifact.key,
+                    upper_scope_digest=resource.scope.scope_digest,
+                    callback_margin_seconds=(
+                        self._client_settings.callback_deadline_margin_seconds
+                    ),
+                )
+                notification = NwdafMLModelTrainNotif(
+                    notifCorreId=value.notification_correlation_id,
+                    mlCorreId=value.ml_correlation_id,
+                    roundInd=value.round_indicator,
+                    mLModelInfos=[
+                        MLEventNotification(
+                            event=value.ml_event_subscriptions[0].ml_event,
+                            mLFileAddr=MLModelAddress(mLModelUrl=published.url),
+                        )
+                    ],
+                )
+                with self._lock:
+                    current = self._resources.get(subscription_id)
+                    if current is not resource or current.revision != revision:
+                        return
+                    current.state = FLClientState.RESULT_PENDING
+                    self._cancel_delay(subscription_id)
+                self._enqueue_delivery(current, notification, FLClientState.READY)
+                return
+            if snapshot is None:
+                raise RuntimeError("FL round has no prepared ADRF dataset")
             dataset = self._dataset_builder.build(snapshot, base.manifest)
             training_sample_count = sum(
                 scope.training_sample_count for scope in dataset.training_scopes
             )
             if training_sample_count != resource.prepared_training_sample_count:
                 raise RuntimeError("FL round dataset changed after preparation")
-            result = self._trainer.train(base, dataset)
+            proximal_mu = None
+            if resource.hierarchy_assignment is not None:
+                if not isinstance(hierarchy_metadata, LeafAssignmentMetadata):
+                    raise RuntimeError("hierarchy round assignment is unsupported")
+                proximal_mu = hierarchy_metadata.strategy.algorithm.proximal_mu
+            result = self._trainer.train(
+                base,
+                dataset,
+                epochs=round_input.fl_metadata.client_training.epochs,
+                proximal_mu=proximal_mu,
+            )
+            with self._lock:
+                current = self._resources.get(subscription_id)
+                if current is not resource or current.revision != revision:
+                    return
             participant_id = self._participant_id()
             base_digest = weights_digest(base.model)
             output_digest = weights_digest(result.model)
@@ -870,9 +966,12 @@ class FLClientEngine:
                 ],
             )
             with self._lock:
-                resource.state = FLClientState.RESULT_PENDING
+                current = self._resources.get(subscription_id)
+                if current is not resource or current.revision != revision:
+                    return
+                current.state = FLClientState.RESULT_PENDING
                 self._cancel_delay(subscription_id)
-            self._enqueue_delivery(resource, notification, FLClientState.READY)
+            self._enqueue_delivery(current, notification, FLClientState.READY)
             logger.info(
                 "FL client local result ready subscription_id=%s round=%s samples=%s artifact=%s",
                 subscription_id,

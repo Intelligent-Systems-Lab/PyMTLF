@@ -37,5 +37,13 @@ class HierarchicalTrainingStatus(HierarchyPrivateModel):
     plan_id: str = Field(alias="planId")
     model_family_id: str = Field(alias="modelFamilyId")
     state: RootRequestState
+    current_round: int | None = Field(default=None, ge=0, alias="currentRound")
+    completed_rounds: int | None = Field(default=None, ge=0, alias="completedRounds")
+    candidate_url: str | None = Field(default=None, min_length=1, alias="candidateUrl")
+    candidate_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        alias="candidateDigest",
+    )
     failure_cause: str | None = Field(default=None, alias="failureCause")
     failure_detail: str | None = Field(default=None, alias="failureDetail")

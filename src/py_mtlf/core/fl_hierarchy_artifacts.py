@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from py_mtlf.core.artifacts import ArtifactMetadata
-from py_mtlf.core.fl_artifacts import ArtifactRole, HierarchyAssignmentArtifact
+from py_mtlf.core.fl_artifacts import (
+    ArtifactRole,
+    HierarchyAssignmentArtifact,
+    RoundGlobalArtifact,
+)
 from py_mtlf.core.fl_hierarchy import (
     BranchAssignmentMetadata,
     CompleteRequiredAdmission,
@@ -18,6 +22,9 @@ from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     FLWorkspaceArtifact,
     ValidatedHierarchyArtifact,
+    model_contract_digest,
+    preprocessing_contract_digest,
+    weights_digest,
 )
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 
@@ -58,6 +65,92 @@ class HierarchyArtifactService:
             strategy=strategy,
         )
         return self._publish(base, metadata, ArtifactRole.HIERARCHY_ASSIGNMENT)
+
+    def publish_round_input(
+        self,
+        *,
+        base: LoadedBundle,
+        process_id: str,
+        server_nf_instance_id: str,
+        round_indicator: int,
+        epochs: int,
+    ) -> FLWorkspaceArtifact:
+        return self._workspace.publish_round_input(
+            process_id=process_id,
+            server_nf_instance_id=server_nf_instance_id,
+            round_indicator=round_indicator,
+            base=base,
+            epochs=epochs,
+        )
+
+    def publish_hierarchy_aggregate(
+        self,
+        *,
+        upper_input: LoadedBundle,
+        lower_global: FLWorkspaceArtifact,
+        upper_process_id: str,
+        branch_nf_instance_id: str,
+        upper_round_indicator: int,
+        upper_scope_digest: str,
+    ) -> FLWorkspaceArtifact:
+        if not isinstance(lower_global.contract, RoundGlobalArtifact):
+            raise HierarchyArtifactOperationError(
+                "lower result is not a ROUND_GLOBAL artifact"
+            )
+        lower_bundle = self._loader.load(
+            ArtifactMetadata(
+                key=lower_global.digest,
+                size_bytes=lower_global.path.stat().st_size,
+                path=lower_global.path,
+                url=lower_global.url,
+            )
+        )
+        lower_metadata = lower_global.contract.fl_metadata
+        base_digest = weights_digest(upper_input.model)
+        if (
+            lower_metadata.model_contract_digest
+            != model_contract_digest(upper_input.manifest)
+            or lower_metadata.preprocessing_contract_digest
+            != preprocessing_contract_digest(upper_input.manifest)
+            or lower_metadata.base_weights_digest != base_digest
+            or lower_metadata.weights_digest != weights_digest(lower_bundle.model)
+        ):
+            raise HierarchyArtifactOperationError(
+                "lower ROUND_GLOBAL does not match the upper round input"
+            )
+        return self._workspace.publish(
+            process_id=upper_process_id,
+            participant_id=branch_nf_instance_id,
+            round_indicator=upper_round_indicator,
+            role="ROUND_LOCAL",
+            base=upper_input,
+            model=lower_bundle.model,
+            metadata={
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "HIERARCHY_AGGREGATE",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": upper_process_id,
+                    "round_ind": upper_round_indicator,
+                    "participant_nf_instance_id": branch_nf_instance_id,
+                    "scope_digest": upper_scope_digest,
+                    "input_global_weights_digest": base_digest,
+                    "model_contract_digest": model_contract_digest(upper_input.manifest),
+                    "preprocessing_contract_digest": preprocessing_contract_digest(
+                        upper_input.manifest
+                    ),
+                    "base_weights_digest": base_digest,
+                    "weights_digest": weights_digest(lower_bundle.model),
+                    "training_sample_count": lower_metadata.aggregated_training_sample_count,
+                    "lower_round_ind": lower_metadata.round_ind,
+                    "lower_global_artifact_digest": lower_global.digest,
+                    "subordinate_participants": [
+                        item.model_dump(mode="python")
+                        for item in lower_metadata.participants
+                    ],
+                },
+            },
+        )
 
     def republish_leaf_assignment(
         self,

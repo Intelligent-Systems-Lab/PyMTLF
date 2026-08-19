@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -16,8 +17,10 @@ from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeRef
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
+    RoundInputArtifact,
     RoundLocalAccuracyCheckMetadata,
     RoundLocalArtifact,
+    RoundLocalHierarchyAggregateMetadata,
     RoundLocalResultType,
     ValidationSummary,
     validate_fl_artifact,
@@ -29,6 +32,7 @@ from py_mtlf.core.fl_experiment import (
 )
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
+    FLWorkspaceArtifact,
     model_contract_digest,
     preprocessing_contract_digest,
     weights_digest,
@@ -68,6 +72,7 @@ class FLServerState(StrEnum):
     READY = "READY"
     ROUND_DISPATCH = "ROUND_DISPATCH"
     ROUND_WAITING = "ROUND_WAITING"
+    ROUND_EVALUATING = "ROUND_EVALUATING"
     AGGREGATING = "AGGREGATING"
     FINAL_VALIDATION_DISPATCH = "FINAL_VALIDATION_DISPATCH"
     FINAL_VALIDATION_WAITING = "FINAL_VALIDATION_WAITING"
@@ -104,6 +109,8 @@ class FLParticipant:
     preparation_failure: str = ""
     expected_round: int | None = None
     notification: NwdafMLModelTrainNotif | None = None
+    round_complete: bool = False
+    round_failure: str = ""
     delay_extensions: int = 0
     requested_extension: int = 0
     granted_extension_seconds: int = 0
@@ -468,14 +475,13 @@ class FLServerEngine:
             process = self._processes.get(process_id)
         if process is None or not process.hierarchy_plan_id:
             raise KeyError(process_id)
-        if process.hierarchy_cleanup_complete:
-            return
         with process.condition:
             process.state = FLServerState.FAILED
             if not process.failure:
                 process.failure = reason
             process.condition.notify_all()
-        self._cleanup_hierarchy_process(process)
+        if not process.hierarchy_cleanup_complete:
+            self._cleanup_hierarchy_process(process)
         active = self._experiments.for_server_process(process.process_id)
         if active is not None:
             self._experiments.detach_server(
@@ -500,15 +506,6 @@ class FLServerEngine:
             )
             if participant is None:
                 raise KeyError(notification.notification_correlation_id)
-            identity = participant.identity
-            identity = TrainingResourceIdentity(
-                subscription_id=identity.subscription_id,
-                ml_correlation_id=process.process_id,
-                notification_correlation_id=identity.notification_correlation_id,
-                expected_round_indicator=identity.expected_round_indicator,
-                notification_method=identity.notification_method,
-            )
-            validate_fl_notification(notification, identity)
             digest = hashlib.sha256(
                 json.dumps(
                     notification.model_dump(
@@ -530,6 +527,23 @@ class FLServerEngine:
                 FLServerState.FINAL_VALIDATION_DISPATCH,
                 FLServerState.FINAL_VALIDATION_WAITING,
             }
+            identity = participant.identity
+            identity = TrainingResourceIdentity(
+                subscription_id=identity.subscription_id,
+                ml_correlation_id=process.process_id,
+                notification_correlation_id=identity.notification_correlation_id,
+                expected_round_indicator=identity.expected_round_indicator,
+                notification_method=identity.notification_method,
+            )
+            try:
+                validate_fl_notification(notification, identity)
+            except ValueError as error:
+                if process.hierarchy_plan_id and active_round:
+                    participant.round_failure = str(error)
+                    participant.round_complete = True
+                    participant.accepted_notification_digest = digest
+                    process.condition.notify_all()
+                raise
             if process.hierarchy_plan_id and not (active_preparation or active_round):
                 if digest in {
                     participant.accepted_notification_digest,
@@ -537,6 +551,23 @@ class FLServerEngine:
                 }:
                     return
                 raise ValueError("hierarchy callback arrived after the active stage")
+            if process.hierarchy_plan_id and active_round:
+                if participant.round_complete:
+                    if digest == participant.accepted_notification_digest:
+                        return
+                    participant.round_failure = "conflicting duplicate round callback"
+                    process.condition.notify_all()
+                    raise ValueError(participant.round_failure)
+                if notification.delay_event_notification is not None and (
+                    notification.ml_model_infos or notification.termination_request
+                ):
+                    participant.round_failure = (
+                        "delay callback cannot also contain a terminal round outcome"
+                    )
+                    participant.round_complete = True
+                    participant.accepted_notification_digest = digest
+                    process.condition.notify_all()
+                    raise ValueError(participant.round_failure)
             if active_preparation:
                 if notification.round_indicator is not None:
                     participant.preparation_failure = (
@@ -593,6 +624,15 @@ class FLServerEngine:
                     process.failure = "delay callback arrived outside the expected stage"
                     process.condition.notify_all()
                     raise ValueError(process.failure)
+                if (
+                    process.hierarchy_plan_id
+                    and participant.accepted_delay_notification_digest
+                ):
+                    participant.round_failure = "conflicting duplicate delay callback"
+                    participant.round_complete = True
+                    participant.accepted_notification_digest = digest
+                    process.condition.notify_all()
+                    raise ValueError(participant.round_failure)
                 participant.accepted_delay_notification_digest = digest
                 participant.requested_extension = (
                     notification.delay_event_notification.expected_completion_time or 0
@@ -606,6 +646,8 @@ class FLServerEngine:
                         return
                     participant.notification = notification.model_copy(deep=True)
                     participant.accepted_notification_digest = digest
+                    if process.hierarchy_plan_id:
+                        participant.round_complete = True
                 else:
                     process.failure = "model callback arrived outside the expected stage"
                     process.condition.notify_all()
@@ -615,13 +657,33 @@ class FLServerEngine:
                     process.failure = "termination callback arrived outside the expected stage"
                     process.condition.notify_all()
                     raise ValueError(process.failure)
-                process.failure = (
-                    f"participant terminated training: {notification.termination_request}"
-                )
+                if process.hierarchy_plan_id:
+                    if participant.notification is not None:
+                        if participant.accepted_notification_digest != digest:
+                            participant.round_failure = (
+                                "conflicting duplicate round callback"
+                            )
+                            participant.round_complete = True
+                            process.condition.notify_all()
+                            raise ValueError(participant.round_failure)
+                    else:
+                        participant.notification = notification.model_copy(deep=True)
+                        participant.accepted_notification_digest = digest
+                    participant.round_complete = True
+                else:
+                    process.failure = (
+                        f"participant terminated training: {notification.termination_request}"
+                    )
             elif notification.delay_event_notification is None and not notification.ml_model_infos:
-                process.failure = "notification does not contain a stage outcome"
+                failure = "notification does not contain a stage outcome"
+                if process.hierarchy_plan_id and active_round:
+                    participant.round_failure = failure
+                    participant.round_complete = True
+                    participant.accepted_notification_digest = digest
+                else:
+                    process.failure = failure
                 process.condition.notify_all()
-                raise ValueError(process.failure)
+                raise ValueError(failure)
             process.condition.notify_all()
 
     def discard_restored_routes(self, subscription_ids: tuple[str, ...]) -> None:
@@ -741,6 +803,109 @@ class FLServerEngine:
             timed_out_participant_nf_instance_ids=timed_out,
         )
 
+    def execute_hierarchy_round(
+        self,
+        *,
+        process_id: str,
+        round_indicator: int,
+        round_input_url: str,
+        expected_result_type: RoundLocalResultType,
+        expected_subordinates: dict[str, tuple[str, ...]] | None = None,
+        timeout_seconds: int | None = None,
+        state_observer: Callable[[FLServerState], None] | None = None,
+    ) -> FLWorkspaceArtifact:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        if process.state is not FLServerState.READY:
+            raise RuntimeError("hierarchy Server process is not ready for a round")
+        if round_indicator < 0:
+            raise ValueError("hierarchy round indicator must be non-negative")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("hierarchy round timeout must be positive")
+        timeout = min(
+            timeout_seconds or self._server_settings.round_timeout_seconds,
+            self._server_settings.round_timeout_seconds,
+        )
+        try:
+            process.state = FLServerState.ROUND_DISPATCH
+            if state_observer is not None:
+                state_observer(process.state)
+            for participant in process.participants:
+                self._raise_if_failed(process)
+                participant.expected_round = round_indicator
+                participant.notification = None
+                participant.round_complete = False
+                participant.round_failure = ""
+                participant.accepted_notification_digest = ""
+                participant.accepted_delay_notification_digest = ""
+                participant.delay_extensions = 0
+                participant.requested_extension = 0
+                participant.granted_extension_seconds = 0
+                self._patch_round(
+                    process,
+                    participant,
+                    round_indicator,
+                    round_input_url,
+                    timeout_seconds=timeout,
+                )
+            self._raise_if_failed(process)
+            process.state = FLServerState.ROUND_WAITING
+            if state_observer is not None:
+                state_observer(process.state)
+            try:
+                self._wait(
+                    process,
+                    lambda: all(item.round_complete for item in process.participants),
+                    timeout,
+                    collect_participant_failures=True,
+                )
+            except RuntimeError as error:
+                if str(error) == "federated stage deadline expired":
+                    for participant in process.participants:
+                        if not participant.round_complete:
+                            participant.round_failure = "round deadline expired"
+                            participant.round_complete = True
+                raise
+            process.state = FLServerState.ROUND_EVALUATING
+            if state_observer is not None:
+                state_observer(process.state)
+            failed = [
+                item.candidate.target.nf_instance_id
+                for item in process.participants
+                if item.round_failure
+                or (
+                    item.notification is not None
+                    and item.notification.termination_request is not None
+                )
+            ]
+            if failed:
+                raise RuntimeError(
+                    "required hierarchy participants terminated: " + ",".join(failed)
+                )
+            process.state = FLServerState.AGGREGATING
+            if state_observer is not None:
+                state_observer(process.state)
+            result = self._aggregate_round(
+                process,
+                round_input_url,
+                round_indicator,
+                expected_result_type=expected_result_type,
+                expected_subordinates=expected_subordinates,
+            )
+            process.current_global_url = result.url
+            process.state = FLServerState.READY
+            return result
+        except Exception as error:
+            with process.condition:
+                process.state = FLServerState.FAILED
+                if not process.failure:
+                    process.failure = str(error)
+                process.condition.notify_all()
+            self.cancel_hierarchy_preparation(process.process_id, str(error))
+            raise
+
     def mark_scope_adopted(
         self,
         family_key: tuple[str, str],
@@ -838,6 +1003,23 @@ class FLServerEngine:
                 raise RuntimeError("FL base model changed while participants were preparing")
             process.current_global_url = current.artifact.url
             for round_indicator in range(self._server_settings.round_count):
+                source_artifact = (
+                    current.artifact
+                    if round_indicator == 0
+                    else self._workspace.download(
+                        process.current_global_url,
+                        process.process_id,
+                        f"round-{round_indicator}-global-source",
+                    )
+                )
+                source_bundle = self._loader.load(source_artifact)
+                round_input = self._workspace.publish_round_input(
+                    process_id=process.process_id,
+                    server_nf_instance_id=self._server_id(),
+                    round_indicator=round_indicator,
+                    base=source_bundle,
+                    epochs=self._server_settings.client_training.epochs,
+                )
                 process.state = FLServerState.ROUND_DISPATCH
                 for participant in process.participants:
                     participant.expected_round = round_indicator
@@ -851,7 +1033,7 @@ class FLServerEngine:
                         process,
                         participant,
                         round_indicator,
-                        process.current_global_url,
+                        round_input.url,
                     )
                 process.state = FLServerState.ROUND_WAITING
                 self._wait(
@@ -861,8 +1043,8 @@ class FLServerEngine:
                 )
                 process.state = FLServerState.AGGREGATING
                 process.current_global_url = self._aggregate_round(
-                    process, current.artifact, round_indicator
-                )
+                    process, round_input.url, round_indicator
+                ).url
                 self._raise_if_failed(process)
                 logger.info(
                     "Federated round aggregated process_id=%s round=%s artifact=%s",
@@ -1070,6 +1252,8 @@ class FLServerEngine:
         participant: FLParticipant,
         round_indicator: int,
         artifact_url: str,
+        *,
+        timeout_seconds: int | None = None,
     ) -> None:
         patch = NwdafMLModelTrainSubscPatch(
             mLPreFlag=False,
@@ -1081,7 +1265,7 @@ class FLServerEngine:
                 )
             ],
             mLTrainRepInfo=MLTrainReportInfo(
-                maxResTime=self._server_settings.round_timeout_seconds
+                maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
             ),
         )
         response = self._client.patch(
@@ -1123,7 +1307,14 @@ class FLServerEngine:
                 f"participant final validation patch failed with {response.status_code}"
             )
 
-    def _wait(self, process: FLProcess, predicate, timeout: int) -> None:
+    def _wait(
+        self,
+        process: FLProcess,
+        predicate,
+        timeout: int,
+        *,
+        collect_participant_failures: bool = False,
+    ) -> None:
         deadline = time.monotonic() + timeout
         with process.condition:
             while True:
@@ -1139,6 +1330,13 @@ class FLServerEngine:
                             participant.delay_extensions
                             >= self._server_settings.delay_policy.max_extensions
                         ):
+                            if collect_participant_failures:
+                                participant.round_failure = (
+                                    "participant exceeded delay extension limit"
+                                )
+                                participant.round_complete = True
+                                participant.requested_extension = 0
+                                continue
                             raise RuntimeError("participant exceeded delay extension limit")
                         remaining_budget = (
                             self._server_settings.delay_policy.max_extension_seconds
@@ -1150,12 +1348,31 @@ class FLServerEngine:
                             remaining_budget,
                         )
                         if extension <= 0:
+                            if collect_participant_failures:
+                                participant.round_failure = (
+                                    "participant delay extension budget is exhausted"
+                                )
+                                participant.round_complete = True
+                                participant.requested_extension = 0
+                                continue
                             raise RuntimeError("participant delay extension budget is exhausted")
-                        self._grant_extension(participant, extension)
+                        try:
+                            self._grant_extension(participant, extension)
+                        except Exception as error:
+                            if collect_participant_failures:
+                                participant.round_failure = (
+                                    f"participant delay extension failed: {error}"
+                                )
+                                participant.round_complete = True
+                                participant.requested_extension = 0
+                                continue
+                            raise
                         participant.delay_extensions += 1
                         participant.granted_extension_seconds += extension
                         participant.requested_extension = 0
                         deadline = max(deadline, time.monotonic() + extension)
+                if predicate():
+                    return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("federated stage deadline expired")
@@ -1221,26 +1438,47 @@ class FLServerEngine:
     def _aggregate_round(
         self,
         process: FLProcess,
-        base_artifact: ArtifactMetadata,
+        round_input_url: str,
         round_indicator: int,
-    ) -> str:
-        if round_indicator > 0:
-            base_artifact = self._workspace.download(
-                process.current_global_url,
-                process.process_id,
-                f"round-{round_indicator}-global-input",
-            )
+        *,
+        expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
+        expected_subordinates: dict[str, tuple[str, ...]] | None = None,
+    ) -> FLWorkspaceArtifact:
+        base_artifact = self._workspace.download(
+            round_input_url,
+            process.process_id,
+            f"round-{round_indicator}-input-for-aggregation",
+        )
         base = self._loader.load(base_artifact)
+        input_contract = validate_fl_artifact(_artifact_projection(base.manifest))
+        if not isinstance(input_contract, RoundInputArtifact):
+            raise RuntimeError("Server aggregation input is not a ROUND_INPUT artifact")
         base_digest = weights_digest(base.model)
+        if (
+            input_contract.fl_metadata.ml_corre_id != process.process_id
+            or input_contract.fl_metadata.round_ind != round_indicator
+            or input_contract.fl_metadata.weights_digest != base_digest
+            or input_contract.fl_metadata.model_contract_digest
+            != model_contract_digest(base.manifest)
+            or input_contract.fl_metadata.preprocessing_contract_digest
+            != preprocessing_contract_digest(base.manifest)
+        ):
+            raise RuntimeError("Server aggregation input identity does not match round")
         expected_model_contract = model_contract_digest(base.manifest)
         expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
         local_bundles: list[tuple[LoadedBundle, int]] = []
         participant_metadata = []
         for participant in process.participants:
             notification = participant.notification
-            if notification is None or not notification.ml_model_infos:
-                raise RuntimeError("participant local result is missing")
-            address = notification.ml_model_infos[0].model_file_address
+            model_infos = notification.ml_model_infos if notification is not None else None
+            if (
+                notification is None
+                or model_infos is None
+                or len(model_infos) != 1
+                or model_infos[0].event != participant.scope.ml_event
+            ):
+                raise RuntimeError("participant local result notification is missing or invalid")
+            address = model_infos[0].model_file_address
             if address is None or address.model_url is None:
                 raise RuntimeError("participant local result has no model URL")
             artifact = self._workspace.download(
@@ -1253,9 +1491,23 @@ class FLServerEngine:
             contract = validate_fl_artifact(projection)
             if not isinstance(contract, RoundLocalArtifact):
                 raise RuntimeError("participant returned a non-local FL artifact")
-            if contract.result_type is not RoundLocalResultType.TRAINING:
-                raise RuntimeError("participant returned a non-training local artifact")
+            if contract.result_type is not expected_result_type:
+                raise RuntimeError("participant returned an unexpected local artifact type")
             metadata = contract.fl_metadata
+            if expected_result_type is RoundLocalResultType.HIERARCHY_AGGREGATE:
+                if not isinstance(metadata, RoundLocalHierarchyAggregateMetadata):
+                    raise RuntimeError("Branch result lacks hierarchy aggregate metadata")
+                expected = (expected_subordinates or {}).get(
+                    participant.candidate.target.nf_instance_id
+                )
+                actual = tuple(
+                    item.participant_nf_instance_id
+                    for item in metadata.subordinate_participants
+                )
+                if expected is None or actual != expected:
+                    raise RuntimeError(
+                        "Branch hierarchy aggregate subordinate set does not match admission"
+                    )
             if (
                 metadata.ml_corre_id != process.process_id
                 or metadata.round_ind != round_indicator
@@ -1263,8 +1515,10 @@ class FLServerEngine:
                 != participant.candidate.target.nf_instance_id
                 or metadata.scope_digest != participant.expected_scope_digest
                 or metadata.input_global_weights_digest != base_digest
+                or metadata.base_weights_digest != base_digest
                 or metadata.model_contract_digest != expected_model_contract
                 or metadata.preprocessing_contract_digest != expected_preprocessing_contract
+                or metadata.weights_digest != weights_digest(bundle.model)
             ):
                 raise RuntimeError("participant local artifact identity does not match assignment")
             local_bundles.append((bundle, metadata.training_sample_count))
@@ -1303,7 +1557,7 @@ class FLServerEngine:
                 },
             },
         )
-        return published.url
+        return published
 
     def _evaluate_final_validation(
         self,

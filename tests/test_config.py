@@ -33,6 +33,19 @@ def test_defaults_use_confirmed_phase_one_values():
     assert settings.artifact.max_entries == 32
     assert FittingSettings().validation_ratio == 0.10
     assert FLServerSettings().preparation_data_window_seconds == 3600
+    assert FLServerSettings().client_training.epochs == 18
+
+
+def test_federated_epochs_are_server_owned() -> None:
+    server = FLServerSettings(client_training={"epochs": 4})
+    assert server.client_training.epochs == 4
+
+    with pytest.raises(ValidationError):
+        FLClientSettings.model_validate({"training": {"epochs": 4}})
+
+    for epochs in (0, -1, 1.5, "4"):
+        with pytest.raises(ValidationError):
+            FLServerSettings.model_validate({"client_training": {"epochs": epochs}})
 
 
 def test_load_settings_rejects_unknown_fields(tmp_path):

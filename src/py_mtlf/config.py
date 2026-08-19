@@ -150,11 +150,10 @@ class ArtifactDownloadSettings(FrozenSettings):
         return normalized
 
 
-class FittingSettings(FrozenSettings):
+class FittingRuntimeSettings(FrozenSettings):
     device: str = "cpu"
     batch_size: int = Field(default=32, gt=0)
     learning_rate: float = Field(default=0.001, gt=0)
-    epochs: int = Field(default=18, gt=0)
     validation_ratio: float = Field(default=0.10, gt=0, lt=1)
     random_seed: int = Field(default=42, ge=0)
 
@@ -168,6 +167,14 @@ class FittingSettings(FrozenSettings):
         if match is None:
             raise ValueError("training.device must be 'cpu', 'cuda', or 'cuda:N'")
         return f"cuda:{match.group(1) or '0'}"
+
+
+class FittingSettings(FittingRuntimeSettings):
+    epochs: int = Field(default=18, gt=0)
+
+
+class FederatedFittingSettings(FittingRuntimeSettings):
+    pass
 
 
 class ValidationSettings(FrozenSettings):
@@ -193,7 +200,7 @@ class FLClientSettings(FrozenSettings):
     max_concurrent_jobs: int = Field(default=2, gt=0, le=32)
     model_interoperability_ids: tuple[str, ...] = ()
     fallback_deadlines: FallbackDeadlineSettings = FallbackDeadlineSettings()
-    training: FittingSettings = FittingSettings()
+    training: FederatedFittingSettings = FederatedFittingSettings()
 
     @field_validator("model_interoperability_ids")
     @classmethod
@@ -230,6 +237,10 @@ class CleanupSettings(FrozenSettings):
     retry_backoff_seconds: float = Field(default=0.2, ge=0, le=60)
 
 
+class ClientTrainingSettings(FrozenSettings):
+    epochs: int = Field(default=18, gt=0, strict=True)
+
+
 class FLServerSettings(FrozenSettings):
     callback_uri: str = "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
     preparation_timeout_seconds: int = Field(default=300, gt=0, le=86400)
@@ -237,6 +248,7 @@ class FLServerSettings(FrozenSettings):
     round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
     round_count: int = Field(default=2, ge=1, le=100)
     max_active_processes: int = Field(default=1, gt=0, le=32)
+    client_training: ClientTrainingSettings = ClientTrainingSettings()
     delay_policy: DelayPolicySettings = DelayPolicySettings()
     cleanup: CleanupSettings = CleanupSettings()
     final_validation: ValidationSettings = ValidationSettings()

@@ -130,10 +130,58 @@ def test_local_trainer_uses_cuda_and_returns_cpu_model():
 def test_federated_trainer_uses_cuda_and_returns_cpu_model():
     result = FederatedTrainer(
         FittingSettings(device="cuda:0", epochs=1, batch_size=8)
-    ).train(bundle(TinyModel()), training_dataset())
+    ).train(bundle(TinyModel()), training_dataset(), epochs=1)
 
     assert math.isfinite(result.final_loss)
     assert next(result.model.parameters()).device.type == "cpu"
+
+
+def test_federated_trainer_uses_server_supplied_epochs(monkeypatch):
+    steps = 0
+    original_step = torch.optim.Adam.step
+
+    def counted_step(optimizer, *args, **kwargs):
+        nonlocal steps
+        steps += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.Adam, "step", counted_step)
+    FederatedTrainer(FittingSettings(batch_size=8)).train(
+        bundle(TinyModel()),
+        training_dataset(),
+        epochs=3,
+    )
+
+    assert steps == 24
+
+
+def test_fedprox_penalty_uses_immutable_global_reference():
+    base = bundle(TinyModel())
+    before = {name: value.detach().clone() for name, value in base.model.named_parameters()}
+
+    result = FederatedTrainer(FittingSettings(batch_size=8)).train(
+        base,
+        training_dataset(),
+        epochs=1,
+        proximal_mu=0.5,
+    )
+
+    assert all(torch.equal(before[name], value) for name, value in base.model.named_parameters())
+    assert any(
+        not torch.equal(before[name], value)
+        for name, value in result.model.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("value", [0, -0.1, math.nan, math.inf, -math.inf])
+def test_federated_trainer_rejects_invalid_fedprox_mu(value):
+    with pytest.raises(ValueError, match="proximal_mu"):
+        FederatedTrainer(FittingSettings()).train(
+            bundle(TinyModel()),
+            training_dataset(),
+            epochs=1,
+            proximal_mu=value,
+        )
 
 
 def test_wape_zero_denominator_matches_accuracy_policy():

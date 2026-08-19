@@ -1,15 +1,19 @@
 import hashlib
 import json
 import threading
+import time
 from datetime import datetime
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import httpx
 import pytest
+import torch
 from nwdaf_context import context_client
 
 from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
+from py_mtlf.core.fl_artifacts import RoundLocalResultType
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
@@ -21,7 +25,11 @@ from py_mtlf.core.fl_server import (
     HierarchyPreparationTarget,
     _assign,
 )
-from py_mtlf.core.fl_workspace import preprocessing_contract_digest
+from py_mtlf.core.fl_workspace import (
+    model_contract_digest,
+    preprocessing_contract_digest,
+    weights_digest,
+)
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
 from py_mtlf.wire.private import SelectedTarget
 
@@ -247,6 +255,100 @@ def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
             {"subscription-a"}
         )
         policy.complete_retrain.assert_called_once_with(intent.family_key)
+    finally:
+        orchestrator.close()
+
+
+def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    second_owner_id = "22222222-2222-4222-8222-222222222222"
+    active_scopes = (
+        scope("scope-a", "000001", owner_id),
+        scope("scope-b", "000002", second_owner_id),
+    )
+    intent = SimpleNamespace(
+        family_key="ue-communication-default",
+        active_scope_keys=tuple(item.scope_key for item in active_scopes),
+        active_scopes=active_scopes,
+    )
+    current = SimpleNamespace(
+        artifact=SimpleNamespace(
+            key="a" * 64,
+            url="http://root.example/base.tar.gz",
+        ),
+        descriptor=SimpleNamespace(model_interoperability="001122"),
+    )
+    catalog = Mock()
+    catalog.current.return_value = current
+    resolver = Mock()
+    resolver.discover.return_value = (
+        candidate(owner_id, "000001"),
+        candidate(second_owner_id, "000002"),
+    )
+    context = Mock()
+    context.get.return_value.nf_instance_id = (
+        "33333333-3333-4333-8333-333333333333"
+    )
+    workspace = Mock()
+    source = SimpleNamespace(name="flat-base")
+    round_input = SimpleNamespace(url="http://root.example/round-input/0")
+    workspace.publish_round_input.return_value = round_input
+    policy = Mock()
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(
+            round_count=1,
+            client_training={"epochs": 9},
+            cleanup={"max_attempts": 1},
+        ),
+        context,
+        policy,
+        catalog,
+        workspace,
+        resolver,
+        client=client,
+    )
+    orchestrator._loader = Mock()
+    orchestrator._loader.load.return_value = source
+
+    def prepare(_process, participant, _model_interoperability, _base_url):
+        participant.resource_location = (
+            "http://go.example/subscriptions/"
+            + participant.candidate.target.nf_instance_id
+        )
+        participant.preparation_complete = True
+
+    def patch_round(_process, participant, *_args, **_kwargs):
+        participant.notification = Mock()
+
+    def patch_validation(_process, participant, *_args, **_kwargs):
+        participant.notification = Mock()
+
+    def evaluate_validation(process, *_args):
+        process.gate_would_accept = True
+
+    orchestrator._create_preparation = Mock(side_effect=prepare)
+    orchestrator._wait = Mock()
+    orchestrator._patch_round = Mock(side_effect=patch_round)
+    orchestrator._aggregate_round = Mock(
+        return_value=SimpleNamespace(url="http://root.example/round-global/0")
+    )
+    orchestrator._patch_validation = Mock(side_effect=patch_validation)
+    orchestrator._evaluate_final_validation = Mock(side_effect=evaluate_validation)
+    process = FLProcess(process_id="process-1", intent=intent)
+    try:
+        orchestrator._run(process)
+
+        publication = workspace.publish_round_input.call_args.kwargs
+        assert publication["base"] is source
+        assert publication["process_id"] == process.process_id
+        assert publication["round_indicator"] == 0
+        assert publication["epochs"] == 9
+        assert orchestrator._patch_round.call_args.args[3] == round_input.url
+        assert process.candidate_url == "http://root.example/round-global/0"
+        assert process.state is FLServerState.CANDIDATE_READY
     finally:
         orchestrator.close()
 
@@ -733,6 +835,655 @@ def test_hierarchy_collection_waits_for_every_leaf_after_first_failure(tmp_path)
         orchestrator.close()
 
 
+def test_hierarchy_round_waits_for_every_terminal_outcome_before_failure(tmp_path):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.patch.return_value = Mock(status_code=204)
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(round_timeout_seconds=2),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    completed = threading.Event()
+    failures = []
+
+    def execute():
+        try:
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=3,
+                round_input_url="http://root.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+        except Exception as error:
+            failures.append(str(error))
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        while process.state is FLServerState.ROUND_DISPATCH:
+            time.sleep(0.001)
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif(
+                notifCorreId=participants[0].notification_correlation_id,
+                mlCorreId=process.process_id,
+                roundInd=3,
+                termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+            )
+        )
+        assert completed.wait(0.05) is False
+
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participants[1].notification_correlation_id,
+                    "mlCorreId": process.process_id,
+                    "roundInd": 3,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://leaf.example/local-result"
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        assert completed.wait(1) is True
+        assert failures == [
+            "required hierarchy participants terminated: " + participant_ids[0]
+        ]
+        assert process.state is FLServerState.FAILED
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+
+
+def test_hierarchy_round_patch_failure_cleans_lower_resources_before_return(tmp_path):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.patch.side_effect = [Mock(status_code=204), Mock(status_code=500)]
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+    try:
+        with pytest.raises(RuntimeError, match="round patch failed"):
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=3,
+                round_input_url="http://branch.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+
+        assert process.state is FLServerState.FAILED
+        assert process.hierarchy_cleanup_complete is True
+        assert client.delete.call_args_list == [
+            call(participants[0].resource_location),
+            call(participants[1].resource_location),
+        ]
+        assert all(
+            participant.notification_correlation_id not in orchestrator._correlations
+            for participant in participants
+        )
+    finally:
+        orchestrator.close()
+
+
+def test_hierarchy_round_deadline_marks_every_missing_participant_and_skips_aggregate(
+    tmp_path,
+):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.patch.return_value = Mock(status_code=204)
+    client.delete.return_value = Mock(status_code=204)
+    workspace = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+    orchestrator._wait = Mock(
+        side_effect=RuntimeError("federated stage deadline expired")
+    )
+    try:
+        with pytest.raises(RuntimeError, match="federated stage deadline expired"):
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=3,
+                round_input_url="http://branch.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+
+        assert process.state is FLServerState.FAILED
+        assert [item.round_failure for item in participants] == [
+            "round deadline expired",
+            "round deadline expired",
+        ]
+        assert all(item.round_complete for item in participants)
+        workspace.download.assert_not_called()
+        workspace.publish.assert_not_called()
+        assert client.delete.call_args_list == [
+            call(participants[0].resource_location),
+            call(participants[1].resource_location),
+        ]
+    finally:
+        orchestrator.close()
+
+
+def test_parent_cancel_during_hierarchy_round_wakes_waiter_and_cleans_resources(
+    tmp_path,
+):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="round-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=[participant],
+    )
+    client = Mock()
+    client.patch.return_value = Mock(status_code=204)
+    client.delete.return_value = Mock(status_code=204)
+    workspace = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(
+            round_timeout_seconds=30,
+            cleanup={"max_attempts": 1},
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    waiting = threading.Event()
+    completed = threading.Event()
+    failures = []
+
+    def execute():
+        try:
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=0,
+                round_input_url="http://branch.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+                state_observer=lambda state: (
+                    waiting.set() if state is FLServerState.ROUND_WAITING else None
+                ),
+            )
+        except RuntimeError as error:
+            failures.append(str(error))
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        assert waiting.wait(1) is True
+        orchestrator.cancel_hierarchy_preparation(process.process_id, "parent cancelled")
+        assert completed.wait(1) is True
+
+        assert failures == ["parent cancelled"]
+        assert process.state is FLServerState.FAILED
+        assert process.hierarchy_cleanup_complete is True
+        workspace.download.assert_not_called()
+        workspace.publish.assert_not_called()
+        client.delete.assert_called_once_with(participant.resource_location)
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+
+
+def test_parent_cancel_during_lower_patch_fanout_fences_remaining_dispatches(
+    tmp_path,
+):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+
+    def patch_then_cancel(*_args, **_kwargs):
+        orchestrator.cancel_hierarchy_preparation(
+            process.process_id,
+            "parent cancelled during fanout",
+        )
+        return Mock(status_code=204)
+
+    client.patch.side_effect = patch_then_cancel
+    try:
+        with pytest.raises(RuntimeError, match="parent cancelled during fanout"):
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=0,
+                round_input_url="http://branch.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+
+        assert client.patch.call_count == 1
+        assert process.state is FLServerState.FAILED
+        assert process.hierarchy_cleanup_complete is True
+    finally:
+        orchestrator.close()
+
+
+def test_hierarchy_wrong_round_records_failure_but_still_collects_other_outcomes(
+    tmp_path,
+):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.patch.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(round_timeout_seconds=2),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+    completed = threading.Event()
+    failures = []
+
+    def execute():
+        try:
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=3,
+                round_input_url="http://root.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+        except Exception as error:
+            failures.append(str(error))
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        while process.state is FLServerState.ROUND_DISPATCH:
+            time.sleep(0.001)
+        with pytest.raises(ValueError, match="ML_MODEL_TRAINING_REQS_NOT_MET"):
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(
+                    notifCorreId=participants[0].notification_correlation_id,
+                    mlCorreId=process.process_id,
+                    roundInd=99,
+                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+                )
+            )
+        assert completed.wait(0.05) is False
+
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participants[1].notification_correlation_id,
+                    "mlCorreId": process.process_id,
+                    "roundInd": 3,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://leaf.example/local-result"
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        assert completed.wait(1) is True
+        assert failures == [
+            "required hierarchy participants terminated: " + participant_ids[0]
+        ]
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+
+
+def test_hierarchy_round_callback_during_dispatch_is_idempotent_but_conflict_fails(
+    tmp_path,
+):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="round-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+        expected_round=3,
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.ROUND_DISPATCH,
+        participants=[participant],
+    )
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+
+    def notification(url: str) -> NwdafMLModelTrainNotif:
+        return NwdafMLModelTrainNotif.model_validate(
+            {
+                "notifCorreId": participant.notification_correlation_id,
+                "mlCorreId": process.process_id,
+                "roundInd": 3,
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {"mLModelUrl": url},
+                    }
+                ],
+            }
+        )
+
+    accepted = notification("http://leaf.example/local-a.tar.gz")
+    conflicting = notification("http://leaf.example/local-b.tar.gz")
+    try:
+        orchestrator.receive_notification(accepted)
+        orchestrator.receive_notification(accepted)
+
+        assert participant.round_complete is True
+        assert participant.round_failure == ""
+        with pytest.raises(ValueError, match="conflicting duplicate round callback"):
+            orchestrator.receive_notification(conflicting)
+        assert participant.round_failure == "conflicting duplicate round callback"
+    finally:
+        orchestrator.close()
+
+
+def test_last_callback_accepted_at_deadline_wins_before_timeout(tmp_path, monkeypatch):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="round-client-a",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        participants=[participant],
+    )
+    clock = [100.0]
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.time.monotonic",
+        lambda: clock[0],
+    )
+
+    def complete_at_deadline(timeout=None):
+        assert timeout == 1
+        clock[0] = 101.0
+        participant.round_complete = True
+
+    process.condition.wait = complete_at_deadline
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    try:
+        orchestrator._wait(
+            process,
+            lambda: participant.round_complete,
+            1,
+            collect_participant_failures=True,
+        )
+        assert participant.round_complete is True
+        assert participant.round_failure == ""
+    finally:
+        orchestrator.close()
+
+
+def test_round_callback_after_collection_freeze_allows_exact_duplicate_only(
+    tmp_path,
+):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="round-client-a",
+        expected_round=3,
+    )
+    accepted = NwdafMLModelTrainNotif.model_validate(
+        {
+            "notifCorreId": participant.notification_correlation_id,
+            "mlCorreId": "process-1",
+            "roundInd": 3,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://leaf.example/local-a.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    participant.notification = accepted
+    participant.round_complete = True
+    participant.accepted_notification_digest = hashlib.sha256(
+        json.dumps(
+            accepted.model_dump(by_alias=True, exclude_none=True, mode="json"),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.ROUND_EVALUATING,
+        participants=[participant],
+    )
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    conflicting_payload = accepted.model_dump(
+        by_alias=True,
+        exclude_none=True,
+        mode="json",
+    )
+    conflicting_payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = (
+        "http://leaf.example/local-b.tar.gz"
+    )
+    conflicting = NwdafMLModelTrainNotif.model_validate(conflicting_payload)
+    try:
+        orchestrator.receive_notification(accepted)
+        with pytest.raises(ValueError, match="after the active stage"):
+            orchestrator.receive_notification(conflicting)
+
+        assert process.state is FLServerState.ROUND_EVALUATING
+        assert participant.notification == accepted
+        assert participant.round_failure == ""
+    finally:
+        process.hierarchy_cleanup_complete = True
+        orchestrator.close()
+
+
 def test_hierarchy_cancellation_wakes_collection_and_late_callback_is_rejected(tmp_path):
     owner_id = "11111111-1111-4111-8111-111111111111"
     participant = FLParticipant(
@@ -845,11 +1596,201 @@ def test_preparation_uses_configured_historical_data_window(tmp_path):
         orchestrator.close()
 
 
+def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
+    tmp_path,
+):
+    branch_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    leaf_ids = (
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+    )
+    scope_digests = ("a" * 64, "b" * 64)
+
+    def model_with_weight(value: float) -> torch.nn.Module:
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(value)
+        model.eval()
+        return model
+
+    base_model = model_with_weight(0)
+    branch_models = (model_with_weight(2), model_with_weight(10))
+    base_weights_digest = weights_digest(base_model)
+    file_digests = {
+        "model.py": "1" * 64,
+        "model.npy": "2" * 64,
+        "scaler.pkl": "3" * 64,
+    }
+    base_manifest = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_INPUT",
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 1},
+        "inference": {"seq_length": 1},
+        "file_digests": file_digests,
+        "fl_metadata": {
+            "contract_version": "1.0",
+            "ml_corre_id": "process-1",
+            "round_ind": 0,
+            "model_contract_digest": "0" * 64,
+            "preprocessing_contract_digest": "0" * 64,
+            "weights_digest": base_weights_digest,
+            "client_training": {"epochs": 2},
+        },
+    }
+    base_manifest["fl_metadata"]["model_contract_digest"] = model_contract_digest(
+        base_manifest
+    )
+    base_manifest["fl_metadata"][
+        "preprocessing_contract_digest"
+    ] = preprocessing_contract_digest(base_manifest)
+    base = SimpleNamespace(manifest=base_manifest, model=base_model)
+
+    branch_bundles = []
+    sample_counts = (1, 3)
+    for index, (branch_id, leaf_id, scope_digest, model, sample_count) in enumerate(
+        zip(
+            branch_ids,
+            leaf_ids,
+            scope_digests,
+            branch_models,
+            sample_counts,
+            strict=True,
+        ),
+        start=1,
+    ):
+        manifest = {
+            "bundle_schema_version": "1.0",
+            "artifact_role": "ROUND_LOCAL",
+            "result_type": "HIERARCHY_AGGREGATE",
+            "file_digests": file_digests,
+            "fl_metadata": {
+                "contract_version": "1.0",
+                "ml_corre_id": "process-1",
+                "round_ind": 0,
+                "participant_nf_instance_id": branch_id,
+                "scope_digest": scope_digest,
+                "model_contract_digest": model_contract_digest(base_manifest),
+                "preprocessing_contract_digest": preprocessing_contract_digest(
+                    base_manifest
+                ),
+                "input_global_weights_digest": base_weights_digest,
+                "base_weights_digest": base_weights_digest,
+                "weights_digest": weights_digest(model),
+                "training_sample_count": sample_count,
+                "lower_round_ind": 9 + index,
+                "lower_global_artifact_digest": str(index + 5) * 64,
+                "subordinate_participants": [
+                    {
+                        "participant_nf_instance_id": leaf_id,
+                        "training_sample_count": sample_count,
+                        "local_artifact_digest": str(index + 7) * 64,
+                    }
+                ],
+            },
+        }
+        branch_bundles.append(SimpleNamespace(manifest=manifest, model=model))
+
+    participants = []
+    for index, (branch_id, scope_digest) in enumerate(
+        zip(branch_ids, scope_digests, strict=True),
+        start=1,
+    ):
+        participants.append(
+            FLParticipant(
+                scope=scope(f"branch-{index}", f"00000{index}", branch_id),
+                candidate=candidate(branch_id, f"00000{index}"),
+                notification_correlation_id=f"round-branch-{index}",
+                expected_scope_digest=scope_digest,
+                notification=NwdafMLModelTrainNotif.model_validate(
+                    {
+                        "notifCorreId": f"round-branch-{index}",
+                        "mlCorreId": "process-1",
+                        "roundInd": 0,
+                        "mLModelInfos": [
+                            {
+                                "event": "UE_COMMUNICATION",
+                                "mLFileAddr": {
+                                    "mLModelUrl": (
+                                        f"http://branch-{index}.example/aggregate.tar.gz"
+                                    )
+                                },
+                            }
+                        ],
+                    }
+                ),
+            )
+        )
+    process = FLProcess(process_id="process-1", intent=None, participants=participants)
+    workspace = Mock()
+    workspace.download.side_effect = [
+        SimpleNamespace(key="0" * 64),
+        SimpleNamespace(key="4" * 64),
+        SimpleNamespace(key="5" * 64),
+    ]
+    published = SimpleNamespace(url="http://root.example/round-global")
+    workspace.publish.return_value = published
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._loader = Mock()
+    orchestrator._loader.load.side_effect = [base, *branch_bundles]
+    try:
+        result = orchestrator._aggregate_round(
+            process,
+            "http://root.example/round-input",
+            0,
+            expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+            expected_subordinates={
+                branch_id: (leaf_id,)
+                for branch_id, leaf_id in zip(branch_ids, leaf_ids, strict=True)
+            },
+        )
+
+        assert result is published
+        publication = workspace.publish.call_args.kwargs
+        assert publication["model"].weight.item() == pytest.approx(8.0)
+        assert publication["metadata"]["fl_metadata"]["participants"] == [
+            {
+                "participant_nf_instance_id": branch_ids[0],
+                "training_sample_count": 1,
+                "local_artifact_digest": "4" * 64,
+            },
+            {
+                "participant_nf_instance_id": branch_ids[1],
+                "training_sample_count": 3,
+                "local_artifact_digest": "5" * 64,
+            },
+        ]
+        assert (
+            publication["metadata"]["fl_metadata"][
+                "aggregated_training_sample_count"
+            ]
+            == 4
+        )
+    finally:
+        orchestrator.close()
+
+
 def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_path):
     participant_id = "11111111-1111-4111-8111-111111111111"
     scope_digest = "a" * 64
     base_weights_digest = hashlib.sha256(b"").hexdigest()
     base_manifest = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_INPUT",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
@@ -860,7 +1801,22 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
             "model.npy": "2" * 64,
             "scaler.pkl": "3" * 64,
         },
+        "fl_metadata": {
+            "contract_version": "1.0",
+            "ml_corre_id": "process-1",
+            "round_ind": 0,
+            "model_contract_digest": "0" * 64,
+            "preprocessing_contract_digest": "1" * 64,
+            "weights_digest": base_weights_digest,
+            "client_training": {"epochs": 1},
+        },
     }
+    base_manifest["fl_metadata"]["model_contract_digest"] = model_contract_digest(
+        base_manifest
+    )
+    base_manifest["fl_metadata"][
+        "preprocessing_contract_digest"
+    ] = preprocessing_contract_digest(base_manifest)
     local_manifest = {
         "bundle_schema_version": "1.0",
         "file_digests": {
@@ -923,6 +1879,29 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
     )
     process.participants = [participant]
     try:
+        duplicate = participant.notification.model_copy(deep=True)
+        duplicate.ml_model_infos.append(duplicate.ml_model_infos[0].model_copy(deep=True))
+        participant.notification = duplicate
+        orchestrator._loader.load.side_effect = [base]
+        with pytest.raises(RuntimeError, match="notification is missing or invalid"):
+            orchestrator._aggregate_round(process, Mock(), 0)
+
+        participant.notification = NwdafMLModelTrainNotif.model_validate(
+            {
+                "notifCorreId": "round-a",
+                "mlCorreId": "process-1",
+                "roundInd": 0,
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {
+                            "mLModelUrl": "http://client.example/local.tar.gz"
+                        },
+                    }
+                ],
+            }
+        )
+        orchestrator._loader.load.side_effect = [base, local]
         with pytest.raises(RuntimeError, match="identity does not match"):
             orchestrator._aggregate_round(process, Mock(), 0)
     finally:

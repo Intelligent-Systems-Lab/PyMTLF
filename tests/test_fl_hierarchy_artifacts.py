@@ -22,6 +22,8 @@ from py_mtlf.core.fl_artifacts import (
     ArtifactRole,
     HierarchyAssignmentArtifact,
     HierarchyPreparationResultArtifact,
+    RoundInputArtifact,
+    RoundLocalArtifact,
 )
 from py_mtlf.core.fl_hierarchy import (
     FailedClient,
@@ -41,6 +43,8 @@ from py_mtlf.core.fl_workspace import (
     FLArtifactUnavailableError,
     FLWorkspace,
     FLWorkspaceError,
+    model_contract_digest,
+    preprocessing_contract_digest,
     weights_digest,
 )
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
@@ -151,6 +155,91 @@ def metadata(artifact) -> ArtifactMetadata:
         path=artifact.path,
         url=artifact.url,
     )
+
+
+def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path) -> None:
+    branch_workspace = workspace(tmp_path / "branch", "http://branch.example")
+    try:
+        service = HierarchyArtifactService(branch_workspace)
+        upper = base_bundle()
+        lower_input = service.publish_round_input(
+            base=upper,
+            process_id="lower-process",
+            server_nf_instance_id=BRANCH,
+            round_indicator=4,
+            epochs=7,
+        )
+        assert isinstance(lower_input.contract, RoundInputArtifact)
+        assert lower_input.contract.fl_metadata.client_training.epochs == 7
+
+        base_digest = weights_digest(upper.model)
+        lower_global = branch_workspace.publish(
+            process_id="lower-process",
+            participant_id=BRANCH,
+            round_indicator=4,
+            role="ROUND_GLOBAL",
+            base=upper,
+            model=upper.model,
+            metadata={
+                "artifact_role": "ROUND_GLOBAL",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": "lower-process",
+                    "round_ind": 4,
+                    "model_contract_digest": model_contract_digest(upper.manifest),
+                    "preprocessing_contract_digest": preprocessing_contract_digest(
+                        upper.manifest
+                    ),
+                    "base_weights_digest": base_digest,
+                    "weights_digest": base_digest,
+                    "participants": [
+                        {
+                            "participant_nf_instance_id": LEAF_A,
+                            "training_sample_count": 12,
+                            "local_artifact_digest": "1" * 64,
+                        },
+                        {
+                            "participant_nf_instance_id": LEAF_B,
+                            "training_sample_count": 8,
+                            "local_artifact_digest": "2" * 64,
+                        },
+                    ],
+                    "aggregated_training_sample_count": 20,
+                },
+            },
+        )
+        upper_result = service.publish_hierarchy_aggregate(
+            upper_input=upper,
+            lower_global=lower_global,
+            upper_process_id="upper-process",
+            branch_nf_instance_id=BRANCH,
+            upper_round_indicator=2,
+            upper_scope_digest="3" * 64,
+        )
+        assert isinstance(upper_result.contract, RoundLocalArtifact)
+        assert upper_result.contract.result_type == "HIERARCHY_AGGREGATE"
+        assert upper_result.contract.fl_metadata.training_sample_count == 20
+        assert tuple(
+            item.participant_nf_instance_id
+            for item in upper_result.contract.fl_metadata.subordinate_participants
+        ) == (LEAF_A, LEAF_B)
+
+        with torch.no_grad():
+            upper.model.linear.weight.add_(1.0)
+        with pytest.raises(
+            HierarchyArtifactOperationError,
+            match="does not match the upper round input",
+        ):
+            service.publish_hierarchy_aggregate(
+                upper_input=upper,
+                lower_global=lower_global,
+                upper_process_id="upper-process",
+                branch_nf_instance_id=BRANCH,
+                upper_round_indicator=3,
+                upper_scope_digest="3" * 64,
+            )
+    finally:
+        branch_workspace.close()
 
 
 def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_path) -> None:

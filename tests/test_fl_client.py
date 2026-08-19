@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import httpx
 import numpy as np
 import pytest
+import torch
 
 from py_mtlf.config import (
     FederatedLearningSettings,
@@ -23,7 +24,13 @@ from py_mtlf.core.fl_client import (
 )
 from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy import HierarchyMessageType, PreparationOutcome
-from py_mtlf.core.fl_workspace import ValidatedArchive, ValidatedHierarchyArtifact
+from py_mtlf.core.fl_workspace import (
+    ValidatedArchive,
+    ValidatedHierarchyArtifact,
+    model_contract_digest,
+    preprocessing_contract_digest,
+    weights_digest,
+)
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
     MLAnalyticsCapability,
@@ -94,6 +101,93 @@ def fl_settings(tmp_path) -> FederatedLearningSettings:
 
 def client_settings() -> FLClientSettings:
     return FLClientSettings(model_interoperability_ids=("001122",))
+
+
+def round_input_bundle(*, epochs: int = 7):
+    model = torch.nn.Linear(2, 1)
+    manifest = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_INPUT",
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 2, "output_size": 1},
+        "inference": {"feature_order": ["uplink", "downlink"]},
+        "file_digests": {
+            "model.py": "1" * 64,
+            "model.npy": "2" * 64,
+            "scaler.pkl": "3" * 64,
+        },
+    }
+    manifest["fl_metadata"] = {
+        "contract_version": "1.0",
+        "ml_corre_id": "fl-process-001",
+        "round_ind": 2,
+        "model_contract_digest": model_contract_digest(manifest),
+        "preprocessing_contract_digest": preprocessing_contract_digest(manifest),
+        "weights_digest": weights_digest(model),
+        "client_training": {"epochs": epochs},
+    }
+    return Mock(manifest=manifest, model=model)
+
+
+def hierarchy_assignment(tmp_path, *, branch: bool) -> ValidatedHierarchyArtifact:
+    root_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    hierarchy_metadata = {
+        "contract_version": "1.0",
+        "message_type": (
+            HierarchyMessageType.BRANCH_ASSIGNMENT
+            if branch
+            else HierarchyMessageType.LEAF_ASSIGNMENT
+        ),
+        "plan_id": "11111111-1111-4111-8111-111111111111",
+        "publisher_nf_instance_id": root_id if branch else branch_id,
+        "intended_recipient_nf_instance_id": branch_id if branch else leaf_id,
+        "strategy": {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+    }
+    if branch:
+        hierarchy_metadata.update(
+            {
+                "assigned_leaf_nf_instance_ids": [leaf_id],
+                "admission": {"mode": "complete_required"},
+            }
+        )
+    else:
+        hierarchy_metadata["parent_branch_nf_instance_id"] = branch_id
+    contract = HierarchyAssignmentArtifact.model_validate(
+        {
+            "artifact_role": "HIERARCHY_ASSIGNMENT",
+            "bundle_schema_version": "1.0",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "hierarchy_metadata": hierarchy_metadata,
+        }
+    )
+    path = tmp_path / ("branch-assignment.tar.gz" if branch else "leaf-assignment.tar.gz")
+    path.write_bytes(b"assignment")
+    return ValidatedHierarchyArtifact(
+        metadata=ArtifactMetadata(
+            key="a" * 64,
+            size_bytes=path.stat().st_size,
+            path=path,
+            url="http://parent.example/assignment.tar.gz",
+        ),
+        manifest={
+            "analytics_event": "UE_COMMUNICATION",
+            "model_interoperability": "001122",
+        },
+        contract=contract,
+    )
 
 
 def test_create_admits_before_async_adrf_preparation(tmp_path):
@@ -682,6 +776,12 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
         assert active.assigned_role is ExperimentRole.BRANCH
         assert updated.branch_process_id == "lower-process"
         assert updated.hierarchy_assignment == admitted
+        assert updated.expected_model_contract_digest == model_contract_digest(
+            admitted.manifest
+        )
+        assert updated.expected_preprocessing_contract_digest == (
+            preprocessing_contract_digest(admitted.manifest)
+        )
         branch.prepare.assert_called_once_with(
             assignment=admitted,
             representation=value,
@@ -1053,6 +1153,249 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
             assert "conflicting" in str(error)
         else:
             raise AssertionError("conflicting duplicate round was accepted")
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("stale_before_callback", [False, True])
+def test_branch_round_delegates_without_local_dataset_or_training(
+    tmp_path,
+    stale_before_callback,
+):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://root.example/round-input.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    base = round_input_bundle(epochs=7)
+    assignment = hierarchy_assignment(tmp_path, branch=True)
+    workspace = Mock()
+    workspace.download.return_value = Mock(key="4" * 64)
+    branch = Mock()
+    branch.execute_round.return_value = Mock(
+        url="http://branch.example/hierarchy-aggregate.tar.gz"
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        workspace,
+        branch_coordinator=branch,
+    )
+    service._loader = Mock()
+    service._loader.load.return_value = base
+    service._dataset_builder = Mock()
+    service._trainer = Mock()
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.ROUND_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        expected_model_contract_digest=model_contract_digest(base.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            base.manifest
+        ),
+        hierarchy_assignment=assignment,
+    )
+    service._resources[resource.subscription_id] = resource
+    if stale_before_callback:
+        def retire_resource(**_kwargs):
+            service._resources.pop(resource.subscription_id)
+            return Mock(url="http://branch.example/hierarchy-aggregate.tar.gz")
+
+        branch.execute_round.side_effect = retire_resource
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_round(resource.subscription_id, resource.revision)
+
+        branch.execute_round.assert_called_once_with(
+            assignment=assignment,
+            representation=value,
+            upper_input=base,
+            upper_client_subscription_id=resource.subscription_id,
+            upper_resource_revision=resource.revision,
+            upper_input_artifact_digest="4" * 64,
+            upper_scope_digest=resource.scope.scope_digest,
+            callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
+        )
+        service._dataset_builder.build.assert_not_called()
+        service._trainer.train.assert_not_called()
+        if stale_before_callback:
+            service._enqueue_delivery.assert_not_called()
+            return
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.round_indicator == 2
+        assert (
+            str(notification.ml_model_infos[0].model_file_address.model_url)
+            == "http://branch.example/hierarchy-aggregate.tar.gz"
+        )
+    finally:
+        service.close()
+
+
+def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://branch.example/round-input.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    base = round_input_bundle(epochs=7)
+    assignment = hierarchy_assignment(tmp_path, branch=False)
+    workspace = Mock()
+    workspace.download.return_value = Mock()
+    workspace.publish.return_value = Mock(url="http://leaf.example/local.tar.gz")
+    context = Mock()
+    context.get.return_value.nf_instance_id = (
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        workspace,
+    )
+    service._loader = Mock()
+    service._loader.load.return_value = base
+    training_scope = Mock(training_sample_count=10)
+    dataset = Mock(training_scopes=(training_scope,))
+    service._dataset_builder = Mock()
+    service._dataset_builder.build.return_value = dataset
+    result_model = torch.nn.Linear(2, 1)
+    service._trainer = Mock()
+    service._trainer.train.return_value = Mock(
+        model=result_model,
+        training_sample_count=10,
+    )
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.ROUND_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        dataset_snapshot=Mock(),
+        prepared_training_sample_count=10,
+        expected_model_contract_digest=model_contract_digest(base.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            base.manifest
+        ),
+        hierarchy_assignment=assignment,
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_round(resource.subscription_id, resource.revision)
+
+        service._trainer.train.assert_called_once_with(
+            base,
+            dataset,
+            epochs=7,
+            proximal_mu=0.01,
+        )
+        metadata = workspace.publish.call_args.kwargs["metadata"]
+        assert metadata["fl_metadata"]["training_sample_count"] == 10
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.round_indicator == 2
+    finally:
+        service.close()
+
+
+def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_path):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://server.example/round-input.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    base = round_input_bundle(epochs=6)
+    workspace = Mock()
+    workspace.download.return_value = Mock()
+    workspace.publish.return_value = Mock(url="http://client.example/local.tar.gz")
+    context = Mock()
+    context.get.return_value.nf_instance_id = (
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        workspace,
+    )
+    service._loader = Mock()
+    service._loader.load.return_value = base
+    training_scope = Mock(training_sample_count=10)
+    dataset = Mock(training_scopes=(training_scope,))
+    service._dataset_builder = Mock()
+    service._dataset_builder.build.return_value = dataset
+    result_model = torch.nn.Linear(2, 1)
+    service._trainer = Mock()
+    service._trainer.train.return_value = Mock(
+        model=result_model,
+        training_sample_count=10,
+    )
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.ROUND_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        dataset_snapshot=Mock(),
+        prepared_training_sample_count=10,
+        expected_model_contract_digest=model_contract_digest(base.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            base.manifest
+        ),
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_round(resource.subscription_id, resource.revision)
+
+        service._trainer.train.assert_called_once_with(
+            base,
+            dataset,
+            epochs=6,
+            proximal_mu=None,
+        )
+        assert service.get(resource.subscription_id).state is FLClientState.RESULT_PENDING
     finally:
         service.close()
 

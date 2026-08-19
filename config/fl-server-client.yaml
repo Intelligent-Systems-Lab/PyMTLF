@@ -39,6 +39,10 @@ federated_learning:
     round_count: 2
     # Hierarchical FL V1 admits one top-level experiment per PyMTLF process.
     max_active_processes: 1
+    # Used only when this process initiates flat or Root-side rounds. An assigned
+    # Branch preserves the Root-provided value instead of reading this setting.
+    client_training:
+      epochs: 18
   client:
     callback_deadline_margin_seconds: 5
     callback_queue_size: 256
@@ -52,7 +56,6 @@ federated_learning:
       device: "cpu"
       batch_size: 32
       learning_rate: 0.001
-      epochs: 18
       validation_ratio: 0.10
       random_seed: 42
 

@@ -8,9 +8,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from py_mtlf.config import FederatedStrategySettings
+from py_mtlf.config import FederatedStrategySettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
-from py_mtlf.core.fl_artifacts import ArtifactRole, HierarchyPreparationResultArtifact
+from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.fl_artifacts import (
+    ArtifactRole,
+    HierarchyPreparationResultArtifact,
+    RoundLocalResultType,
+)
 from py_mtlf.core.fl_experiment import (
     ExperimentConflictError,
     ExperimentLifecycle,
@@ -53,6 +58,10 @@ class RootRequestState(StrEnum):
     PREPARATION_WAITING = "PREPARATION_WAITING"
     PREPARATION_EVALUATING = "PREPARATION_EVALUATING"
     ADMITTED = "ADMITTED"
+    ROUND_DISPATCH = "ROUND_DISPATCH"
+    ROUND_WAITING = "ROUND_WAITING"
+    AGGREGATING = "AGGREGATING"
+    CANDIDATE_READY = "CANDIDATE_READY"
     FAILED = "FAILED"
 
 
@@ -65,6 +74,7 @@ class RootFailureCause(StrEnum):
     PREPARATION_TIMEOUT = "PREPARATION_TIMEOUT"
     RESULT_VALIDATION_FAILED = "RESULT_VALIDATION_FAILED"
     ADMISSION_REJECTED = "ADMISSION_REJECTED"
+    ROUND_FAILED = "ROUND_FAILED"
     SHUTDOWN = "SHUTDOWN"
 
 
@@ -113,6 +123,10 @@ class RootRequestSnapshot:
     failure_cause: str = ""
     failure_detail: str = ""
     admission: RootAdmissionSnapshot | None = None
+    current_round: int | None = None
+    completed_rounds: int = 0
+    candidate_url: str = ""
+    candidate_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -133,6 +147,10 @@ class _RootRequestRecord:
     failure_detail: str = ""
     server_process_id: str = ""
     admission: RootAdmissionSnapshot | None = None
+    current_round: int | None = None
+    completed_rounds: int = 0
+    candidate_url: str = ""
+    candidate_digest: str = ""
     future: Future | None = field(default=None, repr=False)
 
 
@@ -141,6 +159,7 @@ class FLRootCoordinator:
         self,
         *,
         strategy: FederatedStrategySettings,
+        server_settings: FLServerSettings,
         planner: TopologyPlanner,
         resolver: HierarchyNodeResolver,
         nwdaf_context: NwdafContextClient,
@@ -161,6 +180,7 @@ class FLRootCoordinator:
             waiting_policy=strategy.waiting_policy,
             aggregation=strategy.aggregation,
         )
+        self._server_settings = server_settings
         self._planner = planner
         self._resolver = resolver
         self._nwdaf_context = nwdaf_context
@@ -486,6 +506,56 @@ class FLRootCoordinator:
                 record.admission = admission
                 record.state = RootRequestState.ADMITTED
                 self._condition.notify_all()
+
+            cause = RootFailureCause.ROUND_FAILED
+            source = base
+            expected_subordinates = {
+                item.branch_nf_instance_id: item.prepared_leaf_nf_instance_ids
+                for item in admission.branches
+            }
+            for round_indicator in range(self._server_settings.round_count):
+                self._set_round_state(
+                    record,
+                    RootRequestState.ROUND_DISPATCH,
+                    round_indicator,
+                )
+                round_input = self._artifact_service.publish_round_input(
+                    base=source,
+                    process_id=process.process_id,
+                    server_nf_instance_id=context.nf_instance_id,
+                    round_indicator=round_indicator,
+                    epochs=self._server_settings.client_training.epochs,
+                )
+                aggregate = self._server.execute_hierarchy_round(
+                    process_id=process.process_id,
+                    round_indicator=round_indicator,
+                    round_input_url=round_input.url,
+                    expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+                    expected_subordinates=expected_subordinates,
+                    state_observer=lambda state, current_round=round_indicator: (
+                        self._observe_server_round_state(
+                            record,
+                            current_round,
+                            state,
+                        )
+                    ),
+                )
+                source = self._loader.load(
+                    ArtifactMetadata(
+                        key=aggregate.digest,
+                        size_bytes=aggregate.path.stat().st_size,
+                        path=aggregate.path,
+                        url=aggregate.url,
+                    )
+                )
+                with self._condition:
+                    record.completed_rounds = round_indicator + 1
+                    record.candidate_url = aggregate.url
+                    record.candidate_digest = aggregate.digest
+                    self._condition.notify_all()
+            process.candidate_url = record.candidate_url
+            process.state = FLServerState.CANDIDATE_READY
+            self._set_state(record, RootRequestState.CANDIDATE_READY)
         except Exception as error:
             if isinstance(error, HierarchyDiscoveryError):
                 cause = RootFailureCause.DISCOVERY_FAILED
@@ -650,6 +720,36 @@ class FLRootCoordinator:
             record.state = state
             self._condition.notify_all()
 
+    def _set_round_state(
+        self,
+        record: _RootRequestRecord,
+        state: RootRequestState,
+        round_indicator: int,
+    ) -> None:
+        with self._condition:
+            if self._closing:
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            if self._active_request_id != record.initiation.request_id:
+                raise RootRequestConflictError("Root request is stale")
+            record.current_round = round_indicator
+            record.state = state
+            self._condition.notify_all()
+
+    def _observe_server_round_state(
+        self,
+        record: _RootRequestRecord,
+        round_indicator: int,
+        state: FLServerState,
+    ) -> None:
+        projected = {
+            FLServerState.ROUND_DISPATCH: RootRequestState.ROUND_DISPATCH,
+            FLServerState.ROUND_WAITING: RootRequestState.ROUND_WAITING,
+            FLServerState.ROUND_EVALUATING: RootRequestState.ROUND_WAITING,
+            FLServerState.AGGREGATING: RootRequestState.AGGREGATING,
+        }.get(state)
+        if projected is not None:
+            self._set_round_state(record, projected, round_indicator)
+
     def _cleanup_attempt(
         self,
         record: _RootRequestRecord,
@@ -701,6 +801,10 @@ class FLRootCoordinator:
             failure_cause=record.failure_cause,
             failure_detail=record.failure_detail,
             admission=record.admission,
+            current_round=record.current_round,
+            completed_rounds=record.completed_rounds,
+            candidate_url=record.candidate_url,
+            candidate_digest=record.candidate_digest,
         )
 
 
@@ -731,5 +835,6 @@ def _public_failure_detail(cause: RootFailureCause) -> str:
         RootFailureCause.PREPARATION_TIMEOUT: "one or more Branch preparations timed out",
         RootFailureCause.RESULT_VALIDATION_FAILED: "Branch preparation result validation failed",
         RootFailureCause.ADMISSION_REJECTED: "complete-required hierarchy admission was rejected",
+        RootFailureCause.ROUND_FAILED: "hierarchical training round failed",
         RootFailureCause.SHUTDOWN: "Root coordinator is shutting down",
     }[cause]

@@ -38,6 +38,9 @@ federated_learning:
     round_timeout_seconds: 300
     round_count: 2
     max_active_processes: 1
+    # Root-authored local dataset passes propagated through Branches to Leaves.
+    client_training:
+      epochs: 18
   strategy:
     algorithm:
       name: "fedprox"

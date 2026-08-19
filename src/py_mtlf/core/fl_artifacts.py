@@ -26,6 +26,7 @@ class ArtifactContractModel(BaseModel):
 
 
 class ArtifactRole(StrEnum):
+    ROUND_INPUT = "ROUND_INPUT"
     ROUND_LOCAL = "ROUND_LOCAL"
     ROUND_GLOBAL = "ROUND_GLOBAL"
     FINAL_MODEL = "FINAL_MODEL"
@@ -36,6 +37,11 @@ class ArtifactRole(StrEnum):
 class RoundLocalResultType(StrEnum):
     TRAINING = "TRAINING"
     ACCURACY_CHECK = "ACCURACY_CHECK"
+    HIERARCHY_AGGREGATE = "HIERARCHY_AGGREGATE"
+
+
+class ClientTrainingDirective(ArtifactContractModel):
+    epochs: int = Field(gt=0, strict=True)
 
 
 class WapeComponents(ArtifactContractModel):
@@ -89,6 +95,16 @@ class CommonFLMetadata(ArtifactContractModel):
     weights_digest: Sha256
 
 
+class RoundInputMetadata(ArtifactContractModel):
+    contract_version: Literal["1.0"]
+    ml_corre_id: str = Field(min_length=1)
+    round_ind: int = Field(ge=0)
+    model_contract_digest: Sha256
+    preprocessing_contract_digest: Sha256
+    weights_digest: Sha256
+    client_training: ClientTrainingDirective
+
+
 class RoundLocalCommonMetadata(CommonFLMetadata):
     round_ind: int = Field(ge=0)
     participant_nf_instance_id: str
@@ -109,6 +125,26 @@ class RoundLocalCommonMetadata(CommonFLMetadata):
 
 class RoundLocalTrainingMetadata(RoundLocalCommonMetadata):
     training_sample_count: int = Field(gt=0)
+
+
+class RoundLocalHierarchyAggregateMetadata(RoundLocalTrainingMetadata):
+    lower_round_ind: int = Field(ge=0)
+    lower_global_artifact_digest: Sha256
+    subordinate_participants: tuple[RoundParticipant, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_subordinates(self) -> RoundLocalHierarchyAggregateMetadata:
+        identifiers = [item.participant_nf_instance_id for item in self.subordinate_participants]
+        if identifiers != sorted(identifiers):
+            raise ValueError("subordinate participants must use canonical NF instance ID ordering")
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("subordinate participants must be unique")
+        if self.participant_nf_instance_id in identifiers:
+            raise ValueError("Branch participant cannot also be a subordinate participant")
+        sample_count = sum(item.training_sample_count for item in self.subordinate_participants)
+        if self.training_sample_count != sample_count:
+            raise ValueError("training sample count must equal subordinate sample counts")
+        return self
 
 
 class AccuracyCheckEvaluation(ArtifactContractModel):
@@ -213,18 +249,28 @@ class ArtifactContractBase(ArtifactContractModel):
         return value
 
 
+class RoundInputArtifact(ArtifactContractBase):
+    artifact_role: Literal[ArtifactRole.ROUND_INPUT]
+    fl_metadata: RoundInputMetadata
+
+
 class RoundLocalArtifact(ArtifactContractBase):
     artifact_role: Literal[ArtifactRole.ROUND_LOCAL]
     result_type: RoundLocalResultType
-    fl_metadata: RoundLocalTrainingMetadata | RoundLocalAccuracyCheckMetadata
+    fl_metadata: (
+        RoundLocalTrainingMetadata
+        | RoundLocalAccuracyCheckMetadata
+        | RoundLocalHierarchyAggregateMetadata
+    )
 
     @model_validator(mode="after")
     def validate_result_type(self) -> RoundLocalArtifact:
         expected_type = {
             RoundLocalResultType.TRAINING: RoundLocalTrainingMetadata,
             RoundLocalResultType.ACCURACY_CHECK: RoundLocalAccuracyCheckMetadata,
+            RoundLocalResultType.HIERARCHY_AGGREGATE: RoundLocalHierarchyAggregateMetadata,
         }[self.result_type]
-        if not isinstance(self.fl_metadata, expected_type):
+        if type(self.fl_metadata) is not expected_type:
             raise ValueError(f"{self.result_type.value} requires {expected_type.__name__}")
         return self
 
@@ -251,7 +297,8 @@ class HierarchyPreparationResultArtifact(ArtifactContractBase):
 
 
 FLArtifactContract = Annotated[
-    RoundLocalArtifact
+    RoundInputArtifact
+    | RoundLocalArtifact
     | RoundGlobalArtifact
     | FinalModelArtifact
     | HierarchyAssignmentArtifact
@@ -278,6 +325,7 @@ def fl_artifact_projection(manifest: Mapping[str, object]) -> dict[str, object]:
 
     base_fields = {"bundle_schema_version", "file_digests", "artifact_role"}
     role_fields = {
+        ArtifactRole.ROUND_INPUT: {"fl_metadata"},
         ArtifactRole.ROUND_LOCAL: {"result_type", "fl_metadata"},
         ArtifactRole.ROUND_GLOBAL: {"fl_metadata"},
         ArtifactRole.FINAL_MODEL: {"model_identity", "fl_metadata"},

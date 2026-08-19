@@ -83,6 +83,10 @@ def _status_response(
         planId=snapshot.plan_id,
         modelFamilyId=snapshot.model_family_id,
         state=snapshot.state,
+        currentRound=snapshot.current_round,
+        completedRounds=snapshot.completed_rounds or None,
+        candidateUrl=snapshot.candidate_url or None,
+        candidateDigest=snapshot.candidate_digest or None,
         failureCause=snapshot.failure_cause or None,
         failureDetail=snapshot.failure_detail or None,
     )

@@ -67,6 +67,9 @@ federated_learning:
     round_count: 2
     # Maximum federated retraining processes coordinated concurrently.
     max_active_processes: 1
+    # Local dataset passes required from every Client in each fitting round.
+    client_training:
+      epochs: 18
     delay_policy:
       # Maximum Client-requested deadline extensions accepted per operation.
       max_extensions: 1
