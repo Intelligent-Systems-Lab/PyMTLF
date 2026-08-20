@@ -10,7 +10,12 @@ from nwdaf_context import context_client
 
 from py_mtlf.config import PublicationSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
-from py_mtlf.core.fl_artifacts import ValidationSummary, WapeComponents
+from py_mtlf.core.fl_artifacts import (
+    HierarchyBranchValidation,
+    HierarchyValidation,
+    ValidationSummary,
+    WapeComponents,
+)
 from py_mtlf.core.model_records import (
     CatalogValidationSummary,
     ParticipantSampleCount,
@@ -23,6 +28,7 @@ from py_mtlf.wire.private import SelectedTarget
 NWDAF_ID = "11111111-1111-4111-8111-111111111111"
 ADRF_ID = "22222222-2222-4222-8222-222222222222"
 CLIENT_ID = "33333333-3333-4333-8333-333333333333"
+LEAF_ID = "44444444-4444-4444-8444-444444444444"
 DIGEST = "a" * 64
 
 
@@ -276,3 +282,96 @@ def test_restart_reannounces_cutover_pending_publication():
         assert announced.wait(timeout=1)
     finally:
         coordinator.close()
+
+
+def test_final_bundle_receives_durable_hierarchy_validation(
+    tmp_path,
+    monkeypatch,
+):
+    publication = pending_publication().model_copy(
+        update={
+            "state": PublicationState.RESERVED,
+            "final_bundle_path": None,
+            "final_bundle_digest": None,
+            "hierarchy_validation": HierarchyValidation(
+                plan_id="55555555-5555-4555-8555-555555555555",
+                branches=(
+                    HierarchyBranchValidation(
+                        branch_nf_instance_id=CLIENT_ID,
+                        subordinate_validation_summaries=(
+                            pending_publication()
+                            .validation_evidence[0]
+                            .model_copy(
+                                update={
+                                    "participant_nf_instance_id": LEAF_ID,
+                                }
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        }
+    )
+    candidate_path = tmp_path / "candidate.tar.gz"
+    candidate_path.write_bytes(b"candidate")
+    publication = PendingPublication.model_validate(
+        publication.model_copy(
+            update={"candidate_path": str(candidate_path)}
+        ).model_dump(by_alias=True, mode="json")
+    )
+    base_model = SimpleNamespace(digest="d" * 64)
+    candidate_model = SimpleNamespace(digest="e" * 64)
+    base_bundle = SimpleNamespace(manifest={"bundle": "base"}, model=base_model)
+    candidate_bundle = SimpleNamespace(
+        manifest={"bundle": "candidate"},
+        model=candidate_model,
+    )
+    catalog = Mock()
+    catalog.family_key_for_id.return_value = publication.family_id
+    catalog.current.return_value = Mock(
+        model_id=publication.previous_model_id,
+        artifact=Mock(),
+    )
+    artifacts = Mock()
+    artifacts.publish.return_value = ArtifactMetadata(
+        key="f" * 64,
+        size_bytes=1,
+        path=tmp_path / "final.tar.gz",
+        url="http://py-mtlf.example/final",
+    )
+    workspace = Mock()
+    workspace.publish.return_value = SimpleNamespace(path=tmp_path / "workspace-final")
+    coordinator = PublicationCoordinator(
+        PublicationSettings(),
+        Mock(),
+        catalog,
+        artifacts,
+        workspace,
+        Mock(),
+        nwdaf_context_client(),
+        Mock(),
+    )
+    coordinator._loader = Mock()
+    coordinator._loader.load.side_effect = [base_bundle, candidate_bundle]
+    coordinator._replace_publication = lambda value: value
+    monkeypatch.setattr(
+        "py_mtlf.core.publication.model_contract_digest",
+        lambda _manifest: "1" * 64,
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.publication.preprocessing_contract_digest",
+        lambda _manifest: "2" * 64,
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.publication.weights_digest",
+        lambda model: model.digest,
+    )
+
+    updated = coordinator._build_final_bundle(publication)
+
+    metadata = workspace.publish.call_args.kwargs["metadata"]["fl_metadata"]
+    assert metadata["hierarchy_validation"] == (
+        publication.hierarchy_validation.model_dump(mode="json")
+    )
+    assert updated.hierarchy_validation == publication.hierarchy_validation
+    assert updated.state is PublicationState.FINAL_BUNDLE_READY

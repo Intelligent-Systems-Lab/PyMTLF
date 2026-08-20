@@ -52,6 +52,35 @@ def hierarchy_strategy() -> dict[str, object]:
     }
 
 
+def validation_summary(
+    participant_id: str,
+    *,
+    sample_count: int,
+    base_error: float,
+    candidate_error: float,
+    actual: float,
+    start: datetime,
+    end: datetime,
+) -> dict[str, object]:
+    return {
+        "participant_nf_instance_id": participant_id,
+        "scope_digest": DIGEST_B,
+        "evaluation_sample_count": sample_count,
+        "start_time": start,
+        "end_time": end,
+        "base_model_weights_digest": DIGEST_A,
+        "candidate_weights_digest": DIGEST_C,
+        "base": {
+            "absolute_error_sum": base_error,
+            "absolute_actual_sum": actual,
+        },
+        "candidate": {
+            "absolute_error_sum": candidate_error,
+            "absolute_actual_sum": actual,
+        },
+    }
+
+
 def round_input() -> dict[str, object]:
     return {
         "bundle_schema_version": "1.0",
@@ -285,6 +314,77 @@ def test_round_local_accuracy_check_rejects_modified_candidate_weights() -> None
         )
 
 
+def test_hierarchy_accuracy_check_requires_exact_canonical_subordinate_evidence() -> None:
+    start = datetime.now(UTC)
+    middle = start + timedelta(minutes=1)
+    end = middle + timedelta(minutes=1)
+    subordinates = [
+        validation_summary(
+            CLIENT_A,
+            sample_count=40,
+            base_error=10,
+            candidate_error=5,
+            actual=100,
+            start=start,
+            end=middle,
+        ),
+        validation_summary(
+            CLIENT_B,
+            sample_count=30,
+            base_error=8,
+            candidate_error=4,
+            actual=90,
+            start=middle,
+            end=end,
+        ),
+    ]
+    metadata = common_metadata()
+    metadata.update(
+        {
+            "base_weights_digest": DIGEST_C,
+            "weights_digest": DIGEST_C,
+            "round_ind": 2,
+            "participant_nf_instance_id": BRANCH,
+            "scope_digest": DIGEST_B,
+            "input_global_weights_digest": DIGEST_C,
+            "evaluation": {
+                "evaluation_stage": "FINAL_VALIDATION",
+                "evaluation_sample_count": 70,
+                "start_time": start,
+                "end_time": end,
+                "base_model_weights_digest": DIGEST_A,
+                "candidate_weights_digest": DIGEST_C,
+                "base": {"absolute_error_sum": 18, "absolute_actual_sum": 190},
+                "candidate": {"absolute_error_sum": 9, "absolute_actual_sum": 190},
+            },
+            "subordinate_validation_summaries": subordinates,
+        }
+    )
+    value = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_LOCAL",
+        "result_type": "ACCURACY_CHECK",
+        "fl_metadata": metadata,
+        "file_digests": FILE_DIGESTS,
+    }
+
+    artifact = validate_fl_artifact(value)
+    assert isinstance(artifact, RoundLocalArtifact)
+    assert tuple(
+        item.participant_nf_instance_id
+        for item in artifact.fl_metadata.subordinate_validation_summaries
+    ) == (CLIENT_A, CLIENT_B)
+
+    metadata["evaluation"]["candidate"]["absolute_error_sum"] = 10
+    with pytest.raises(ValidationError, match="subordinate validation summaries"):
+        validate_fl_artifact(value)
+
+    metadata["evaluation"]["candidate"]["absolute_error_sum"] = 9
+    metadata["subordinate_validation_summaries"].reverse()
+    with pytest.raises(ValidationError, match="canonical"):
+        validate_fl_artifact(value)
+
+
 def test_round_local_result_type_rejects_wrong_metadata_shape() -> None:
     metadata = common_metadata()
     metadata.update(
@@ -382,6 +482,80 @@ def test_final_model_requires_identity_and_accepted_gate() -> None:
                 "file_digests": FILE_DIGESTS,
             }
         )
+
+
+def test_final_model_hierarchy_provenance_matches_direct_branch_evidence() -> None:
+    start = datetime.now(UTC)
+    middle = start + timedelta(minutes=1)
+    end = middle + timedelta(minutes=1)
+    subordinates = [
+        validation_summary(
+            CLIENT_A,
+            sample_count=40,
+            base_error=10,
+            candidate_error=5,
+            actual=100,
+            start=start,
+            end=middle,
+        ),
+        validation_summary(
+            CLIENT_B,
+            sample_count=30,
+            base_error=8,
+            candidate_error=4,
+            actual=90,
+            start=middle,
+            end=end,
+        ),
+    ]
+    branch_summary = validation_summary(
+        BRANCH,
+        sample_count=70,
+        base_error=18,
+        candidate_error=9,
+        actual=190,
+        start=start,
+        end=end,
+    )
+    metadata = common_metadata()
+    metadata.update(
+        {
+            "previous_model_unique_id": 4,
+            "participants": [
+                {"participant_nf_instance_id": BRANCH, "training_sample_count": 200}
+            ],
+            "final_candidate_digest": DIGEST_C,
+            "validation_summary": [branch_summary],
+            "hierarchy_validation": {
+                "plan_id": PLAN,
+                "branches": [
+                    {
+                        "branch_nf_instance_id": BRANCH,
+                        "subordinate_validation_summaries": subordinates,
+                    }
+                ],
+            },
+            "global_gate_accepted": True,
+            "created_at": datetime.now(UTC),
+        }
+    )
+    value = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "FINAL_MODEL",
+        "model_identity": {"model_unique_id": 5},
+        "fl_metadata": metadata,
+        "file_digests": FILE_DIGESTS,
+    }
+
+    artifact = validate_fl_artifact(value)
+    assert isinstance(artifact, FinalModelArtifact)
+    assert artifact.fl_metadata.hierarchy_validation.plan_id == PLAN
+
+    metadata["hierarchy_validation"]["branches"][0][
+        "branch_nf_instance_id"
+    ] = ROOT
+    with pytest.raises(ValidationError, match="direct participants"):
+        validate_fl_artifact(value)
 
 
 def test_unknown_artifact_schema_and_incomplete_digest_inventory_fail() -> None:

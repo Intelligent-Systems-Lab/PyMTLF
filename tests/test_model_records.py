@@ -14,6 +14,7 @@ from py_mtlf.core.model_records import (
 
 DIGEST_A = "a" * 64
 CLIENT_A = "00000000-0000-4000-8000-000000000001"
+LEAF_A = "00000000-0000-4000-8000-000000000002"
 ADRF = "00000000-0000-4000-8000-000000000010"
 
 
@@ -194,3 +195,62 @@ def test_durable_model_state_repository_atomically_survives_restart(tmp_path) ->
     assert restored.last_allocated_model_id == 10
     assert restored.families["family-a"].latest_model_id == 3
     assert not tuple(tmp_path.glob(".model-state.*"))
+
+
+def test_durable_publication_preserves_hierarchy_validation_evidence(tmp_path) -> None:
+    direct_evidence = validation_evidence()[0]
+    leaf_evidence = {**direct_evidence, "participant_nf_instance_id": LEAF_A}
+    publication = PendingPublication.model_validate(
+        {
+            "schemaVersion": "1.0",
+            "publicationId": "publication-hierarchy",
+            "state": "RESERVED",
+            "mlCorreId": "root-process",
+            "reservedModelId": 4,
+            "previousModelId": 3,
+            "familyId": "family-a",
+            "expectedGeneration": 1,
+            "expectedArtifactDigest": DIGEST_A,
+            "participantsAndSampleCounts": [
+                {"participantNfInstanceId": CLIENT_A, "sampleCount": 20}
+            ],
+            "validationSummary": {"globalGateAccepted": True},
+            "validationEvidence": [direct_evidence],
+            "hierarchyValidation": {
+                "plan_id": "11111111-1111-4111-8111-111111111111",
+                "branches": [
+                    {
+                        "branch_nf_instance_id": CLIENT_A,
+                        "subordinate_validation_summaries": [leaf_evidence],
+                    }
+                ],
+            },
+            "candidatePath": "/durable/publication/candidate.tar.gz",
+            "candidateDigest": DIGEST_A,
+            "updatedAt": datetime.now(UTC),
+        }
+    )
+    catalog = migrate_seed_catalog(
+        model_unique_id=3,
+        artifact_key=DIGEST_A,
+        created_at=datetime.now(UTC),
+    ).model_copy(update={"next_model_id": 5})
+    initial = DurableModelState(
+        schemaVersion="2.0",
+        lastAllocatedModelId=4,
+        families={"family-a": catalog},
+        pendingPublications=(publication,),
+    )
+
+    DurableModelStateRepository(tmp_path).open(initial)
+    restored = DurableModelStateRepository(tmp_path).open(initial)
+
+    hierarchy = restored.pending_publications[0].hierarchy_validation
+    assert hierarchy is not None
+    assert hierarchy.plan_id == "11111111-1111-4111-8111-111111111111"
+    assert (
+        hierarchy.branches[0]
+        .subordinate_validation_summaries[0]
+        .participant_nf_instance_id
+        == LEAF_A
+    )

@@ -23,6 +23,7 @@ from py_mtlf.core.fl_artifacts import (
     FLArtifactContract,
     HierarchyAssignmentArtifact,
     HierarchyPreparationResultArtifact,
+    RoundGlobalArtifact,
     validate_fl_artifact_manifest,
 )
 from py_mtlf.core.fl_hierarchy import (
@@ -356,6 +357,95 @@ class FLWorkspace:
                 shutil.rmtree(directory)
         except OSError as error:
             raise FLWorkspaceError("FL plan workspace release failed") from error
+
+    def republish_validation_candidate(
+        self,
+        *,
+        source: ArtifactMetadata,
+        plan_id: str,
+        participant_id: str,
+        round_indicator: int,
+    ) -> FLWorkspaceArtifact:
+        normalized_plan = normalize_plan_id(plan_id)
+        normalized_participant = normalize_nf_instance_id(participant_id)
+        if round_indicator < 0:
+            raise ValueError("validation round indicator must be non-negative")
+        try:
+            expected_digest = _artifact_url_digest(source.url)
+        except RuntimeError as error:
+            raise FLArtifactIntegrityError(str(error)) from error
+        actual_digest = _hash_file(source.path)
+        if source.key != expected_digest or actual_digest != expected_digest:
+            raise FLArtifactIntegrityError(
+                "validation candidate URL, metadata, and archive digest do not match"
+            )
+        validated = self._validate_archive(source.path)
+        if not isinstance(validated.contract, RoundGlobalArtifact):
+            raise FLArtifactContractError(
+                "validation candidate is not a ROUND_GLOBAL artifact"
+            )
+
+        directory = (
+            self._root
+            / normalized_plan
+            / normalized_participant
+            / str(round_indicator)
+            / ArtifactRole.ROUND_GLOBAL.value
+        )
+        destination = directory / f"{expected_digest}.tar.gz"
+        temporary: Path | None = None
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if _hash_file(destination) != expected_digest:
+                    raise FLArtifactIntegrityError(
+                        "existing validation candidate conflicts with digest"
+                    )
+            else:
+                file_descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".validation-candidate-",
+                    suffix=".tar.gz",
+                    dir=directory,
+                )
+                os.close(file_descriptor)
+                temporary = Path(temporary_name)
+                shutil.copyfile(source.path, temporary)
+                if _hash_file(temporary) != expected_digest:
+                    raise FLArtifactIntegrityError(
+                        "republished validation candidate changed archive bytes"
+                    )
+                os.replace(temporary, destination)
+        except FLWorkspaceError:
+            raise
+        except OSError as error:
+            raise FLWorkspaceError(
+                "validation candidate publication workspace operation failed"
+            ) from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+        base_url = self._settings.public_base_url.rstrip("/")
+        url = (
+            f"{base_url}/internal/v1/fl-artifacts/{quote(normalized_plan)}/"
+            f"{quote(normalized_participant)}/{round_indicator}/"
+            f"{ArtifactRole.ROUND_GLOBAL.value}/{expected_digest}"
+        )
+        if url == source.url:
+            raise FLArtifactIdentityError(
+                "Branch validation candidate URL must differ from the Root URL"
+            )
+        return FLWorkspaceArtifact(
+            process_id=normalized_plan,
+            participant_id=normalized_participant,
+            round_indicator=round_indicator,
+            role=ArtifactRole.ROUND_GLOBAL.value,
+            digest=expected_digest,
+            path=destination,
+            url=url,
+            manifest=validated.manifest,
+            contract=validated.contract,
+        )
 
     def _validate_archive(self, path: Path) -> ValidatedArchive:
         extracted = 0

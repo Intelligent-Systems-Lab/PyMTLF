@@ -61,7 +61,14 @@ class RootRequestState(StrEnum):
     ROUND_DISPATCH = "ROUND_DISPATCH"
     ROUND_WAITING = "ROUND_WAITING"
     AGGREGATING = "AGGREGATING"
+    FINAL_VALIDATION_DISPATCH = "FINAL_VALIDATION_DISPATCH"
+    FINAL_VALIDATION_WAITING = "FINAL_VALIDATION_WAITING"
+    FINAL_VALIDATION_EVALUATING = "FINAL_VALIDATION_EVALUATING"
+    VALIDATION_REJECTED = "VALIDATION_REJECTED"
     CANDIDATE_READY = "CANDIDATE_READY"
+    PUBLISHING = "PUBLISHING"
+    CUTOVER_PENDING = "CUTOVER_PENDING"
+    COMPLETE = "COMPLETE"
     FAILED = "FAILED"
 
 
@@ -75,6 +82,8 @@ class RootFailureCause(StrEnum):
     RESULT_VALIDATION_FAILED = "RESULT_VALIDATION_FAILED"
     ADMISSION_REJECTED = "ADMISSION_REJECTED"
     ROUND_FAILED = "ROUND_FAILED"
+    FINAL_VALIDATION_FAILED = "FINAL_VALIDATION_FAILED"
+    PUBLICATION_FAILED = "PUBLICATION_FAILED"
     SHUTDOWN = "SHUTDOWN"
 
 
@@ -390,6 +399,7 @@ class FLRootCoordinator:
 
     def _run(self, record: _RootRequestRecord) -> None:
         cause = RootFailureCause.VALIDATION_FAILED
+        process: FLProcess | None = None
         try:
             self._set_state(record, RootRequestState.VALIDATING)
             current = self._catalog.current(record.initiation.model_family_id)
@@ -553,9 +563,18 @@ class FLRootCoordinator:
                     record.candidate_url = aggregate.url
                     record.candidate_digest = aggregate.digest
                     self._condition.notify_all()
-            process.candidate_url = record.candidate_url
-            process.state = FLServerState.CANDIDATE_READY
-            self._set_state(record, RootRequestState.CANDIDATE_READY)
+            cause = RootFailureCause.FINAL_VALIDATION_FAILED
+            self._server.finalize_hierarchy_candidate(
+                process_id=process.process_id,
+                validation_round=self._server_settings.round_count,
+                candidate=aggregate,
+                base_artifact=current.artifact,
+                expected_subordinates=expected_subordinates,
+                state_observer=lambda state: self._observe_server_finalization_state(
+                    record,
+                    state,
+                ),
+            )
         except Exception as error:
             if isinstance(error, HierarchyDiscoveryError):
                 cause = RootFailureCause.DISCOVERY_FAILED
@@ -563,6 +582,11 @@ class FLRootCoordinator:
                 cause = RootFailureCause.SHUTDOWN
             elif isinstance(error, RootPreparationError):
                 cause = error.cause
+            elif (
+                process is not None
+                and getattr(process, "state", None) is FLServerState.PUBLISHING
+            ):
+                cause = RootFailureCause.PUBLICATION_FAILED
             logger.exception(
                 "Hierarchy Root request failed request_id=%s plan_id=%s",
                 record.initiation.request_id,
@@ -750,6 +774,30 @@ class FLRootCoordinator:
         if projected is not None:
             self._set_round_state(record, projected, round_indicator)
 
+    def _observe_server_finalization_state(
+        self,
+        record: _RootRequestRecord,
+        state: FLServerState,
+    ) -> None:
+        projected = {
+            FLServerState.FINAL_VALIDATION_DISPATCH: (
+                RootRequestState.FINAL_VALIDATION_DISPATCH
+            ),
+            FLServerState.FINAL_VALIDATION_WAITING: (
+                RootRequestState.FINAL_VALIDATION_WAITING
+            ),
+            FLServerState.FINAL_VALIDATION_EVALUATING: (
+                RootRequestState.FINAL_VALIDATION_EVALUATING
+            ),
+            FLServerState.VALIDATION_REJECTED: RootRequestState.VALIDATION_REJECTED,
+            FLServerState.CANDIDATE_READY: RootRequestState.CANDIDATE_READY,
+            FLServerState.PUBLISHING: RootRequestState.PUBLISHING,
+            FLServerState.CUTOVER_PENDING: RootRequestState.CUTOVER_PENDING,
+            FLServerState.COMPLETE: RootRequestState.COMPLETE,
+        }.get(state)
+        if projected is not None:
+            self._set_state(record, projected)
+
     def _cleanup_attempt(
         self,
         record: _RootRequestRecord,
@@ -836,5 +884,9 @@ def _public_failure_detail(cause: RootFailureCause) -> str:
         RootFailureCause.RESULT_VALIDATION_FAILED: "Branch preparation result validation failed",
         RootFailureCause.ADMISSION_REJECTED: "complete-required hierarchy admission was rejected",
         RootFailureCause.ROUND_FAILED: "hierarchical training round failed",
+        RootFailureCause.FINAL_VALIDATION_FAILED: (
+            "hierarchical final validation failed"
+        ),
+        RootFailureCause.PUBLICATION_FAILED: "hierarchical model publication failed",
         RootFailureCause.SHUTDOWN: "Root coordinator is shutting down",
     }[cause]

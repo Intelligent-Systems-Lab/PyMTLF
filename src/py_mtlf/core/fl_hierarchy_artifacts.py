@@ -5,6 +5,7 @@ from py_mtlf.core.fl_artifacts import (
     ArtifactRole,
     HierarchyAssignmentArtifact,
     RoundGlobalArtifact,
+    ValidationSummary,
 )
 from py_mtlf.core.fl_hierarchy import (
     BranchAssignmentMetadata,
@@ -105,6 +106,7 @@ class HierarchyArtifactService:
                 url=lower_global.url,
             )
         )
+
         lower_metadata = lower_global.contract.fl_metadata
         base_digest = weights_digest(upper_input.model)
         if (
@@ -147,6 +149,105 @@ class HierarchyArtifactService:
                     "subordinate_participants": [
                         item.model_dump(mode="python")
                         for item in lower_metadata.participants
+                    ],
+                },
+            },
+        )
+
+    def republish_validation_candidate(
+        self,
+        *,
+        source: ArtifactMetadata,
+        plan_id: str,
+        containing_branch_nf_instance_id: str,
+        validation_round_indicator: int,
+    ) -> FLWorkspaceArtifact:
+        return self._workspace.republish_validation_candidate(
+            source=source,
+            plan_id=plan_id,
+            participant_id=containing_branch_nf_instance_id,
+            round_indicator=validation_round_indicator,
+        )
+
+    def publish_hierarchy_validation_result(
+        self,
+        *,
+        upper_candidate: LoadedBundle,
+        upper_process_id: str,
+        branch_nf_instance_id: str,
+        upper_round_indicator: int,
+        upper_scope_digest: str,
+        subordinate_summaries: tuple[ValidationSummary, ...],
+    ) -> FLWorkspaceArtifact:
+        if not subordinate_summaries:
+            raise HierarchyArtifactOperationError(
+                "hierarchy validation result requires subordinate evidence"
+            )
+        candidate_digest = weights_digest(upper_candidate.model)
+        base_digest = subordinate_summaries[0].base_model_weights_digest
+        return self._workspace.publish(
+            process_id=upper_process_id,
+            participant_id=branch_nf_instance_id,
+            round_indicator=upper_round_indicator,
+            role="ROUND_LOCAL",
+            base=upper_candidate,
+            model=upper_candidate.model,
+            metadata={
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "ACCURACY_CHECK",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": upper_process_id,
+                    "round_ind": upper_round_indicator,
+                    "participant_nf_instance_id": branch_nf_instance_id,
+                    "scope_digest": upper_scope_digest,
+                    "input_global_weights_digest": candidate_digest,
+                    "model_contract_digest": model_contract_digest(
+                        upper_candidate.manifest
+                    ),
+                    "preprocessing_contract_digest": preprocessing_contract_digest(
+                        upper_candidate.manifest
+                    ),
+                    "base_weights_digest": candidate_digest,
+                    "weights_digest": candidate_digest,
+                    "evaluation": {
+                        "evaluation_stage": "FINAL_VALIDATION",
+                        "evaluation_sample_count": sum(
+                            item.evaluation_sample_count
+                            for item in subordinate_summaries
+                        ),
+                        "start_time": min(
+                            item.start_time for item in subordinate_summaries
+                        ).isoformat(),
+                        "end_time": max(
+                            item.end_time for item in subordinate_summaries
+                        ).isoformat(),
+                        "base_model_weights_digest": base_digest,
+                        "candidate_weights_digest": candidate_digest,
+                        "base": {
+                            "absolute_error_sum": sum(
+                                item.base.absolute_error_sum
+                                for item in subordinate_summaries
+                            ),
+                            "absolute_actual_sum": sum(
+                                item.base.absolute_actual_sum
+                                for item in subordinate_summaries
+                            ),
+                        },
+                        "candidate": {
+                            "absolute_error_sum": sum(
+                                item.candidate.absolute_error_sum
+                                for item in subordinate_summaries
+                            ),
+                            "absolute_actual_sum": sum(
+                                item.candidate.absolute_actual_sum
+                                for item in subordinate_summaries
+                            ),
+                        },
+                    },
+                    "subordinate_validation_summaries": [
+                        item.model_dump(mode="json")
+                        for item in subordinate_summaries
                     ],
                 },
             },

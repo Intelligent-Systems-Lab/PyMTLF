@@ -39,7 +39,6 @@ class HierarchicalTrainingStatus(HierarchyPrivateModel):
     state: RootRequestState
     current_round: int | None = Field(default=None, ge=0, alias="currentRound")
     completed_rounds: int | None = Field(default=None, ge=0, alias="completedRounds")
-    candidate_url: str | None = Field(default=None, min_length=1, alias="candidateUrl")
     candidate_digest: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",

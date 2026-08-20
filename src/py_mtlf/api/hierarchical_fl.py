@@ -85,7 +85,6 @@ def _status_response(
         state=snapshot.state,
         currentRound=snapshot.current_round,
         completedRounds=snapshot.completed_rounds or None,
-        candidateUrl=snapshot.candidate_url or None,
         candidateDigest=snapshot.candidate_digest or None,
         failureCause=snapshot.failure_cause or None,
         failureDetail=snapshot.failure_detail or None,

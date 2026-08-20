@@ -55,6 +55,7 @@ def test_private_hierarchy_request_returns_async_resource_and_status():
             },
         )
         status = client.get(created.headers["Location"])
+        repeated_status = client.get(created.headers["Location"])
 
     assert created.status_code == 202
     assert created.json() == {
@@ -71,13 +72,14 @@ def test_private_hierarchy_request_returns_async_resource_and_status():
         "state": "CANDIDATE_READY",
         "currentRound": 1,
         "completedRounds": 2,
-        "candidateUrl": "http://root.example/round-global/1",
         "candidateDigest": "a" * 64,
     }
+    assert repeated_status.json() == status.json()
     coordinator.submit_manual.assert_called_once_with(
         request_id=REQUEST_ID,
         model_family_id="ue-communication-default",
     )
+    assert coordinator.get.call_count == 2
 
 
 def test_private_hierarchy_request_maps_conflict_missing_family_and_unavailable():

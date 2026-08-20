@@ -1,3 +1,4 @@
+import threading
 import time
 from datetime import UTC, datetime
 from unittest.mock import Mock
@@ -15,6 +16,10 @@ from py_mtlf.config import (
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetJobState
 from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact
+from py_mtlf.core.fl_branch import (
+    BranchPreparationExecution,
+    FLBranchPreparationCoordinator,
+)
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
     FLClientEngine,
@@ -24,6 +29,7 @@ from py_mtlf.core.fl_client import (
 )
 from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy import HierarchyMessageType, PreparationOutcome
+from py_mtlf.core.fl_server import HierarchyValidationCollection
 from py_mtlf.core.fl_workspace import (
     ValidatedArchive,
     ValidatedHierarchyArtifact,
@@ -127,6 +133,45 @@ def round_input_bundle(*, epochs: int = 7):
         "preprocessing_contract_digest": preprocessing_contract_digest(manifest),
         "weights_digest": weights_digest(model),
         "client_training": {"epochs": epochs},
+    }
+    return Mock(manifest=manifest, model=model)
+
+
+def round_global_bundle():
+    model = torch.nn.Linear(2, 1)
+    manifest = {
+        "bundle_schema_version": "1.0",
+        "artifact_role": "ROUND_GLOBAL",
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 2, "output_size": 1},
+        "inference": {"feature_order": ["uplink", "downlink"]},
+        "file_digests": {
+            "model.py": "1" * 64,
+            "model.npy": "2" * 64,
+            "scaler.pkl": "3" * 64,
+        },
+    }
+    digest = weights_digest(model)
+    manifest["fl_metadata"] = {
+        "contract_version": "1.0",
+        "ml_corre_id": "fl-process-001",
+        "round_ind": 1,
+        "model_contract_digest": model_contract_digest(manifest),
+        "preprocessing_contract_digest": preprocessing_contract_digest(manifest),
+        "base_weights_digest": digest,
+        "weights_digest": digest,
+        "participants": [
+            {
+                "participant_nf_instance_id": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+                "training_sample_count": 10,
+                "local_artifact_digest": "4" * 64,
+            }
+        ],
+        "aggregated_training_sample_count": 10,
     }
     return Mock(manifest=manifest, model=model)
 
@@ -931,9 +976,19 @@ def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
         service.close()
 
 
-def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hierarchy_leaf", [False, True])
+def test_final_validation_uses_configured_training_device(
+    tmp_path,
+    monkeypatch,
+    hierarchy_leaf,
+):
     nwdaf_context = Mock()
-    nwdaf_context.get.return_value.nf_instance_id = "participant-a"
+    assignment = hierarchy_assignment(tmp_path, branch=False) if hierarchy_leaf else None
+    nwdaf_context.get.return_value.nf_instance_id = (
+        assignment.contract.hierarchy_metadata.intended_recipient_nf_instance_id
+        if assignment is not None
+        else "participant-a"
+    )
     workspace = Mock()
     workspace.download.return_value = Mock()
     workspace.publish.return_value.url = "http://client.example/validation.tar.gz"
@@ -976,10 +1031,15 @@ def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch)
         expected_model_contract_digest="a" * 64,
         expected_preprocessing_contract_digest="b" * 64,
         preparation_base_artifact=Mock(),
+        hierarchy_assignment=assignment,
     )
     service._resources[resource.subscription_id] = resource
     base = Mock(manifest={"bundle": "base"}, model=Mock(), scaler=Mock())
-    candidate = Mock(manifest={"bundle": "candidate"}, model=Mock(), scaler=Mock())
+    candidate = round_global_bundle()
+    if hierarchy_leaf:
+        candidate.manifest["fl_metadata"]["ml_corre_id"] = "root-process"
+    candidate.manifest["fl_metadata"]["weights_digest"] = "c" * 64
+    candidate.scaler = Mock()
     service._loader = Mock()
     service._loader.load.side_effect = [base, candidate]
     scope = Mock(
@@ -990,6 +1050,7 @@ def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch)
     dataset = Mock(training_scopes=(scope,), evaluation_scopes=(scope,))
     service._dataset_builder = Mock()
     service._dataset_builder.build.return_value = dataset
+    service._trainer = Mock()
     service._enqueue_delivery = Mock()
     predict = Mock(
         side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
@@ -1010,6 +1071,10 @@ def test_final_validation_uses_configured_training_device(tmp_path, monkeypatch)
         assert predict.call_count == 2
         assert all(call.args[4] == service._device for call in predict.call_args_list)
         service._enqueue_delivery.assert_called_once()
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.ml_correlation_id == value.ml_correlation_id
+        assert workspace.publish.call_args.kwargs["model"] is candidate.model
+        service._trainer.train.assert_not_called()
     finally:
         service.close()
 
@@ -1245,6 +1310,242 @@ def test_branch_round_delegates_without_local_dataset_or_training(
         )
     finally:
         service.close()
+
+
+@pytest.mark.parametrize("delete_during_validation", [False, True])
+def test_branch_validation_delegates_without_local_dataset_or_local_metrics(
+    tmp_path,
+    delete_during_validation,
+):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://root.example/round-global.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    candidate = round_global_bundle()
+    base = Mock(manifest=candidate.manifest, model=Mock())
+    assignment = hierarchy_assignment(tmp_path, branch=True)
+    candidate_artifact = Mock(key="4" * 64)
+    workspace = Mock()
+    workspace.download.return_value = candidate_artifact
+    branch = Mock()
+    branch.execute_validation.return_value = Mock(
+        url="http://branch.example/validation-result.tar.gz"
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        workspace,
+        branch_coordinator=branch,
+    )
+    service._loader = Mock()
+    service._loader.load.side_effect = [base, candidate]
+    service._dataset_builder = Mock()
+    service._trainer = Mock()
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.VALIDATION_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        expected_model_contract_digest=model_contract_digest(candidate.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            candidate.manifest
+        ),
+        preparation_base_artifact=Mock(),
+        hierarchy_assignment=assignment,
+    )
+    service._resources[resource.subscription_id] = resource
+    dispatched_revision = resource.revision
+    if delete_during_validation:
+        assert service._outbox_capacity.acquire(blocking=False)
+
+        def delete_parent(**_kwargs):
+            service.delete(resource.subscription_id)
+            return Mock(url="http://branch.example/validation-result.tar.gz")
+
+        branch.execute_validation.side_effect = delete_parent
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_validation(resource.subscription_id, dispatched_revision)
+
+        branch.execute_validation.assert_called_once_with(
+            assignment=assignment,
+            representation=value,
+            upper_candidate=candidate,
+            upper_candidate_artifact=candidate_artifact,
+            upper_client_subscription_id=resource.subscription_id,
+            upper_resource_revision=dispatched_revision,
+            upper_scope_digest=resource.scope.scope_digest,
+            callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
+        )
+        service._dataset_builder.build.assert_not_called()
+        service._trainer.train.assert_not_called()
+        if delete_during_validation:
+            service._enqueue_delivery.assert_not_called()
+            assert resource.subscription_id not in service._resources
+            return
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.round_indicator == 2
+        assert (
+            str(notification.ml_model_infos[0].model_file_address.model_url)
+            == "http://branch.example/validation-result.tar.gz"
+        )
+    finally:
+        service.close()
+
+
+def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_path):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://root.example/round-global.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    candidate = round_global_bundle()
+    base = Mock(manifest=candidate.manifest, model=Mock())
+    assignment = hierarchy_assignment(tmp_path, branch=True)
+    metadata = assignment.contract.hierarchy_metadata
+    plan_id = metadata.plan_id
+    candidate_artifact = Mock(key="4" * 64)
+    republished = Mock(
+        url="http://branch.example/validation-candidate.tar.gz",
+        digest="4" * 64,
+    )
+    lower_started = threading.Event()
+    release_lower = threading.Event()
+    server = Mock()
+
+    def execute_lower(**_kwargs):
+        lower_started.set()
+        if not release_lower.wait(1):
+            raise AssertionError("test did not release the lower validation")
+        return HierarchyValidationCollection(
+            candidate_artifact=candidate_artifact,
+            validation_summaries=(),
+        )
+
+    def cancel_lower(_process_id, _reason):
+        release_lower.set()
+
+    server.execute_hierarchy_validation.side_effect = execute_lower
+    server.cancel_hierarchy_preparation.side_effect = cancel_lower
+    artifacts = Mock()
+    artifacts.republish_validation_candidate.return_value = republished
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id=metadata.intended_recipient_nf_instance_id,
+        api_root="http://branch.example",
+        internal_api_root="http://branch-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("UE_COMMUNICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    branch = FLBranchPreparationCoordinator(
+        resolver=Mock(),
+        nwdaf_context=context,
+        artifact_service=artifacts,
+        server=server,
+    )
+    branch._executions[plan_id] = BranchPreparationExecution(
+        plan_id=plan_id,
+        parent_assignment=assignment,
+        leaf_nodes=(Mock(),),
+        leaf_assignments=(Mock(),),
+        process_id="lower-process",
+    )
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
+    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.BRANCH)
+    workspace = Mock()
+    workspace.download.return_value = candidate_artifact
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        workspace,
+        experiments=registry,
+        branch_coordinator=branch,
+    )
+    service._loader = Mock()
+    service._loader.load.side_effect = [base, candidate]
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.VALIDATION_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        expected_model_contract_digest=model_contract_digest(candidate.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            candidate.manifest
+        ),
+        preparation_base_artifact=Mock(),
+        hierarchy_assignment=assignment,
+        experiment_reservation_id=reservation.reservation_id,
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    assert service._outbox_capacity.acquire(blocking=False)
+    thread = threading.Thread(
+        target=service._run_validation,
+        args=(resource.subscription_id, resource.revision),
+    )
+    thread.start()
+    try:
+        assert lower_started.wait(1) is True
+        service.delete(resource.subscription_id)
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert resource.subscription_id not in service._resources
+        assert registry.active() is None
+        assert (plan_id, value.ml_correlation_id, value.round_indicator) not in (
+            branch._validations
+        )
+        artifacts.publish_hierarchy_validation_result.assert_not_called()
+        service._enqueue_delivery.assert_not_called()
+        server.cancel_hierarchy_preparation.assert_called_once_with(
+            "lower-process",
+            "parent cancelled preparation",
+        )
+    finally:
+        release_lower.set()
+        thread.join(timeout=1)
+        service.close()
+        branch.close()
 
 
 def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):

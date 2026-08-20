@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
+from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import (
     HierarchyAssignmentArtifact,
     RoundGlobalArtifact,
@@ -27,6 +28,7 @@ from py_mtlf.core.fl_server import (
     FLServerEngine,
     HierarchyPreparationCollection,
     HierarchyPreparationTarget,
+    HierarchyValidationCollection,
 )
 from py_mtlf.core.fl_workspace import FLWorkspaceArtifact, ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
@@ -74,6 +76,23 @@ class BranchRoundExecution:
     failure: str = ""
 
 
+@dataclass(frozen=True)
+class BranchValidationExecution:
+    plan_id: str
+    upper_client_subscription_id: str
+    upper_resource_revision: int
+    upper_ml_corre_id: str
+    upper_round_indicator: int
+    upper_candidate_artifact_digest: str
+    upper_scope_digest: str
+    lower_server_process_id: str
+    lower_validation_round: int
+    republished_candidate: FLWorkspaceArtifact | None = None
+    state: BranchRoundState = BranchRoundState.RUNNING
+    upper_result: FLWorkspaceArtifact | None = None
+    failure: str = ""
+
+
 class BranchPreDispatchError(RuntimeError):
     def __init__(
         self,
@@ -109,6 +128,9 @@ class FLBranchPreparationCoordinator:
         self._condition = threading.Condition(self._lock)
         self._executions: dict[str, BranchPreparationExecution] = {}
         self._rounds: dict[tuple[str, str, int], BranchRoundExecution] = {}
+        self._validations: dict[
+            tuple[str, str, int], BranchValidationExecution
+        ] = {}
         self._next_lower_round: dict[str, int] = {}
         self._cancelled_plan_ids: set[str] = set()
         self._closing = False
@@ -467,6 +489,144 @@ class FLBranchPreparationCoordinator:
                 self._condition.notify_all()
             raise
 
+    def execute_validation(
+        self,
+        *,
+        assignment: ValidatedHierarchyArtifact,
+        representation: NwdafMLModelTrainSubsc,
+        upper_candidate: LoadedBundle,
+        upper_candidate_artifact: ArtifactMetadata,
+        upper_client_subscription_id: str,
+        upper_resource_revision: int,
+        upper_scope_digest: str,
+        callback_margin_seconds: int,
+    ) -> FLWorkspaceArtifact:
+        metadata = assignment.contract.hierarchy_metadata
+        if not isinstance(metadata, BranchAssignmentMetadata):
+            raise ValueError("Branch validation requires a BRANCH_ASSIGNMENT")
+        upper_process_id = representation.ml_correlation_id or ""
+        upper_round = representation.round_indicator
+        if not upper_process_id or upper_round is None or upper_round <= 0:
+            raise ValueError("Branch validation requires upper process and round identities")
+        if not upper_client_subscription_id or upper_resource_revision <= 0:
+            raise ValueError("Branch validation requires upper resource identity")
+        if len(upper_candidate_artifact.key) != 64:
+            raise ValueError("Branch validation requires the candidate archive digest")
+        report = representation.ml_training_report_info
+        parent_budget = report.maximum_response_time if report is not None else None
+        if parent_budget is None or parent_budget <= callback_margin_seconds:
+            raise RuntimeError("Branch upper validation budget cannot contain lower execution")
+        context = self._nwdaf_context.get(refresh=True)
+        if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
+            raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
+        key = (metadata.plan_id, upper_process_id, upper_round)
+        conflicting = False
+        lower_round = -1
+        with self._condition:
+            self._ensure_dispatch_active(metadata.plan_id)
+            preparation = self._executions.get(metadata.plan_id)
+            if preparation is None:
+                raise RuntimeError("Branch lower process is unavailable")
+            while True:
+                existing = self._validations.get(key)
+                if existing is None:
+                    lower_round = self._next_lower_round.get(metadata.plan_id, 0)
+                    self._next_lower_round[metadata.plan_id] = lower_round + 1
+                    self._validations[key] = BranchValidationExecution(
+                        plan_id=metadata.plan_id,
+                        upper_client_subscription_id=upper_client_subscription_id,
+                        upper_resource_revision=upper_resource_revision,
+                        upper_ml_corre_id=upper_process_id,
+                        upper_round_indicator=upper_round,
+                        upper_candidate_artifact_digest=upper_candidate_artifact.key,
+                        upper_scope_digest=upper_scope_digest,
+                        lower_server_process_id=preparation.process_id,
+                        lower_validation_round=lower_round,
+                    )
+                    break
+                if not _same_validation_command(
+                    existing,
+                    upper_client_subscription_id=upper_client_subscription_id,
+                    upper_resource_revision=upper_resource_revision,
+                    upper_candidate_artifact_digest=upper_candidate_artifact.key,
+                    upper_scope_digest=upper_scope_digest,
+                ):
+                    conflicting = True
+                    break
+                if existing.state is BranchRoundState.COMPLETE:
+                    if existing.upper_result is None:
+                        raise RuntimeError("completed Branch validation has no upper result")
+                    return existing.upper_result
+                if existing.state is BranchRoundState.FAILED:
+                    raise RuntimeError(
+                        existing.failure or "Branch validation execution failed"
+                    )
+                self._condition.wait()
+                self._ensure_dispatch_active(metadata.plan_id)
+        if conflicting:
+            failure = "conflicting duplicate Branch upper validation command"
+            self.cancel(metadata.plan_id, failure)
+            raise RuntimeError(failure)
+
+        try:
+            republished = self._artifact_service.republish_validation_candidate(
+                source=upper_candidate_artifact,
+                plan_id=metadata.plan_id,
+                containing_branch_nf_instance_id=context.nf_instance_id,
+                validation_round_indicator=lower_round,
+            )
+            with self._condition:
+                self._ensure_dispatch_active(metadata.plan_id)
+                current = self._validations.get(key)
+                if current is None:
+                    raise RuntimeError("Branch validation mapping disappeared")
+                self._validations[key] = replace(
+                    current,
+                    republished_candidate=republished,
+                )
+            collection: HierarchyValidationCollection = (
+                self._server.execute_hierarchy_validation(
+                    process_id=preparation.process_id,
+                    validation_round=lower_round,
+                    candidate=republished,
+                    base_artifact=assignment.metadata,
+                    expected_candidate_process_id=upper_process_id,
+                    expected_candidate_round=upper_round - 1,
+                    timeout_seconds=parent_budget - callback_margin_seconds,
+                )
+            )
+            with self._condition:
+                self._ensure_dispatch_active(metadata.plan_id)
+                current = self._validations.get(key)
+                if current is None:
+                    raise RuntimeError("Branch validation mapping disappeared")
+                upper_result = self._artifact_service.publish_hierarchy_validation_result(
+                    upper_candidate=upper_candidate,
+                    upper_process_id=upper_process_id,
+                    branch_nf_instance_id=context.nf_instance_id,
+                    upper_round_indicator=upper_round,
+                    upper_scope_digest=upper_scope_digest,
+                    subordinate_summaries=collection.validation_summaries,
+                )
+                self._validations[key] = replace(
+                    current,
+                    state=BranchRoundState.COMPLETE,
+                    upper_result=upper_result,
+                )
+                self._condition.notify_all()
+            return upper_result
+        except Exception as error:
+            with self._condition:
+                current = self._validations.get(key)
+                if current is not None:
+                    self._validations[key] = replace(
+                        current,
+                        state=BranchRoundState.FAILED,
+                        failure=str(error),
+                    )
+                self._condition.notify_all()
+            raise
+
     @staticmethod
     def _classify(
         execution: BranchPreparationExecution,
@@ -526,6 +686,11 @@ class FLBranchPreparationCoordinator:
             self._rounds = {
                 key: value for key, value in self._rounds.items() if key[0] != plan_id
             }
+            self._validations = {
+                key: value
+                for key, value in self._validations.items()
+                if key[0] != plan_id
+            }
             self._next_lower_round.pop(plan_id, None)
             self._condition.notify_all()
         if execution is not None:
@@ -538,6 +703,7 @@ class FLBranchPreparationCoordinator:
             self._cancelled_plan_ids.update(self._executions)
             self._executions.clear()
             self._rounds.clear()
+            self._validations.clear()
             self._next_lower_round.clear()
             self._condition.notify_all()
         for execution in executions:
@@ -569,5 +735,22 @@ def _same_round_command(
         execution.upper_client_subscription_id == upper_client_subscription_id
         and execution.upper_resource_revision == upper_resource_revision
         and execution.upper_input_artifact_digest == upper_input_artifact_digest
+        and execution.upper_scope_digest == upper_scope_digest
+    )
+
+
+def _same_validation_command(
+    execution: BranchValidationExecution,
+    *,
+    upper_client_subscription_id: str,
+    upper_resource_revision: int,
+    upper_candidate_artifact_digest: str,
+    upper_scope_digest: str,
+) -> bool:
+    return (
+        execution.upper_client_subscription_id == upper_client_subscription_id
+        and execution.upper_resource_revision == upper_resource_revision
+        and execution.upper_candidate_artifact_digest
+        == upper_candidate_artifact_digest
         and execution.upper_scope_digest == upper_scope_digest
     )

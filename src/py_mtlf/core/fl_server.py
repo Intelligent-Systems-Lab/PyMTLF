@@ -17,6 +17,9 @@ from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeRef
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
+    HierarchyBranchValidation,
+    HierarchyValidation,
+    RoundGlobalArtifact,
     RoundInputArtifact,
     RoundLocalAccuracyCheckMetadata,
     RoundLocalArtifact,
@@ -151,6 +154,8 @@ class FLProcess:
     hierarchy_family_key: FamilyKey | None = None
     hierarchy_active_scopes: tuple[ScopeReference, ...] = ()
     hierarchy_cleanup_complete: bool = False
+    hierarchy_validation: HierarchyValidation | None = None
+    hierarchy_state_observer: Callable[[FLServerState], None] | None = None
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -173,6 +178,31 @@ class HierarchyPreparationCollection:
     plan_id: str
     participants: tuple[HierarchyParticipantPreparationOutcome, ...]
     timed_out_participant_nf_instance_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HierarchyValidationCollection:
+    candidate_artifact: ArtifactMetadata
+    validation_summaries: tuple[ValidationSummary, ...]
+    hierarchy_branches: tuple[HierarchyBranchValidation, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ValidatedHierarchyCandidate:
+    artifact: ArtifactMetadata
+    base_weights_digest: str
+    candidate_weights_digest: str
+    model_contract_digest: str
+    preprocessing_contract_digest: str
+
+
+@dataclass(frozen=True)
+class HierarchyFinalizationResult:
+    state: FLServerState
+    candidate_digest: str
+    published_model_id: int | None
+    gate_would_accept: bool
+    gate_rejection_reasons: tuple[str, ...]
 
 
 class FLClientResolver:
@@ -906,6 +936,258 @@ class FLServerEngine:
             self.cancel_hierarchy_preparation(process.process_id, str(error))
             raise
 
+    def execute_hierarchy_validation(
+        self,
+        *,
+        process_id: str,
+        validation_round: int,
+        candidate: FLWorkspaceArtifact,
+        base_artifact: ArtifactMetadata,
+        expected_candidate_process_id: str,
+        expected_candidate_round: int,
+        expected_subordinates: dict[str, tuple[str, ...]] | None = None,
+        timeout_seconds: int | None = None,
+        state_observer: Callable[[FLServerState], None] | None = None,
+    ) -> HierarchyValidationCollection:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        if process.state is not FLServerState.READY:
+            raise RuntimeError("hierarchy Server process is not ready for final validation")
+        if validation_round < 0 or expected_candidate_round < 0:
+            raise ValueError("hierarchy validation rounds must be non-negative")
+        if not expected_candidate_process_id:
+            raise ValueError("hierarchy validation requires the candidate process identity")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("hierarchy validation timeout must be positive")
+        timeout = min(
+            timeout_seconds or self._server_settings.round_timeout_seconds,
+            self._server_settings.round_timeout_seconds,
+        )
+        try:
+            self._validate_hierarchy_candidate(
+                candidate=candidate,
+                base_artifact=base_artifact,
+                expected_candidate_process_id=expected_candidate_process_id,
+                expected_candidate_round=expected_candidate_round,
+            )
+            self._set_hierarchy_state(
+                process,
+                FLServerState.FINAL_VALIDATION_DISPATCH,
+                state_observer,
+            )
+            process.candidate_url = candidate.url
+            for participant in process.participants:
+                self._raise_if_failed(process)
+                participant.expected_round = validation_round
+                participant.notification = None
+                participant.round_complete = False
+                participant.round_failure = ""
+                participant.accepted_notification_digest = ""
+                participant.accepted_delay_notification_digest = ""
+                participant.delay_extensions = 0
+                participant.requested_extension = 0
+                participant.granted_extension_seconds = 0
+                self._patch_validation(
+                    process,
+                    participant,
+                    validation_round,
+                    candidate.url,
+                    timeout_seconds=timeout,
+                )
+            self._raise_if_failed(process)
+            self._set_hierarchy_state(
+                process,
+                FLServerState.FINAL_VALIDATION_WAITING,
+                state_observer,
+            )
+            try:
+                self._wait(
+                    process,
+                    lambda: all(item.round_complete for item in process.participants),
+                    timeout,
+                    collect_participant_failures=True,
+                )
+            except RuntimeError as error:
+                if str(error) == "federated stage deadline expired":
+                    timed_out = []
+                    for participant in process.participants:
+                        if not participant.round_complete:
+                            participant.round_failure = "validation deadline expired"
+                            participant.round_complete = True
+                            timed_out.append(
+                                participant.candidate.target.nf_instance_id
+                            )
+                    raise RuntimeError(
+                        "hierarchy validation deadline expired for participants: "
+                        + ",".join(timed_out)
+                    ) from error
+                raise
+            failed = [
+                item.candidate.target.nf_instance_id
+                for item in process.participants
+                if item.round_failure
+                or (
+                    item.notification is not None
+                    and item.notification.termination_request is not None
+                )
+            ]
+            if failed:
+                raise RuntimeError(
+                    "required hierarchy validation participants terminated: "
+                    + ",".join(failed)
+                )
+            self._set_hierarchy_state(
+                process,
+                FLServerState.FINAL_VALIDATION_EVALUATING,
+                state_observer,
+            )
+            return self._collect_hierarchy_validation(
+                process=process,
+                candidate=candidate,
+                base_artifact=base_artifact,
+                validation_round=validation_round,
+                expected_candidate_process_id=expected_candidate_process_id,
+                expected_candidate_round=expected_candidate_round,
+                expected_subordinates=expected_subordinates,
+            )
+        except Exception as error:
+            with process.condition:
+                process.state = FLServerState.FAILED
+                if not process.failure:
+                    process.failure = str(error)
+                process.condition.notify_all()
+            self.cancel_hierarchy_preparation(process.process_id, str(error))
+            raise
+
+    def finalize_hierarchy_candidate(
+        self,
+        *,
+        process_id: str,
+        validation_round: int,
+        candidate: FLWorkspaceArtifact,
+        base_artifact: ArtifactMetadata,
+        expected_subordinates: dict[str, tuple[str, ...]],
+        state_observer: Callable[[FLServerState], None] | None = None,
+    ) -> HierarchyFinalizationResult:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        if process.hierarchy_family_key is None:
+            raise RuntimeError("Root hierarchy process has no model family")
+        if self._publication is None:
+            raise RuntimeError("Root hierarchy publication owner is unavailable")
+        process.hierarchy_state_observer = state_observer
+        collection = self.execute_hierarchy_validation(
+            process_id=process_id,
+            validation_round=validation_round,
+            candidate=candidate,
+            base_artifact=base_artifact,
+            expected_candidate_process_id=process_id,
+            expected_candidate_round=validation_round - 1,
+            expected_subordinates=expected_subordinates,
+            state_observer=state_observer,
+        )
+        hierarchy_validation = HierarchyValidation(
+            plan_id=process.hierarchy_plan_id,
+            branches=collection.hierarchy_branches,
+        )
+        process.candidate_artifact = collection.candidate_artifact
+        process.validation_summaries = collection.validation_summaries
+        process.hierarchy_validation = hierarchy_validation
+        leaf_summaries = tuple(
+            summary
+            for branch in hierarchy_validation.branches
+            for summary in branch.subordinate_validation_summaries
+        )
+        self._evaluate_hierarchy_gate(process, leaf_summaries)
+        if (
+            self._server_settings.final_validation.enforce_performance_gate
+            and not process.gate_would_accept
+        ):
+            self._set_hierarchy_state(
+                process,
+                FLServerState.VALIDATION_REJECTED,
+                state_observer,
+            )
+            return HierarchyFinalizationResult(
+                state=process.state,
+                candidate_digest=candidate.digest,
+                published_model_id=None,
+                gate_would_accept=False,
+                gate_rejection_reasons=process.gate_rejection_reasons,
+            )
+
+        self._set_hierarchy_state(
+            process,
+            FLServerState.CANDIDATE_READY,
+            state_observer,
+        )
+        self._set_hierarchy_state(
+            process,
+            FLServerState.PUBLISHING,
+            state_observer,
+        )
+        current = self._catalog.current(process.hierarchy_family_key)
+        if current is None or current.artifact.key != base_artifact.key:
+            raise RuntimeError("catalog base changed before hierarchy publication")
+        published = self._publication.publish(
+            ValidatedCandidate(
+                process_id=process.process_id,
+                family_key=process.hierarchy_family_key,
+                base_artifact=base_artifact,
+                candidate_artifact=collection.candidate_artifact,
+                participants=tuple(
+                    ParticipantSampleCount(
+                        participantNfInstanceId=(
+                            participant.candidate.target.nf_instance_id
+                        ),
+                        sampleCount=participant.training_sample_count,
+                    )
+                    for participant in sorted(
+                        process.participants,
+                        key=lambda item: item.candidate.target.nf_instance_id,
+                    )
+                ),
+                validation_summaries=collection.validation_summaries,
+                required_scope_keys=tuple(
+                    item.scope_key for item in process.hierarchy_active_scopes
+                ),
+                gate_would_accept=bool(process.gate_would_accept),
+                gate_rejection_reasons=process.gate_rejection_reasons,
+                hierarchy_validation=hierarchy_validation,
+            )
+        )
+        process.published_model_id = published.model_id
+        required_scope_keys = tuple(
+            item.scope_key for item in process.hierarchy_active_scopes
+        )
+        self._policy.begin_generation(
+            process.hierarchy_family_key,
+            self._catalog.version_key_for_id(current.model_id),
+            published.version_key,
+            required_scope_keys,
+        )
+        if self._provision_notifications is not None:
+            self._provision_notifications.reconcile_family(process.hierarchy_family_key)
+        terminal_state = (
+            FLServerState.CUTOVER_PENDING
+            if required_scope_keys
+            else FLServerState.COMPLETE
+        )
+        self._set_hierarchy_state(process, terminal_state, state_observer)
+        if terminal_state is FLServerState.COMPLETE:
+            self._policy.complete_retrain(process.hierarchy_family_key)
+        return HierarchyFinalizationResult(
+            state=process.state,
+            candidate_digest=candidate.digest,
+            published_model_id=published.model_id,
+            gate_would_accept=bool(process.gate_would_accept),
+            gate_rejection_reasons=process.gate_rejection_reasons,
+        )
+
     def mark_scope_adopted(
         self,
         family_key: tuple[str, str],
@@ -922,15 +1204,32 @@ class FLServerEngine:
                 (
                     item
                     for item in self._processes.values()
-                    if item.intent is not None
-                    and item.intent.family_key == family_key
-                    and item.published_model_id == model_id
+                    if item.published_model_id == model_id
+                    and (
+                        (
+                            item.intent is not None
+                            and item.intent.family_key == family_key
+                        )
+                        or item.hierarchy_family_key == family_key
+                    )
                 ),
                 None,
             )
         if process is not None:
-            process.state = FLServerState.COMPLETE
-            self._finish_experiment(process)
+            if process.hierarchy_plan_id:
+                process.state = FLServerState.COMPLETE
+                observer = process.hierarchy_state_observer
+                if observer is not None:
+                    try:
+                        observer(process.state)
+                    except Exception:
+                        logger.exception(
+                            "Failed to project hierarchy cutover completion process_id=%s",
+                            process.process_id,
+                        )
+            else:
+                process.state = FLServerState.COMPLETE
+                self._finish_experiment(process)
         self._policy.complete_retrain(family_key)
         logger.info(
             "Federated model cutover complete model_id=%s family=%s",
@@ -1282,6 +1581,8 @@ class FLServerEngine:
         participant: FLParticipant,
         round_indicator: int,
         artifact_url: str,
+        *,
+        timeout_seconds: int | None = None,
     ) -> None:
         patch = NwdafMLModelTrainSubscPatch(
             mLAccChkFlg=True,
@@ -1294,7 +1595,7 @@ class FLServerEngine:
                 )
             ],
             mLTrainRepInfo=MLTrainReportInfo(
-                maxResTime=self._server_settings.round_timeout_seconds
+                maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
             ),
         )
         response = self._client.patch(
@@ -1383,6 +1684,16 @@ class FLServerEngine:
         with process.condition:
             if process.failure:
                 raise RuntimeError(process.failure)
+
+    @staticmethod
+    def _set_hierarchy_state(
+        process: FLProcess,
+        state: FLServerState,
+        observer: Callable[[FLServerState], None] | None,
+    ) -> None:
+        process.state = state
+        if observer is not None:
+            observer(state)
 
     def _cleanup_participant(
         self,
@@ -1683,6 +1994,202 @@ class FLServerEngine:
             process.process_id,
             aggregate_base,
             aggregate_candidate,
+            process.gate_would_accept,
+            self._server_settings.final_validation.enforce_performance_gate,
+        )
+
+    def _collect_hierarchy_validation(
+        self,
+        *,
+        process: FLProcess,
+        candidate: FLWorkspaceArtifact,
+        base_artifact: ArtifactMetadata,
+        validation_round: int,
+        expected_candidate_process_id: str,
+        expected_candidate_round: int,
+        expected_subordinates: dict[str, tuple[str, ...]] | None,
+    ) -> HierarchyValidationCollection:
+        validated = self._validate_hierarchy_candidate(
+            candidate=candidate,
+            base_artifact=base_artifact,
+            expected_candidate_process_id=expected_candidate_process_id,
+            expected_candidate_round=expected_candidate_round,
+        )
+        candidate_artifact = validated.artifact
+        base_digest = validated.base_weights_digest
+        candidate_digest = validated.candidate_weights_digest
+        expected_model_contract = validated.model_contract_digest
+        expected_preprocessing_contract = validated.preprocessing_contract_digest
+
+        summaries: list[ValidationSummary] = []
+        hierarchy_branches: list[HierarchyBranchValidation] = []
+        for participant in process.participants:
+            notification = participant.notification
+            model_infos = notification.ml_model_infos if notification is not None else None
+            if (
+                notification is None
+                or model_infos is None
+                or len(model_infos) != 1
+                or model_infos[0].event != participant.scope.ml_event
+            ):
+                raise RuntimeError("participant final validation result is missing or invalid")
+            address = model_infos[0].model_file_address
+            if address is None or address.model_url is None:
+                raise RuntimeError("participant final validation result has no model URL")
+            artifact = self._workspace.download(
+                str(address.model_url),
+                process.process_id,
+                f"validation-{participant.candidate.target.nf_instance_id}",
+            )
+            bundle = self._loader.load(artifact)
+            contract = validate_fl_artifact(_artifact_projection(bundle.manifest))
+            if (
+                not isinstance(contract, RoundLocalArtifact)
+                or contract.result_type is not RoundLocalResultType.ACCURACY_CHECK
+                or not isinstance(contract.fl_metadata, RoundLocalAccuracyCheckMetadata)
+            ):
+                raise RuntimeError("participant returned a non-validation local artifact")
+            metadata = contract.fl_metadata
+            evaluation = metadata.evaluation
+            if (
+                metadata.ml_corre_id != process.process_id
+                or metadata.round_ind != validation_round
+                or metadata.participant_nf_instance_id
+                != participant.candidate.target.nf_instance_id
+                or metadata.scope_digest != participant.expected_scope_digest
+                or metadata.input_global_weights_digest != candidate_digest
+                or metadata.weights_digest != candidate_digest
+                or weights_digest(bundle.model) != candidate_digest
+                or metadata.model_contract_digest != expected_model_contract
+                or metadata.preprocessing_contract_digest
+                != expected_preprocessing_contract
+                or evaluation.base_model_weights_digest != base_digest
+                or evaluation.candidate_weights_digest != candidate_digest
+                or evaluation.base.absolute_actual_sum <= 0
+                or evaluation.candidate.absolute_actual_sum <= 0
+            ):
+                raise RuntimeError(
+                    "participant final validation identity does not match assignment"
+                )
+            summary = ValidationSummary(
+                participant_nf_instance_id=metadata.participant_nf_instance_id,
+                scope_digest=metadata.scope_digest,
+                evaluation_sample_count=evaluation.evaluation_sample_count,
+                start_time=evaluation.start_time,
+                end_time=evaluation.end_time,
+                base_model_weights_digest=evaluation.base_model_weights_digest,
+                candidate_weights_digest=evaluation.candidate_weights_digest,
+                base=evaluation.base,
+                candidate=evaluation.candidate,
+            )
+            summaries.append(summary)
+            if expected_subordinates is None:
+                if metadata.subordinate_validation_summaries is not None:
+                    raise RuntimeError(
+                        "Leaf validation result must not contain subordinate evidence"
+                    )
+                continue
+            expected = expected_subordinates.get(metadata.participant_nf_instance_id)
+            subordinate = metadata.subordinate_validation_summaries
+            actual = tuple(
+                item.participant_nf_instance_id for item in subordinate or ()
+            )
+            if expected is None or subordinate is None or actual != expected:
+                raise RuntimeError(
+                    "Branch validation subordinate set does not match admission"
+                )
+            hierarchy_branches.append(
+                HierarchyBranchValidation(
+                    branch_nf_instance_id=metadata.participant_nf_instance_id,
+                    subordinate_validation_summaries=subordinate,
+                )
+            )
+        summaries.sort(key=lambda item: item.participant_nf_instance_id)
+        hierarchy_branches.sort(key=lambda item: item.branch_nf_instance_id)
+        if expected_subordinates is not None and set(expected_subordinates) != {
+            item.branch_nf_instance_id for item in hierarchy_branches
+        }:
+            raise RuntimeError("hierarchy validation does not cover every admitted Branch")
+        return HierarchyValidationCollection(
+            candidate_artifact=candidate_artifact,
+            validation_summaries=tuple(summaries),
+            hierarchy_branches=tuple(hierarchy_branches),
+        )
+
+    def _validate_hierarchy_candidate(
+        self,
+        *,
+        candidate: FLWorkspaceArtifact,
+        base_artifact: ArtifactMetadata,
+        expected_candidate_process_id: str,
+        expected_candidate_round: int,
+    ) -> _ValidatedHierarchyCandidate:
+        if not isinstance(candidate.contract, RoundGlobalArtifact):
+            raise RuntimeError("hierarchy final candidate is not a ROUND_GLOBAL artifact")
+        candidate_metadata = candidate.contract.fl_metadata
+        candidate_artifact = ArtifactMetadata(
+            key=candidate.digest,
+            size_bytes=candidate.path.stat().st_size,
+            path=candidate.path,
+            url=candidate.url,
+        )
+        base = self._loader.load(base_artifact)
+        candidate_bundle = self._loader.load(candidate_artifact)
+        base_digest = weights_digest(base.model)
+        candidate_digest = weights_digest(candidate_bundle.model)
+        expected_model_contract = model_contract_digest(base.manifest)
+        expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
+        if (
+            candidate_metadata.ml_corre_id != expected_candidate_process_id
+            or candidate_metadata.round_ind != expected_candidate_round
+            or candidate_metadata.model_contract_digest != expected_model_contract
+            or candidate_metadata.preprocessing_contract_digest
+            != expected_preprocessing_contract
+            or candidate_metadata.base_weights_digest != base_digest
+            or candidate_metadata.weights_digest != candidate_digest
+            or model_contract_digest(candidate_bundle.manifest) != expected_model_contract
+            or preprocessing_contract_digest(candidate_bundle.manifest)
+            != expected_preprocessing_contract
+        ):
+            raise RuntimeError("hierarchy final candidate identity does not match the plan")
+        return _ValidatedHierarchyCandidate(
+            artifact=candidate_artifact,
+            base_weights_digest=base_digest,
+            candidate_weights_digest=candidate_digest,
+            model_contract_digest=expected_model_contract,
+            preprocessing_contract_digest=expected_preprocessing_contract,
+        )
+
+    def _evaluate_hierarchy_gate(
+        self,
+        process: FLProcess,
+        summaries: tuple[ValidationSummary, ...],
+    ) -> None:
+        if not summaries:
+            raise RuntimeError("hierarchy final validation has no Leaf evidence")
+        base_error = sum(item.base.absolute_error_sum for item in summaries)
+        base_actual = sum(item.base.absolute_actual_sum for item in summaries)
+        candidate_error = sum(item.candidate.absolute_error_sum for item in summaries)
+        candidate_actual = sum(item.candidate.absolute_actual_sum for item in summaries)
+        if base_actual <= 0 or candidate_actual <= 0:
+            raise RuntimeError("hierarchy final validation has a zero denominator")
+        reasons: list[str] = []
+        if candidate_error / candidate_actual >= base_error / base_actual:
+            reasons.append("aggregate_not_improved")
+        for summary in summaries:
+            regression = (wape(summary.candidate) or 0.0) - (
+                wape(summary.base) or 0.0
+            )
+            if regression > self._server_settings.final_validation.max_scope_wape_regression:
+                reasons.append(f"scope_regression_exceeded:{summary.scope_digest}")
+        process.gate_would_accept = not reasons
+        process.gate_rejection_reasons = tuple(reasons)
+        logger.info(
+            "Hierarchy final validation evaluated process_id=%s "
+            "base_wape=%s candidate_wape=%s gate_would_accept=%s enforced=%s",
+            process.process_id,
+            base_error / base_actual,
+            candidate_error / candidate_actual,
             process.gate_would_accept,
             self._server_settings.final_validation.enforce_performance_gate,
         )

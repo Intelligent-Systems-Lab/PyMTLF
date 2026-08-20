@@ -19,6 +19,7 @@ from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
     ArtifactRole,
     HierarchyAssignmentArtifact,
+    RoundGlobalArtifact,
     RoundInputArtifact,
     validate_fl_artifact_manifest,
 )
@@ -119,6 +120,19 @@ class BranchPreparationDispatcher(Protocol):
         upper_client_subscription_id: str,
         upper_resource_revision: int,
         upper_input_artifact_digest: str,
+        upper_scope_digest: str,
+        callback_margin_seconds: int,
+    ) -> BranchArtifactView: ...
+
+    def execute_validation(
+        self,
+        *,
+        assignment: ValidatedHierarchyArtifact,
+        representation: NwdafMLModelTrainSubsc,
+        upper_candidate: LoadedBundle,
+        upper_candidate_artifact: ArtifactMetadata,
+        upper_client_subscription_id: str,
+        upper_resource_revision: int,
         upper_scope_digest: str,
         callback_margin_seconds: int,
     ) -> BranchArtifactView: ...
@@ -489,6 +503,12 @@ class FLClientEngine:
 
     def _start_validation(self, resource: FLClientResource) -> None:
         value = resource.representation
+        hierarchy_metadata = (
+            resource.hierarchy_assignment.contract.hierarchy_metadata
+            if resource.hierarchy_assignment is not None
+            else None
+        )
+        branch_validation = isinstance(hierarchy_metadata, BranchAssignmentMetadata)
         violations: list[InvalidParameter] = []
         if value.ml_accuracy_check_flag is not True:
             violations.append(InvalidParameter("mLAccChkFlg", "must be true for final validation"))
@@ -503,7 +523,9 @@ class FLClientEngine:
                     "must provide exactly one final candidate for validation",
                 )
             )
-        if resource.dataset_snapshot is None or resource.preparation_base_artifact is None:
+        if resource.preparation_base_artifact is None or (
+            resource.dataset_snapshot is None and not branch_validation
+        ):
             violations.append(
                 InvalidParameter(
                     "mLAccChkFlg",
@@ -998,13 +1020,13 @@ class FLClientEngine:
                 resource = self._required(subscription_id)
                 if (
                     resource.revision != revision
-                    or resource.dataset_snapshot is None
                     or resource.preparation_base_artifact is None
                 ):
                     raise RuntimeError("final validation has no frozen preparation inputs")
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
                 preparation_base_artifact = resource.preparation_base_artifact
+                hierarchy_assignment = resource.hierarchy_assignment
             model_info = value.ml_model_infos[0]
             if model_info.model_file_address is None:
                 raise RuntimeError("final validation candidate must use mLFileAddr")
@@ -1015,6 +1037,9 @@ class FLClientEngine:
             )
             base = self._loader.load(preparation_base_artifact)
             candidate = self._loader.load(candidate_artifact)
+            candidate_contract = validate_fl_artifact_manifest(candidate.manifest)
+            if not isinstance(candidate_contract, RoundGlobalArtifact):
+                raise RuntimeError("final validation candidate is not a ROUND_GLOBAL artifact")
             for bundle, label in ((base, "base"), (candidate, "candidate")):
                 if (
                     model_contract_digest(bundle.manifest)
@@ -1023,6 +1048,63 @@ class FLClientEngine:
                     != resource.expected_preprocessing_contract_digest
                 ):
                     raise RuntimeError(f"final validation {label} changed the prepared contract")
+            candidate_digest = weights_digest(candidate.model)
+            if (
+                value.round_indicator is None
+                or candidate_contract.fl_metadata.round_ind != value.round_indicator - 1
+                or candidate_contract.fl_metadata.weights_digest != candidate_digest
+            ):
+                raise RuntimeError("final validation candidate identity does not match the command")
+            hierarchy_metadata = (
+                hierarchy_assignment.contract.hierarchy_metadata
+                if hierarchy_assignment is not None
+                else None
+            )
+            if not isinstance(hierarchy_metadata, LeafAssignmentMetadata) and (
+                candidate_contract.fl_metadata.ml_corre_id
+                != value.ml_correlation_id
+            ):
+                raise RuntimeError(
+                    "final validation candidate does not match the upper process"
+                )
+            if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
+                if self._branch_coordinator is None:
+                    raise RuntimeError(
+                        "Branch hierarchy validation requires the Branch coordinator"
+                    )
+                published = self._branch_coordinator.execute_validation(
+                    assignment=hierarchy_assignment,
+                    representation=value,
+                    upper_candidate=candidate,
+                    upper_candidate_artifact=candidate_artifact,
+                    upper_client_subscription_id=subscription_id,
+                    upper_resource_revision=revision,
+                    upper_scope_digest=resource.scope.scope_digest,
+                    callback_margin_seconds=(
+                        self._client_settings.callback_deadline_margin_seconds
+                    ),
+                )
+                notification = NwdafMLModelTrainNotif(
+                    notifCorreId=value.notification_correlation_id,
+                    mlCorreId=value.ml_correlation_id,
+                    roundInd=value.round_indicator,
+                    mLModelInfos=[
+                        MLEventNotification(
+                            event=value.ml_event_subscriptions[0].ml_event,
+                            mLFileAddr=MLModelAddress(mLModelUrl=published.url),
+                        )
+                    ],
+                )
+                with self._lock:
+                    current = self._resources.get(subscription_id)
+                    if current is None or current.revision != revision:
+                        return
+                    current.state = FLClientState.RESULT_PENDING
+                    self._cancel_delay(subscription_id)
+                self._enqueue_delivery(current, notification, FLClientState.READY)
+                return
+            if snapshot is None:
+                raise RuntimeError("final validation has no frozen preparation dataset")
             dataset = self._dataset_builder.build(snapshot, base.manifest)
             training_sample_count = sum(
                 scope.training_sample_count for scope in dataset.training_scopes
@@ -1064,7 +1146,6 @@ class FLClientEngine:
                 raise RuntimeError("final validation requires non-zero evaluation evidence")
             participant_id = self._participant_id()
             base_digest = weights_digest(base.model)
-            candidate_digest = weights_digest(candidate.model)
             published = self._workspace.publish(
                 process_id=value.ml_correlation_id or subscription_id,
                 participant_id=participant_id,

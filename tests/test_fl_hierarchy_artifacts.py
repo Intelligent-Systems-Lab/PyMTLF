@@ -3,6 +3,7 @@ import io
 import os
 import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import joblib
@@ -22,8 +23,11 @@ from py_mtlf.core.fl_artifacts import (
     ArtifactRole,
     HierarchyAssignmentArtifact,
     HierarchyPreparationResultArtifact,
+    RoundGlobalArtifact,
     RoundInputArtifact,
     RoundLocalArtifact,
+    ValidationSummary,
+    WapeComponents,
 )
 from py_mtlf.core.fl_hierarchy import (
     FailedClient,
@@ -240,6 +244,124 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
             )
     finally:
         branch_workspace.close()
+
+
+def test_branch_republishes_validation_candidate_byte_identically_under_plan_owner(
+    tmp_path,
+) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    base = base_bundle()
+    base_digest = weights_digest(base.model)
+    candidate = root_workspace.publish(
+        process_id="root-process",
+        participant_id=ROOT,
+        round_indicator=1,
+        role="ROUND_GLOBAL",
+        base=base,
+        model=base.model,
+        metadata={
+            "artifact_role": "ROUND_GLOBAL",
+            "fl_metadata": {
+                "contract_version": "1.0",
+                "ml_corre_id": "root-process",
+                "round_ind": 1,
+                "model_contract_digest": model_contract_digest(base.manifest),
+                "preprocessing_contract_digest": preprocessing_contract_digest(
+                    base.manifest
+                ),
+                "base_weights_digest": base_digest,
+                "weights_digest": base_digest,
+                "participants": [
+                    {
+                        "participant_nf_instance_id": BRANCH,
+                        "training_sample_count": 20,
+                        "local_artifact_digest": "1" * 64,
+                    }
+                ],
+                "aggregated_training_sample_count": 20,
+            },
+        },
+    )
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"X-Artifact-SHA256": candidate.digest},
+            content=candidate.path.read_bytes(),
+            request=request,
+        )
+
+    branch_workspace = workspace(
+        tmp_path / "branch",
+        "http://branch.example",
+        client=httpx.Client(transport=httpx.MockTransport(serve)),
+        allowed_origins=("http://root.example",),
+    )
+    try:
+        downloaded = branch_workspace.download(
+            candidate.url,
+            "root-process",
+            "validation-candidate",
+        )
+        republished = HierarchyArtifactService(
+            branch_workspace
+        ).republish_validation_candidate(
+            source=downloaded,
+            plan_id=PLAN,
+            containing_branch_nf_instance_id=BRANCH,
+            validation_round_indicator=2,
+        )
+
+        assert isinstance(republished.contract, RoundGlobalArtifact)
+        assert republished.digest == candidate.digest
+        assert republished.path.read_bytes() == candidate.path.read_bytes()
+        assert republished.manifest == candidate.manifest
+        assert republished.url != candidate.url
+        assert republished.process_id == PLAN
+        loaded_candidate = TrustedBundleLoader().load(metadata(republished))
+        start = datetime(2026, 8, 20, tzinfo=UTC)
+        summaries = tuple(
+            ValidationSummary(
+                participant_nf_instance_id=leaf_id,
+                scope_digest=str(index) * 64,
+                evaluation_sample_count=10,
+                start_time=start,
+                end_time=start + timedelta(minutes=1),
+                base_model_weights_digest=base_digest,
+                candidate_weights_digest=base_digest,
+                base=WapeComponents(
+                    absolute_error_sum=10,
+                    absolute_actual_sum=100,
+                ),
+                candidate=WapeComponents(
+                    absolute_error_sum=5,
+                    absolute_actual_sum=100,
+                ),
+            )
+            for index, leaf_id in enumerate((LEAF_A, LEAF_B), start=1)
+        )
+        result = HierarchyArtifactService(
+            branch_workspace
+        ).publish_hierarchy_validation_result(
+            upper_candidate=loaded_candidate,
+            upper_process_id="root-process",
+            branch_nf_instance_id=BRANCH,
+            upper_round_indicator=2,
+            upper_scope_digest="3" * 64,
+            subordinate_summaries=summaries,
+        )
+        assert isinstance(result.contract, RoundLocalArtifact)
+        assert result.contract.result_type == "ACCURACY_CHECK"
+        assert (
+            result.contract.fl_metadata.subordinate_validation_summaries
+            == summaries
+        )
+        assert result.contract.fl_metadata.evaluation.evaluation_sample_count == 20
+        branch_workspace.release_plan(PLAN)
+        assert branch_workspace.resolve(PLAN, BRANCH, 2, "ROUND_GLOBAL", candidate.digest) is None
+    finally:
+        branch_workspace.close()
+        root_workspace.close()
 
 
 def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_path) -> None:

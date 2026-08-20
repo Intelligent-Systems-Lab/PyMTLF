@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -15,7 +16,11 @@ from pydantic import (
     model_validator,
 )
 
-from py_mtlf.core.fl_hierarchy import AssignmentMetadata, PreparationResultMetadata
+from py_mtlf.core.fl_hierarchy import (
+    AssignmentMetadata,
+    PreparationResultMetadata,
+    normalize_plan_id,
+)
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
 
 Sha256 = Annotated[str, Field(pattern=SHA256_PATTERN.pattern)]
@@ -166,6 +171,10 @@ class AccuracyCheckEvaluation(ArtifactContractModel):
 
 class RoundLocalAccuracyCheckMetadata(RoundLocalCommonMetadata):
     evaluation: AccuracyCheckEvaluation
+    subordinate_validation_summaries: tuple[ValidationSummary, ...] | None = Field(
+        default=None,
+        min_length=1,
+    )
 
     @model_validator(mode="after")
     def validate_unchanged_candidate(self) -> RoundLocalAccuracyCheckMetadata:
@@ -176,6 +185,12 @@ class RoundLocalAccuracyCheckMetadata(RoundLocalCommonMetadata):
         if self.evaluation.candidate_weights_digest != self.weights_digest:
             raise ValueError(
                 "accuracy-check candidate weights digest must match artifact weights digest"
+            )
+        if self.subordinate_validation_summaries is not None:
+            _validate_subordinate_validation_summaries(
+                self.participant_nf_instance_id,
+                self.evaluation,
+                self.subordinate_validation_summaries,
             )
         return self
 
@@ -198,11 +213,66 @@ class RoundGlobalMetadata(CommonFLMetadata):
         return self
 
 
+class HierarchyBranchValidation(ArtifactContractModel):
+    branch_nf_instance_id: str
+    subordinate_validation_summaries: tuple[ValidationSummary, ...] = Field(min_length=1)
+
+    @field_validator("branch_nf_instance_id")
+    @classmethod
+    def normalize_nf_instance_id(cls, value: str) -> str:
+        return str(UUID(value))
+
+    @model_validator(mode="after")
+    def validate_subordinates(self) -> HierarchyBranchValidation:
+        identifiers = [
+            item.participant_nf_instance_id
+            for item in self.subordinate_validation_summaries
+        ]
+        if identifiers != sorted(identifiers):
+            raise ValueError(
+                "subordinate validation summaries must use canonical NF instance ID ordering"
+            )
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("subordinate validation summaries must be unique")
+        if self.branch_nf_instance_id in identifiers:
+            raise ValueError("Branch cannot also be a subordinate validation participant")
+        return self
+
+
+class HierarchyValidation(ArtifactContractModel):
+    plan_id: str
+    branches: tuple[HierarchyBranchValidation, ...] = Field(min_length=1)
+
+    @field_validator("plan_id")
+    @classmethod
+    def validate_plan_id(cls, value: str) -> str:
+        return normalize_plan_id(value)
+
+    @model_validator(mode="after")
+    def validate_topology(self) -> HierarchyValidation:
+        branch_ids = [item.branch_nf_instance_id for item in self.branches]
+        if branch_ids != sorted(branch_ids):
+            raise ValueError("hierarchy validation branches must use canonical ordering")
+        if len(set(branch_ids)) != len(branch_ids):
+            raise ValueError("hierarchy validation branches must be unique")
+        leaf_ids = [
+            summary.participant_nf_instance_id
+            for branch in self.branches
+            for summary in branch.subordinate_validation_summaries
+        ]
+        if len(set(leaf_ids)) != len(leaf_ids):
+            raise ValueError("hierarchy validation Leaves must be globally unique")
+        if set(branch_ids).intersection(leaf_ids):
+            raise ValueError("hierarchy validation Branches and Leaves must be disjoint")
+        return self
+
+
 class FinalModelMetadata(CommonFLMetadata):
     previous_model_unique_id: int | None = Field(default=None, ge=0)
     participants: tuple[ParticipantSample, ...] = Field(min_length=1)
     final_candidate_digest: Sha256
     validation_summary: tuple[ValidationSummary, ...] = Field(min_length=1)
+    hierarchy_validation: HierarchyValidation | None = None
     global_gate_accepted: bool
     created_at: AwareDatetime
 
@@ -231,9 +301,84 @@ class FinalModelMetadata(CommonFLMetadata):
                 raise ValueError(
                     "validation summary candidate digest must match final candidate digest"
                 )
+        if self.hierarchy_validation is not None:
+            branch_ids = tuple(
+                item.branch_nf_instance_id
+                for item in self.hierarchy_validation.branches
+            )
+            if branch_ids != tuple(identifiers):
+                raise ValueError(
+                    "hierarchy validation branches must match final direct participants"
+                )
+            direct = {
+                item.participant_nf_instance_id: item for item in self.validation_summary
+            }
+            for branch in self.hierarchy_validation.branches:
+                _validate_subordinate_validation_summaries(
+                    branch.branch_nf_instance_id,
+                    direct[branch.branch_nf_instance_id],
+                    branch.subordinate_validation_summaries,
+                )
         if not self.global_gate_accepted:
             raise ValueError("FINAL_MODEL requires an accepted global gate")
         return self
+
+
+def _validate_subordinate_validation_summaries(
+    branch_nf_instance_id: str,
+    aggregate: AccuracyCheckEvaluation | ValidationSummary,
+    summaries: tuple[ValidationSummary, ...],
+) -> None:
+    identifiers = [item.participant_nf_instance_id for item in summaries]
+    if identifiers != sorted(identifiers):
+        raise ValueError(
+            "subordinate validation summaries must use canonical NF instance ID ordering"
+        )
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("subordinate validation summaries must be unique")
+    if branch_nf_instance_id in identifiers:
+        raise ValueError("Branch cannot also be a subordinate validation participant")
+    if aggregate.evaluation_sample_count != sum(
+        item.evaluation_sample_count for item in summaries
+    ):
+        raise ValueError(
+            "aggregate evaluation sample count must equal subordinate validation summaries"
+        )
+    if aggregate.start_time != min(item.start_time for item in summaries):
+        raise ValueError("aggregate start time must cover subordinate validation summaries")
+    if aggregate.end_time != max(item.end_time for item in summaries):
+        raise ValueError("aggregate end time must cover subordinate validation summaries")
+    for item in summaries:
+        if item.base_model_weights_digest != aggregate.base_model_weights_digest:
+            raise ValueError(
+                "subordinate validation base digest must match aggregate evidence"
+            )
+        if item.candidate_weights_digest != aggregate.candidate_weights_digest:
+            raise ValueError(
+                "subordinate validation candidate digest must match aggregate evidence"
+            )
+    for label in ("base", "candidate"):
+        aggregate_components = getattr(aggregate, label)
+        subordinate_error = sum(
+            getattr(item, label).absolute_error_sum for item in summaries
+        )
+        subordinate_actual = sum(
+            getattr(item, label).absolute_actual_sum for item in summaries
+        )
+        if not math.isclose(
+            aggregate_components.absolute_error_sum,
+            subordinate_error,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ) or not math.isclose(
+            aggregate_components.absolute_actual_sum,
+            subordinate_actual,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "aggregate WAPE components must equal subordinate validation summaries"
+            )
 
 
 class ArtifactContractBase(ArtifactContractModel):

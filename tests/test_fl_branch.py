@@ -1,10 +1,16 @@
 import threading
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, call
 
 import pytest
 
 from py_mtlf.core.artifacts import ArtifactMetadata
-from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact, RoundGlobalArtifact
+from py_mtlf.core.fl_artifacts import (
+    HierarchyAssignmentArtifact,
+    RoundGlobalArtifact,
+    ValidationSummary,
+    WapeComponents,
+)
 from py_mtlf.core.fl_branch import (
     BranchPreparationCancelled,
     BranchPreparationExecution,
@@ -18,6 +24,7 @@ from py_mtlf.core.fl_hierarchy_discovery import (
 from py_mtlf.core.fl_server import (
     HierarchyParticipantPreparationOutcome,
     HierarchyPreparationCollection,
+    HierarchyValidationCollection,
 )
 from py_mtlf.core.fl_workspace import ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import (
@@ -485,6 +492,252 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
         "lower-process",
         "conflicting duplicate Branch upper round command",
     )
+
+
+def test_branch_validation_republishes_before_lower_dispatch_and_returns_leaf_evidence(
+    tmp_path,
+):
+    assignment = _assignment(tmp_path)
+    candidate_path = tmp_path / "candidate.tar.gz"
+    candidate_path.write_bytes(b"candidate")
+    candidate_artifact = ArtifactMetadata(
+        key="3" * 64,
+        size_bytes=candidate_path.stat().st_size,
+        path=candidate_path,
+        url="http://root.example/candidate/" + "3" * 64,
+    )
+    republished = Mock(
+        url="http://branch.example/candidate/" + "3" * 64,
+        digest="3" * 64,
+    )
+    upper_result = Mock(url="http://branch.example/validation-result")
+    artifacts = Mock()
+    artifacts.republish_validation_candidate.return_value = republished
+    artifacts.publish_hierarchy_validation_result.return_value = upper_result
+    start = datetime(2026, 8, 20, tzinfo=UTC)
+    summaries = tuple(
+        ValidationSummary(
+            participant_nf_instance_id=leaf_id,
+            scope_digest=str(index) * 64,
+            evaluation_sample_count=10,
+            start_time=start,
+            end_time=start + timedelta(minutes=1),
+            base_model_weights_digest="4" * 64,
+            candidate_weights_digest="5" * 64,
+            base=WapeComponents(
+                absolute_error_sum=10,
+                absolute_actual_sum=100,
+            ),
+            candidate=WapeComponents(
+                absolute_error_sum=5,
+                absolute_actual_sum=100,
+            ),
+        )
+        for index, leaf_id in enumerate((LEAF_A, LEAF_B), start=1)
+    )
+    server = Mock()
+    server.execute_hierarchy_validation.return_value = HierarchyValidationCollection(
+        candidate_artifact=candidate_artifact,
+        validation_summaries=summaries,
+    )
+    coordinator = _coordinator(Mock(), artifacts, server)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=assignment,
+        leaf_nodes=(_node(LEAF_A), _node(LEAF_B)),
+        leaf_assignments=(Mock(), Mock()),
+        process_id="lower-process",
+    )
+    coordinator._next_lower_round[PLAN] = 2
+    payload = _representation().model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLTrainRepInfo": {"maxResTime": 300},
+        }
+    )
+    representation = NwdafMLModelTrainSubsc.model_validate(payload)
+    upper_candidate = Mock()
+
+    first = coordinator.execute_validation(
+        assignment=assignment,
+        representation=representation,
+        upper_candidate=upper_candidate,
+        upper_candidate_artifact=candidate_artifact,
+        upper_client_subscription_id="upper-resource",
+        upper_resource_revision=3,
+        upper_scope_digest="6" * 64,
+        callback_margin_seconds=5,
+    )
+    replay = coordinator.execute_validation(
+        assignment=assignment,
+        representation=representation,
+        upper_candidate=upper_candidate,
+        upper_candidate_artifact=candidate_artifact,
+        upper_client_subscription_id="upper-resource",
+        upper_resource_revision=3,
+        upper_scope_digest="6" * 64,
+        callback_margin_seconds=5,
+    )
+
+    assert first is upper_result
+    assert replay is upper_result
+    artifacts.republish_validation_candidate.assert_called_once()
+    lower = server.execute_hierarchy_validation.call_args.kwargs
+    assert lower["process_id"] == "lower-process"
+    assert lower["validation_round"] == 2
+    assert lower["candidate"] is republished
+    assert lower["expected_candidate_process_id"] == "root-process"
+    assert lower["expected_candidate_round"] == 1
+    assert lower["timeout_seconds"] == 295
+    upper = artifacts.publish_hierarchy_validation_result.call_args.kwargs
+    assert upper["subordinate_summaries"] == summaries
+    assert coordinator._validations[(PLAN, "root-process", 2)].state == "COMPLETE"
+
+
+def test_branch_validation_republish_failure_does_not_dispatch_leaves(tmp_path):
+    assignment = _assignment(tmp_path)
+    candidate_path = tmp_path / "candidate.tar.gz"
+    candidate_path.write_bytes(b"candidate")
+    candidate_artifact = ArtifactMetadata(
+        key="3" * 64,
+        size_bytes=candidate_path.stat().st_size,
+        path=candidate_path,
+        url="http://root.example/candidate/" + "3" * 64,
+    )
+    artifacts = Mock()
+    artifacts.republish_validation_candidate.side_effect = RuntimeError(
+        "republish failed"
+    )
+    server = Mock()
+    coordinator = _coordinator(Mock(), artifacts, server)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=assignment,
+        leaf_nodes=(_node(LEAF_A), _node(LEAF_B)),
+        leaf_assignments=(Mock(), Mock()),
+        process_id="lower-process",
+    )
+    payload = _representation().model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLTrainRepInfo": {"maxResTime": 300},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="republish failed"):
+        coordinator.execute_validation(
+            assignment=assignment,
+            representation=NwdafMLModelTrainSubsc.model_validate(payload),
+            upper_candidate=Mock(),
+            upper_candidate_artifact=candidate_artifact,
+            upper_client_subscription_id="upper-resource",
+            upper_resource_revision=3,
+            upper_scope_digest="6" * 64,
+            callback_margin_seconds=5,
+        )
+
+    server.execute_hierarchy_validation.assert_not_called()
+    artifacts.publish_hierarchy_validation_result.assert_not_called()
+
+
+def test_branch_cancellation_during_validation_fences_late_lower_result(tmp_path):
+    assignment = _assignment(tmp_path)
+    candidate_path = tmp_path / "candidate.tar.gz"
+    candidate_path.write_bytes(b"candidate")
+    candidate_artifact = ArtifactMetadata(
+        key="3" * 64,
+        size_bytes=candidate_path.stat().st_size,
+        path=candidate_path,
+        url="http://root.example/candidate/" + "3" * 64,
+    )
+    republished = Mock(
+        url="http://branch.example/candidate/" + "3" * 64,
+        digest="3" * 64,
+    )
+    artifacts = Mock()
+    artifacts.republish_validation_candidate.return_value = republished
+    server = Mock()
+    lower_started = threading.Event()
+    release_lower = threading.Event()
+
+    def execute_lower(**_kwargs):
+        lower_started.set()
+        if not release_lower.wait(1):
+            raise AssertionError("test did not release the lower validation")
+        return HierarchyValidationCollection(
+            candidate_artifact=candidate_artifact,
+            validation_summaries=(),
+        )
+
+    def cancel_lower(_process_id, _reason):
+        release_lower.set()
+
+    server.execute_hierarchy_validation.side_effect = execute_lower
+    server.cancel_hierarchy_preparation.side_effect = cancel_lower
+    coordinator = _coordinator(Mock(), artifacts, server)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=assignment,
+        leaf_nodes=(_node(LEAF_A), _node(LEAF_B)),
+        leaf_assignments=(Mock(), Mock()),
+        process_id="lower-process",
+    )
+    payload = _representation().model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "mLAccChkFlg": True,
+            "skipFlInd": True,
+            "roundInd": 2,
+            "mLTrainRepInfo": {"maxResTime": 300},
+        }
+    )
+    representation = NwdafMLModelTrainSubsc.model_validate(payload)
+    failures = []
+
+    def execute():
+        try:
+            coordinator.execute_validation(
+                assignment=assignment,
+                representation=representation,
+                upper_candidate=Mock(),
+                upper_candidate_artifact=candidate_artifact,
+                upper_client_subscription_id="upper-resource",
+                upper_resource_revision=3,
+                upper_scope_digest="6" * 64,
+                callback_margin_seconds=5,
+            )
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        assert lower_started.wait(1) is True
+        coordinator.cancel(PLAN, "parent deleted upper validation resource")
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], BranchPreparationCancelled)
+        assert (PLAN, "root-process", 2) not in coordinator._validations
+        artifacts.publish_hierarchy_validation_result.assert_not_called()
+        server.cancel_hierarchy_preparation.assert_called_once_with(
+            "lower-process",
+            "parent deleted upper validation resource",
+        )
+    finally:
+        release_lower.set()
+        thread.join(timeout=1)
+        coordinator.close()
 
 
 def test_concurrent_exact_branch_round_replay_waits_for_one_lower_execution(tmp_path):

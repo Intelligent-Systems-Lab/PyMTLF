@@ -6,7 +6,11 @@ from uuid import UUID
 
 import pytest
 
-from py_mtlf.config import FederatedStrategySettings, FLServerSettings
+from py_mtlf.config import (
+    FederatedLearningSettings,
+    FederatedStrategySettings,
+    FLServerSettings,
+)
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import HierarchyPreparationResultArtifact
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
@@ -22,6 +26,9 @@ from py_mtlf.core.fl_root import (
     RootRequestState,
 )
 from py_mtlf.core.fl_server import (
+    FLParticipant,
+    FLProcess,
+    FLServerEngine,
     FLServerState,
     HierarchyParticipantPreparationOutcome,
     HierarchyPreparationCollection,
@@ -578,6 +585,21 @@ def _configure_branch_result(
         url="http://root.example/round-global/0",
     )
 
+    def finalize_hierarchy_candidate(**kwargs):
+        observer = kwargs["state_observer"]
+        for state in (
+            FLServerState.FINAL_VALIDATION_DISPATCH,
+            FLServerState.FINAL_VALIDATION_WAITING,
+            FLServerState.FINAL_VALIDATION_EVALUATING,
+            FLServerState.CANDIDATE_READY,
+            FLServerState.PUBLISHING,
+            FLServerState.COMPLETE,
+        ):
+            observer(state)
+        return SimpleNamespace(state=FLServerState.COMPLETE)
+
+    server.finalize_hierarchy_candidate.side_effect = finalize_hierarchy_candidate
+
 
 def test_root_admits_only_complete_ready_branch_results(tmp_path):
     (
@@ -623,11 +645,11 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         )
         admitted = coordinator.wait_for_state(
             REQUEST_A_ID,
-            {RootRequestState.CANDIDATE_READY, RootRequestState.FAILED},
+            {RootRequestState.COMPLETE, RootRequestState.FAILED},
             timeout=2,
         )
 
-        assert admitted.state is RootRequestState.CANDIDATE_READY
+        assert admitted.state is RootRequestState.COMPLETE
         assert admitted.admission is not None
         assert admitted.admission.plan_id == admitted.plan_id
         assert admitted.admission.branches[0].branch_nf_instance_id == BRANCH_ID
@@ -649,6 +671,13 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         assert round_input["epochs"] == 3
         upper_round = server.execute_hierarchy_round.call_args.kwargs
         assert upper_round["expected_subordinates"] == {
+            BRANCH_ID: (LEAF_A_ID, LEAF_B_ID)
+        }
+        finalization = server.finalize_hierarchy_candidate.call_args.kwargs
+        assert finalization["process_id"] == "server-process"
+        assert finalization["validation_round"] == 1
+        assert finalization["candidate"] is aggregate
+        assert finalization["expected_subordinates"] == {
             BRANCH_ID: (LEAF_A_ID, LEAF_B_ID)
         }
     finally:
@@ -708,11 +737,11 @@ def test_root_reuses_upper_process_and_feeds_previous_global_into_next_round(
         )
         completed = coordinator.wait_for_state(
             REQUEST_A_ID,
-            {RootRequestState.CANDIDATE_READY, RootRequestState.FAILED},
+            {RootRequestState.COMPLETE, RootRequestState.FAILED},
             timeout=2,
         )
 
-        assert completed.state is RootRequestState.CANDIDATE_READY
+        assert completed.state is RootRequestState.COMPLETE
         assert completed.completed_rounds == 2
         assert completed.current_round == 1
         assert completed.candidate_url.endswith("/round-global/1")
@@ -732,6 +761,75 @@ def test_root_reuses_upper_process_and_feeds_previous_global_into_next_round(
         assert [item.kwargs["round_indicator"] for item in executions] == [0, 1]
         server.start_hierarchy_preparation.assert_called_once()
     finally:
+        coordinator.close()
+
+
+def test_duplicate_status_queries_during_publication_do_not_restart_validation(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+
+    def finalize(**kwargs):
+        observer = kwargs["state_observer"]
+        for state in (
+            FLServerState.FINAL_VALIDATION_DISPATCH,
+            FLServerState.FINAL_VALIDATION_WAITING,
+            FLServerState.FINAL_VALIDATION_EVALUATING,
+            FLServerState.CANDIDATE_READY,
+            FLServerState.PUBLISHING,
+        ):
+            observer(state)
+        publication_started.set()
+        if not release_publication.wait(1):
+            raise AssertionError("test did not release publication")
+        observer(FLServerState.CUTOVER_PENDING)
+        return SimpleNamespace(state=FLServerState.CUTOVER_PENDING)
+
+    server.finalize_hierarchy_candidate.side_effect = finalize
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        assert publication_started.wait(1) is True
+
+        first = coordinator.get(REQUEST_A_ID)
+        second = coordinator.get(REQUEST_A_ID)
+
+        assert first is not None
+        assert second is not None
+        assert first.state is RootRequestState.PUBLISHING
+        assert second.state is RootRequestState.PUBLISHING
+        server.finalize_hierarchy_candidate.assert_called_once()
+        server.execute_hierarchy_round.assert_called_once()
+
+        release_publication.set()
+        completed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.CUTOVER_PENDING, RootRequestState.FAILED},
+            timeout=1,
+        )
+        assert completed.state is RootRequestState.CUTOVER_PENDING
+    finally:
+        release_publication.set()
         coordinator.close()
 
 
@@ -846,6 +944,99 @@ def test_root_shutdown_wakes_round_waiter_while_branch_callback_is_pending(tmp_p
     finally:
         cancellation_received.set()
         thread.join(timeout=1)
+
+
+def test_root_shutdown_during_final_validation_fences_publication(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    publication = Mock()
+    actual_server = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path / "server"),
+        FLServerSettings(round_timeout_seconds=30),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+        publication=publication,
+    )
+    actual_server._patch_validation = Mock()
+    actual_server._validate_hierarchy_candidate = Mock()
+    actual_process = FLProcess(
+        process_id="server-process",
+        intent=None,
+        state=FLServerState.READY,
+        participants=[
+            FLParticipant(
+                scope=Mock(),
+                candidate=Mock(target=Mock(nf_instance_id=BRANCH_ID)),
+                notification_correlation_id="validation-branch-a",
+            )
+        ],
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111111",
+        hierarchy_family_key="ue-communication-default",
+    )
+    actual_server._processes[actual_process.process_id] = actual_process
+    validation_waiting = threading.Event()
+    close_completed = threading.Event()
+    original_finalize = actual_server.finalize_hierarchy_candidate
+
+    def finalize(**kwargs):
+        observer = kwargs["state_observer"]
+
+        def observe(state):
+            observer(state)
+            if state is FLServerState.FINAL_VALIDATION_WAITING:
+                validation_waiting.set()
+
+        return original_finalize(**{**kwargs, "state_observer": observe})
+
+    server.finalize_hierarchy_candidate.side_effect = finalize
+    server.cancel_hierarchy_preparation.side_effect = (
+        actual_server.cancel_hierarchy_preparation
+    )
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    assert validation_waiting.wait(1) is True
+
+    thread = threading.Thread(
+        target=lambda: (coordinator.close(), close_completed.set())
+    )
+    thread.start()
+    try:
+        assert close_completed.wait(1) is True
+        thread.join(timeout=1)
+        snapshot = coordinator.get(REQUEST_A_ID)
+
+        assert not thread.is_alive()
+        assert snapshot.state is RootRequestState.FAILED
+        assert snapshot.failure_cause == "SHUTDOWN"
+        publication.publish.assert_not_called()
+        assert actual_process.state is FLServerState.FAILED
+        assert registry.active() is None
+    finally:
+        thread.join(timeout=1)
+        actual_server.close()
 
 
 def test_root_validates_failure_result_before_rejecting_admission(tmp_path):

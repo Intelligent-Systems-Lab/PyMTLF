@@ -13,7 +13,7 @@ import httpx
 from py_mtlf.config import PublicationSettings
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactMetadata, ArtifactRepository
-from py_mtlf.core.fl_artifacts import ValidationSummary
+from py_mtlf.core.fl_artifacts import HierarchyValidation, ValidationSummary
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     model_contract_digest,
@@ -62,6 +62,7 @@ class ValidatedCandidate:
     required_scope_keys: tuple[str, ...]
     gate_would_accept: bool
     gate_rejection_reasons: tuple[str, ...]
+    hierarchy_validation: HierarchyValidation | None = None
 
 
 class PublicationCoordinator:
@@ -252,6 +253,7 @@ class PublicationCoordinator:
                     gateRejectionReasons=candidate.gate_rejection_reasons,
                 ),
                 validationEvidence=candidate.validation_summaries,
+                hierarchyValidation=candidate.hierarchy_validation,
                 candidatePath=str(candidate.candidate_artifact.path),
                 candidateDigest=candidate.candidate_artifact.key,
                 requiredCutoverScopes=candidate.required_scope_keys,
@@ -321,6 +323,15 @@ class PublicationCoordinator:
                     "validation_summary": [
                         item.model_dump(mode="json") for item in publication.validation_evidence
                     ],
+                    **(
+                        {
+                            "hierarchy_validation": publication.hierarchy_validation.model_dump(
+                                mode="json"
+                            )
+                        }
+                        if publication.hierarchy_validation is not None
+                        else {}
+                    ),
                     "global_gate_accepted": True,
                     "created_at": created_at.isoformat(),
                 },

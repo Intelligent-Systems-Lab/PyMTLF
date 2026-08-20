@@ -12,7 +12,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from py_mtlf.core.fl_artifacts import ValidationSummary
+from py_mtlf.core.fl_artifacts import HierarchyValidation, ValidationSummary
 from py_mtlf.models import SHA256_PATTERN
 
 
@@ -152,6 +152,7 @@ class PendingPublication(DurableRecord):
     participants_and_sample_counts: tuple[ParticipantSampleCount, ...] = Field(min_length=1)
     validation_summary: CatalogValidationSummary
     validation_evidence: tuple[ValidationSummary, ...] = Field(min_length=1)
+    hierarchy_validation: HierarchyValidation | None = None
     candidate_path: str = Field(min_length=1)
     candidate_digest: str = Field(pattern=SHA256_PATTERN.pattern)
     final_bundle_path: str | None = None
