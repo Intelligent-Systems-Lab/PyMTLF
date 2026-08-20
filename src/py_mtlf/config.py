@@ -309,6 +309,11 @@ class TrainingTriggerSettings(FrozenSettings):
     private_api: PrivateTrainingTriggerSettings = PrivateTrainingTriggerSettings()
 
 
+class FLLifecycleSettings(FrozenSettings):
+    terminal_status_ttl_seconds: int = Field(default=3600, gt=0)
+    tombstone_ttl_seconds: int = Field(default=3600, gt=0)
+
+
 class FederatedLearningSettings(FrozenSettings):
     workspace_root: Path = Path("data/fl-workspaces")
     workspace_ttl_seconds: int = Field(default=3600, gt=0)
@@ -320,6 +325,7 @@ class FederatedLearningSettings(FrozenSettings):
     strategy: FederatedStrategySettings | None = None
     topology: TopologySettings | None = None
     training_trigger: TrainingTriggerSettings = TrainingTriggerSettings()
+    lifecycle: FLLifecycleSettings = FLLifecycleSettings()
 
     @field_validator("workspace_root", mode="before")
     @classmethod
@@ -565,6 +571,23 @@ class Settings(FrozenSettings):
                 raise ValueError(
                     "federated_learning.server.max_active_processes must be 1"
                 )
+        workspace_root = self.federated_learning.workspace_root.resolve()
+        repository_root = Path(__file__).resolve().parents[2]
+        if (
+            workspace_root == Path(workspace_root.anchor)
+            or Path.cwd().resolve().is_relative_to(workspace_root)
+            or repository_root.is_relative_to(workspace_root)
+        ):
+            raise ValueError("federated_learning.workspace_root is unsafe")
+        durable_roots = (
+            self.storage.artifact_root.resolve(),
+            self.model_state.directory.resolve(),
+            self.publication.directory.resolve(),
+        )
+        if any(_paths_overlap(workspace_root, durable_root) for durable_root in durable_roots):
+            raise ValueError(
+                "federated_learning.workspace_root must not overlap durable storage"
+            )
         return self
 
 
@@ -585,3 +608,7 @@ def load_settings(path: str | Path) -> Settings:
                             (config_path.parent / candidate).resolve()
                         )
     return Settings.model_validate(raw)
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)

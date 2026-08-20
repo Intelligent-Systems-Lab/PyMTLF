@@ -2,6 +2,7 @@ import copy
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ from py_mtlf.core.fl_artifacts import (
     validate_fl_artifact_manifest,
 )
 from py_mtlf.core.fl_experiment import (
+    ExperimentAdmissionClosedError,
     ExperimentLifecycle,
     ExperimentRegistryError,
     ExperimentRole,
@@ -79,7 +81,6 @@ class FLClientState(StrEnum):
     RESULT_PENDING = "RESULT_PENDING"
     READY = "READY"
     FAILED = "FAILED"
-    FAILED_RESTART = "FAILED_RESTART"
 
 
 class FLClientCapacityError(RuntimeError):
@@ -148,7 +149,7 @@ class FLClientResource:
     dataset_job_id: str = ""
     last_error: str = ""
     revision: int = 1
-    restart_terminal: bool = False
+    work_slot_owned: bool = True
     prepared_training_sample_count: int = 0
     expected_model_contract_digest: str = ""
     expected_preprocessing_contract_digest: str = ""
@@ -189,6 +190,7 @@ class FLClientEngine:
         client: httpx.Client | None = None,
         experiments: FLExperimentRegistry | None = None,
         branch_coordinator: BranchPreparationDispatcher | None = None,
+        clock=time.monotonic,
     ) -> None:
         self._settings = settings
         self._client_settings = client_settings
@@ -210,7 +212,8 @@ class FLClientEngine:
         self._lock = threading.RLock()
         self._resources: dict[str, FLClientResource] = {}
         self._deleting: set[str] = set()
-        self._cancelled_hierarchy_resources: set[str] = set()
+        self._cancelled_hierarchy_resources: dict[str, float] = {}
+        self._clock = clock
         self._executor = ThreadPoolExecutor(
             max_workers=client_settings.max_concurrent_jobs,
             thread_name_prefix="fl-client",
@@ -222,6 +225,8 @@ class FLClientEngine:
         self._futures: set[Future] = set()
         self._outbox_futures: set[Future] = set()
         self._outbox_keys: set[tuple[str, int]] = set()
+        self._abandoned_outbox_keys: set[tuple[str, int]] = set()
+        self._abandoned_work_keys: set[tuple[str, int]] = set()
         self._delay_timers: dict[str, threading.Timer] = {}
         self._capacity = threading.BoundedSemaphore(client_settings.max_concurrent_jobs)
         self._outbox_capacity = threading.BoundedSemaphore(client_settings.callback_queue_size)
@@ -238,6 +243,52 @@ class FLClientEngine:
         self._outbox_executor.shutdown(wait=True, cancel_futures=False)
         if self._owns_client:
             self._client.close()
+
+    def abort_generation(self, reason: str) -> None:
+        """Fence all old-Go resources while leaving the engine ready for new work."""
+        active = self._experiments.active()
+        plan_id = active.plan_id if active is not None else None
+        release_callback_slots = 0
+        release_work_slots = 0
+        with self._lock:
+            resources = tuple(self._resources.values())
+            outbox_keys = set(self._outbox_keys)
+            for resource in resources:
+                key = (resource.subscription_id, resource.revision)
+                if resource.work_slot_owned:
+                    resource.work_slot_owned = False
+                    self._abandoned_work_keys.add(key)
+                    release_work_slots += 1
+                if resource.callback_slot_owned:
+                    if key in outbox_keys:
+                        self._abandoned_outbox_keys.add(key)
+                    resource.callback_slot_owned = False
+                    release_callback_slots += 1
+                resource.revision += 1
+                self._cancel_delay(resource.subscription_id)
+            self._resources.clear()
+            self._deleting.clear()
+            self._cancelled_hierarchy_resources.clear()
+        for _ in range(release_callback_slots):
+            self._outbox_capacity.release()
+        for _ in range(release_work_slots):
+            self._capacity.release()
+        if self._branch_coordinator is not None:
+            abort = getattr(self._branch_coordinator, "abort_generation", None)
+            if callable(abort):
+                abort(reason)
+                if plan_id is not None:
+                    self._branch_coordinator.cancel(plan_id, reason)
+            elif plan_id is not None:
+                self._branch_coordinator.cancel(plan_id, reason)
+        if plan_id is not None:
+            try:
+                self._workspace.release_plan(plan_id)
+            except RuntimeError:
+                logger.exception(
+                    "Failed to release FL Client workspace during generation reset plan_id=%s",
+                    plan_id,
+                )
 
     def create(self, value: NwdafMLModelTrainSubsc) -> FLClientResource:
         validate_fl_subscription(value)
@@ -256,6 +307,8 @@ class FLClientEngine:
                     resource_id,
                     value.ml_correlation_id or "",
                 )
+            except ExperimentAdmissionClosedError as error:
+                raise RuntimeError(str(error)) from error
             except ExperimentRegistryError as error:
                 raise FLClientCapacityError(str(error)) from error
             reservation_id = reservation.reservation_id
@@ -316,6 +369,7 @@ class FLClientEngine:
                 resource.revision += 1
                 resource.state = FLClientState.PROVISIONAL
                 resource.callback_slot_owned = True
+                resource.work_slot_owned = True
                 self._start_operation(resource)
                 return copy.deepcopy(resource)
             except Exception:
@@ -362,6 +416,7 @@ class FLClientEngine:
 
     def delete(self, subscription_id: str) -> None:
         with self._lock:
+            self._prune_cancelled_resources_locked()
             if subscription_id in self._cancelled_hierarchy_resources:
                 return
         experiment = self._experiments.for_client_subscription(subscription_id)
@@ -400,7 +455,16 @@ class FLClientEngine:
                 current = experiment or self._experiments.active()
                 plan_id = current.plan_id if current is not None else None
                 if plan_id is not None and self._branch_coordinator is not None:
-                    self._branch_coordinator.cancel(plan_id, "parent cancelled preparation")
+                    try:
+                        self._branch_coordinator.cancel(
+                            plan_id,
+                            "parent cancelled preparation",
+                        )
+                    except RuntimeError:
+                        logger.exception(
+                            "Failed to cancel lower hierarchy resources plan_id=%s",
+                            plan_id,
+                        )
                     current = self._experiments.active()
                 if current is not None:
                     if current.lifecycle in {
@@ -420,7 +484,13 @@ class FLClientEngine:
                         )
                     plan_id = current.plan_id if current is not None else plan_id
                     if plan_id is not None:
-                        self._workspace.release_plan(plan_id)
+                        try:
+                            self._workspace.release_plan(plan_id)
+                        except RuntimeError:
+                            logger.exception(
+                                "Failed to release FL Client workspace plan_id=%s",
+                                plan_id,
+                            )
                     if (
                         current is not None
                         and not current.upper_client_subscription_ids
@@ -434,7 +504,9 @@ class FLClientEngine:
             with self._lock:
                 self._resources.pop(subscription_id, None)
                 self._deleting.discard(subscription_id)
-                self._cancelled_hierarchy_resources.add(subscription_id)
+                self._cancelled_hierarchy_resources[subscription_id] = (
+                    self._clock() + self._settings.lifecycle.tombstone_ttl_seconds
+                )
             return
         try:
             if reservation_id:
@@ -452,37 +524,6 @@ class FLClientEngine:
         with self._lock:
             return copy.deepcopy(self._required(subscription_id))
 
-    def restore_after_restart(
-        self,
-        subscription_id: str,
-        representation: NwdafMLModelTrainSubsc,
-    ) -> None:
-        validate_fl_subscription(representation)
-        resource = FLClientResource(
-            subscription_id=subscription_id,
-            representation=representation.model_copy(deep=True),
-            state=FLClientState.FAILED_RESTART,
-            scope=TrainingScopeDescriptor.from_training_request(representation, 0),
-            last_error="in-flight FL operation cannot resume after backend restart",
-            restart_terminal=True,
-        )
-        with self._lock:
-            self._resources[subscription_id] = resource
-        if self._outbox_capacity.acquire(blocking=False):
-            self._enqueue_delivery(
-                resource,
-                NwdafMLModelTrainNotif(
-                    notifCorreId=representation.notification_correlation_id,
-                    mlCorreId=representation.ml_correlation_id,
-                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
-                ),
-                FLClientState.FAILED,
-            )
-        else:
-            with self._lock:
-                resource.state = FLClientState.FAILED
-                resource.last_error = "restart termination callback could not enter full outbox"
-
     def _start_operation(self, resource: FLClientResource) -> None:
         value = resource.representation
         if value.ml_preparation_flag:
@@ -498,6 +539,7 @@ class FLClientEngine:
             return
         resource.state = FLClientState.READY
         resource.callback_slot_owned = False
+        resource.work_slot_owned = False
         self._capacity.release()
         self._outbox_capacity.release()
 
@@ -581,7 +623,7 @@ class FLClientEngine:
             with self._lock:
                 resource = self._required(subscription_id)
                 if resource.revision != revision:
-                    self._capacity.release()
+                    self._release_work_slot(subscription_id, revision)
                     return
                 value = resource.representation.model_copy(deep=True)
             model_info = value.ml_model_infos[0]
@@ -613,7 +655,7 @@ class FLClientEngine:
                     raise RuntimeError(
                         "FL preparation input is not a hierarchy assignment"
                     )
-                context = self._nwdaf_context.get(refresh=True)
+                context = self._nwdaf_context.get()
                 if not context.advertised_client:
                     raise RuntimeError(
                         "containing NWDAF does not advertise the FL Client capability"
@@ -623,6 +665,7 @@ class FLClientEngine:
                     intended_recipient_nf_instance_id=context.nf_instance_id,
                 )
                 metadata = hierarchy_assignment.contract.hierarchy_metadata
+                self._workspace.claim_artifact(metadata.plan_id, artifact)
                 if isinstance(metadata, BranchAssignmentMetadata):
                     if self._branch_coordinator is None:
                         raise RuntimeError(
@@ -661,7 +704,7 @@ class FLClientEngine:
                 with self._lock:
                     current = self._resources.get(subscription_id)
                     if current is None or current.revision != revision:
-                        self._capacity.release()
+                        self._release_work_slot(subscription_id, revision)
                         return
                     reservation_id = current.experiment_reservation_id
                 self._experiments.bind_plan(
@@ -674,7 +717,7 @@ class FLClientEngine:
                     with self._lock:
                         current = self._resources.get(subscription_id)
                         if current is None or current.revision != revision:
-                            self._capacity.release()
+                            self._release_work_slot(subscription_id, revision)
                             return
                         current.preparation_base_artifact = artifact
                         current.hierarchy_assignment = hierarchy_assignment
@@ -696,7 +739,7 @@ class FLClientEngine:
                                 metadata.plan_id,
                                 "upper Branch resource became stale",
                             )
-                            self._capacity.release()
+                            self._release_work_slot(subscription_id, revision)
                             return
                         current.branch_process_id = str(
                             result.execution.process_id
@@ -731,7 +774,7 @@ class FLClientEngine:
                         if result_outcome is PreparationOutcome.READY
                         else FLClientState.FAILED,
                     )
-                    self._capacity.release()
+                    self._release_work_slot(subscription_id, revision)
                     return
             base = self._loader.load(artifact)
             if base.manifest.get("analytics_event") != event.ml_event:
@@ -743,7 +786,7 @@ class FLClientEngine:
             with self._lock:
                 current = self._resources.get(subscription_id)
                 if current is None or current.revision != revision:
-                    self._capacity.release()
+                    self._release_work_slot(subscription_id, revision)
                     return
                 current.preparation_base_artifact = artifact
                 current.hierarchy_assignment = hierarchy_assignment
@@ -771,7 +814,7 @@ class FLClientEngine:
             with self._lock:
                 resource = self._resources.get(subscription_id)
                 if resource is None or resource.revision != revision:
-                    self._capacity.release()
+                    self._release_work_slot(subscription_id, revision)
                     return
                 resource.state = FLClientState.FAILED
                 resource.last_error = str(error)
@@ -781,7 +824,7 @@ class FLClientEngine:
                 _termination(resource),
                 FLClientState.FAILED,
             )
-            self._capacity.release()
+            self._release_work_slot(subscription_id, revision)
 
     def _preparation_complete(
         self,
@@ -805,7 +848,7 @@ class FLClientEngine:
         with self._lock:
             resource = self._resources.get(subscription_id)
             if resource is None or resource.revision != revision:
-                self._capacity.release()
+                self._release_work_slot(subscription_id, revision)
                 return
             self._cancel_delay(subscription_id)
             if (
@@ -847,7 +890,7 @@ class FLClientEngine:
             final,
             len(job.snapshot.records) if job.snapshot is not None else 0,
         )
-        self._capacity.release()
+        self._release_work_slot(subscription_id, revision)
 
     def _run_round(self, subscription_id: str, revision: int) -> None:
         try:
@@ -864,6 +907,7 @@ class FLClientEngine:
                 str(model_info.model_file_address.model_url),
                 value.ml_correlation_id or subscription_id,
                 f"round-{value.round_indicator}-input",
+                owner_plan_id=_hierarchy_plan_id(resource),
             )
             base = self._loader.load(artifact)
             round_input = validate_fl_artifact_manifest(base.manifest)
@@ -974,6 +1018,7 @@ class FLClientEngine:
                 role="ROUND_LOCAL",
                 base=base,
                 model=result.model,
+                owner_plan_id=_hierarchy_plan_id(resource),
                 metadata=metadata,
             )
             notification = NwdafMLModelTrainNotif(
@@ -1012,7 +1057,7 @@ class FLClientEngine:
             if resource is not None:
                 self._enqueue_delivery(resource, _termination(resource), FLClientState.FAILED)
         finally:
-            self._capacity.release()
+            self._release_work_slot(subscription_id, revision)
 
     def _run_validation(self, subscription_id: str, revision: int) -> None:
         try:
@@ -1034,6 +1079,7 @@ class FLClientEngine:
                 str(model_info.model_file_address.model_url),
                 value.ml_correlation_id or subscription_id,
                 f"validation-{value.round_indicator}-candidate",
+                owner_plan_id=_hierarchy_plan_id(resource),
             )
             base = self._loader.load(preparation_base_artifact)
             candidate = self._loader.load(candidate_artifact)
@@ -1153,6 +1199,7 @@ class FLClientEngine:
                 role="ROUND_LOCAL",
                 base=candidate,
                 model=candidate.model,
+                owner_plan_id=_hierarchy_plan_id(resource),
                 metadata={
                     "artifact_role": "ROUND_LOCAL",
                     "result_type": "ACCURACY_CHECK",
@@ -1226,7 +1273,7 @@ class FLClientEngine:
             if resource is not None:
                 self._enqueue_delivery(resource, _termination(resource), FLClientState.FAILED)
         finally:
-            self._capacity.release()
+            self._release_work_slot(subscription_id, revision)
 
     def _enqueue_delivery(
         self,
@@ -1267,6 +1314,11 @@ class FLClientEngine:
         attempt = 0
         terminal = False
         while not self._closing.is_set():
+            with self._lock:
+                current = self._resources.get(subscription_id)
+                if current is None or current.revision != revision:
+                    terminal = True
+                    break
             try:
                 response = self._client.post(notification_uri, json=payload)
                 if response.status_code == 204:
@@ -1305,17 +1357,36 @@ class FLClientEngine:
             attempt += 1
             if self._closing.wait(delay):
                 break
+        key = (subscription_id, revision)
         with self._lock:
-            self._outbox_keys.discard((subscription_id, revision))
+            self._outbox_keys.discard(key)
+            abandoned = key in self._abandoned_outbox_keys
+            self._abandoned_outbox_keys.discard(key)
             current = self._resources.get(subscription_id)
             if current is not None and current.revision == revision and terminal:
                 current.callback_slot_owned = False
-        if terminal:
+        if terminal and not abandoned:
             self._outbox_capacity.release()
 
     def _outbox_done(self, future: Future) -> None:
         with self._lock:
             self._outbox_futures.discard(future)
+
+    def _release_work_slot(self, subscription_id: str, revision: int) -> None:
+        key = (subscription_id, revision)
+        with self._lock:
+            if key in self._abandoned_work_keys:
+                self._abandoned_work_keys.discard(key)
+                return
+            resource = self._resources.get(subscription_id)
+            if (
+                resource is None
+                or resource.revision != revision
+                or not resource.work_slot_owned
+            ):
+                return
+            resource.work_slot_owned = False
+        self._capacity.release()
 
     def _participant_id(self) -> str:
         context = self._nwdaf_context.get()
@@ -1513,11 +1584,16 @@ class FLClientEngine:
 
     @staticmethod
     def _ensure_mutable(resource: FLClientResource) -> None:
-        if resource.restart_terminal or resource.state in {
-            FLClientState.FAILED,
-            FLClientState.FAILED_RESTART,
-        }:
+        if resource.state is FLClientState.FAILED:
             raise RuntimeError("NOT_AVAILABLE_FOR_FL_PROCESS_ANYMORE")
+
+    def _prune_cancelled_resources_locked(self) -> None:
+        now = self._clock()
+        self._cancelled_hierarchy_resources = {
+            subscription_id: deadline
+            for subscription_id, deadline in self._cancelled_hierarchy_resources.items()
+            if deadline > now
+        }
 
     @staticmethod
     def _same_representation(
@@ -1548,6 +1624,12 @@ def _minimum_samples(value: NwdafMLModelTrainSubsc) -> int:
         ),
         default=0,
     )
+
+
+def _hierarchy_plan_id(resource: FLClientResource) -> str | None:
+    if resource.hierarchy_assignment is None:
+        return None
+    return resource.hierarchy_assignment.contract.hierarchy_metadata.plan_id
 
 
 def _termination(resource: FLClientResource) -> NwdafMLModelTrainNotif:

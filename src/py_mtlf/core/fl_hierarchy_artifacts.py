@@ -70,6 +70,7 @@ class HierarchyArtifactService:
     def publish_round_input(
         self,
         *,
+        plan_id: str,
         base: LoadedBundle,
         process_id: str,
         server_nf_instance_id: str,
@@ -82,6 +83,7 @@ class HierarchyArtifactService:
             round_indicator=round_indicator,
             base=base,
             epochs=epochs,
+            owner_plan_id=plan_id,
         )
 
     def publish_hierarchy_aggregate(
@@ -89,6 +91,7 @@ class HierarchyArtifactService:
         *,
         upper_input: LoadedBundle,
         lower_global: FLWorkspaceArtifact,
+        plan_id: str,
         upper_process_id: str,
         branch_nf_instance_id: str,
         upper_round_indicator: int,
@@ -127,6 +130,7 @@ class HierarchyArtifactService:
             role="ROUND_LOCAL",
             base=upper_input,
             model=lower_bundle.model,
+            owner_plan_id=plan_id,
             metadata={
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "HIERARCHY_AGGREGATE",
@@ -173,6 +177,7 @@ class HierarchyArtifactService:
         self,
         *,
         upper_candidate: LoadedBundle,
+        plan_id: str,
         upper_process_id: str,
         branch_nf_instance_id: str,
         upper_round_indicator: int,
@@ -192,6 +197,7 @@ class HierarchyArtifactService:
             role="ROUND_LOCAL",
             base=upper_candidate,
             model=upper_candidate.model,
+            owner_plan_id=plan_id,
             metadata={
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "ACCURACY_CHECK",
@@ -335,6 +341,7 @@ class HierarchyArtifactService:
             role=role.value,
             base=base,
             model=base.model,
+            owner_plan_id=metadata.plan_id,
             metadata={
                 "artifact_role": role.value,
                 "hierarchy_metadata": metadata.model_dump(mode="json"),

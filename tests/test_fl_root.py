@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from py_mtlf.config import (
+    ArtifactSettings,
     FederatedLearningSettings,
     FederatedStrategySettings,
     FLServerSettings,
@@ -34,7 +35,7 @@ from py_mtlf.core.fl_server import (
     HierarchyPreparationCollection,
 )
 from py_mtlf.core.fl_topology import StaticTopologyPlanner
-from py_mtlf.core.fl_workspace import ValidatedHierarchyArtifact
+from py_mtlf.core.fl_workspace import FLWorkspace, ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
     MLAnalyticsCapability,
@@ -56,6 +57,9 @@ def root_coordinator(
     *,
     resolver_side_effect=None,
     round_count: int = 1,
+    terminal_status_ttl_seconds: int = 3600,
+    clock=None,
+    workspace_override=None,
 ):
     topology_path = tmp_path / "topology.yaml"
     topology_path.write_text(
@@ -94,6 +98,7 @@ branches:
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id=ROOT_ID,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://root.example",
         internal_api_root="http://go.example",
         ml_analytics_capabilities=(
@@ -122,7 +127,7 @@ branches:
     artifact_service.publish_branch_assignment.return_value = SimpleNamespace(
         url="http://root.example/assignments/branch"
     )
-    workspace = Mock()
+    workspace = workspace_override or Mock()
     registry = FLExperimentRegistry()
     server = Mock()
 
@@ -150,6 +155,9 @@ branches:
     policy.take_intents.return_value = ()
     loader = Mock()
     loader.load.return_value = SimpleNamespace()
+    root_kwargs = {}
+    if clock is not None:
+        root_kwargs["clock"] = clock
     coordinator = FLRootCoordinator(
         strategy=FederatedStrategySettings.model_validate(
             {
@@ -173,6 +181,8 @@ branches:
         policy=policy,
         experiments=registry,
         loader=loader,
+        terminal_status_ttl_seconds=terminal_status_ttl_seconds,
+        **root_kwargs,
     )
     return (
         coordinator,
@@ -185,6 +195,33 @@ branches:
         catalog,
         model,
     )
+
+
+def test_go_generation_reset_discards_root_status_and_releases_slot(tmp_path):
+    coordinator, _resolver, _artifacts, _workspace, server, registry, *_ = (
+        root_coordinator(tmp_path)
+    )
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    coordinator.wait_for_state(
+        REQUEST_A_ID,
+        {RootRequestState.PREPARATION_WAITING},
+        timeout=2,
+    )
+
+    coordinator.abort_generation("containing NWDAF process generation changed")
+
+    assert coordinator.get(REQUEST_A_ID) is None
+    assert registry.active() is None
+    replacement = coordinator.submit_manual(
+        request_id=REQUEST_B_ID,
+        model_family_id="ue-communication-default",
+    )
+    assert replacement.plan_id
+    coordinator.close()
+    server.cancel_hierarchy_preparation.assert_called()
 
 
 def test_root_request_validates_tree_publishes_assignment_and_waits(tmp_path):
@@ -596,7 +633,7 @@ def _configure_branch_result(
             FLServerState.COMPLETE,
         ):
             observer(state)
-        return SimpleNamespace(state=FLServerState.COMPLETE)
+        return SimpleNamespace(state=FLServerState.COMPLETE, published_model_id=2)
 
     server.finalize_hierarchy_candidate.side_effect = finalize_hierarchy_candidate
 
@@ -657,10 +694,16 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
             LEAF_A_ID,
             LEAF_B_ID,
         )
-        assert registry.active() is not None
+        assert registry.active() is None
+        workspace.release_plan.assert_called_once_with(admitted.plan_id)
+        server.close_hierarchy_training.assert_called_once_with(
+            "server-process",
+            retain_for_adoption=False,
+        )
         assert admitted.completed_rounds == 1
         assert admitted.current_round == 0
         assert admitted.candidate_digest == "f" * 64
+        assert admitted.published_model_id == 2
         assert observed_round_states == [
             (RootRequestState.ROUND_DISPATCH, 0),
             (RootRequestState.ROUND_WAITING, 0),
@@ -682,6 +725,94 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         }
     finally:
         coordinator.close()
+
+
+def test_root_terminal_closure_invalidates_real_candidate_artifact(tmp_path):
+    workspace = FLWorkspace(
+        FederatedLearningSettings(workspace_root=tmp_path / "workspace"),
+        ArtifactSettings(),
+    )
+    workspace.open()
+    workspace.download_hierarchy = Mock()
+    cleanup_complete = threading.Event()
+    release_plan = workspace.release_plan
+
+    def release_and_signal(plan_id):
+        try:
+            release_plan(plan_id)
+        finally:
+            cleanup_complete.set()
+
+    workspace.release_plan = release_and_signal
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        _workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path, workspace_override=workspace)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    original_finalize = server.finalize_hierarchy_candidate.side_effect
+    candidate_path = (
+        workspace._root
+        / "server-process"
+        / ROOT_ID
+        / "0"
+        / "ROUND_GLOBAL"
+        / f"{'f' * 64}.tar.gz"
+    )
+
+    def finalize_with_owned_candidate(**kwargs):
+        candidate_path.parent.mkdir(parents=True)
+        candidate_path.write_bytes(b"candidate")
+        workspace.claim_artifact(
+            registry.active().plan_id,
+            ArtifactMetadata(
+                key="f" * 64,
+                size_bytes=candidate_path.stat().st_size,
+                path=candidate_path,
+                url="http://root.example/round-global/0",
+            ),
+        )
+        return original_finalize(**kwargs)
+
+    server.finalize_hierarchy_candidate.side_effect = finalize_with_owned_candidate
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        completed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.COMPLETE, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert completed.state is RootRequestState.COMPLETE
+        assert completed.candidate_digest == "f" * 64
+        assert cleanup_complete.wait(1)
+        assert candidate_path.exists() is False
+        assert workspace.open_artifact(
+            "server-process",
+            ROOT_ID,
+            0,
+            "ROUND_GLOBAL",
+            "f" * 64,
+        ) is None
+    finally:
+        coordinator.close()
+        workspace.close()
 
 
 def test_root_reuses_upper_process_and_feeds_previous_global_into_next_round(
@@ -744,7 +875,7 @@ def test_root_reuses_upper_process_and_feeds_previous_global_into_next_round(
         assert completed.state is RootRequestState.COMPLETE
         assert completed.completed_rounds == 2
         assert completed.current_round == 1
-        assert completed.candidate_url.endswith("/round-global/1")
+        assert completed.candidate_url == ""
         assert completed.candidate_digest == "2" * 64
         publications = artifacts.publish_round_input.call_args_list
         assert [item.kwargs["base"] for item in publications] == [
@@ -786,9 +917,12 @@ def test_duplicate_status_queries_during_publication_do_not_restart_validation(t
     )
     publication_started = threading.Event()
     release_publication = threading.Event()
+    finalization_observer = None
 
     def finalize(**kwargs):
+        nonlocal finalization_observer
         observer = kwargs["state_observer"]
+        finalization_observer = observer
         for state in (
             FLServerState.FINAL_VALIDATION_DISPATCH,
             FLServerState.FINAL_VALIDATION_WAITING,
@@ -828,8 +962,142 @@ def test_duplicate_status_queries_during_publication_do_not_restart_validation(t
             timeout=1,
         )
         assert completed.state is RootRequestState.CUTOVER_PENDING
+        assert registry.active() is not None
+        workspace.release_plan.assert_called_once_with(completed.plan_id)
+        server.close_hierarchy_training.assert_called_once_with(
+            "server-process",
+            retain_for_adoption=True,
+        )
+        with pytest.raises(RootRequestConflictError):
+            coordinator.submit_manual(
+                request_id=REQUEST_B_ID,
+                model_family_id="ue-communication-default",
+            )
+
+        assert finalization_observer is not None
+        finalization_observer(FLServerState.COMPLETE)
+
+        assert registry.active() is None
+        server.close_hierarchy_training.assert_called_with(
+            "server-process",
+            retain_for_adoption=False,
+        )
     finally:
         release_publication.set()
+        coordinator.close()
+
+
+def test_validation_rejection_closes_training_and_releases_slot(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+
+    def reject(**kwargs):
+        observer = kwargs["state_observer"]
+        for state in (
+            FLServerState.FINAL_VALIDATION_DISPATCH,
+            FLServerState.FINAL_VALIDATION_WAITING,
+            FLServerState.FINAL_VALIDATION_EVALUATING,
+            FLServerState.VALIDATION_REJECTED,
+        ):
+            observer(state)
+        return SimpleNamespace(state=FLServerState.VALIDATION_REJECTED)
+
+    server.finalize_hierarchy_candidate.side_effect = reject
+    try:
+        accepted = coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        rejected = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.VALIDATION_REJECTED, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert rejected.state is RootRequestState.VALIDATION_REJECTED
+        assert registry.active() is None
+        workspace.release_plan.assert_called_once_with(accepted.plan_id)
+        server.close_hierarchy_training.assert_called_once_with(
+            "server-process",
+            retain_for_adoption=False,
+        )
+    finally:
+        coordinator.close()
+
+
+def test_terminal_root_status_is_pruned_lazily_after_retention_ttl(tmp_path):
+    now = [10.0]
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(
+        tmp_path,
+        terminal_status_ttl_seconds=5,
+        clock=lambda: now[0],
+    )
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        completed = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.COMPLETE, RootRequestState.FAILED},
+            timeout=2,
+        )
+        assert completed.state is RootRequestState.COMPLETE
+
+        now[0] = 16.0
+
+        barrier = threading.Barrier(3)
+        results = []
+
+        def get_expired_status():
+            barrier.wait()
+            results.append(coordinator.get(REQUEST_A_ID))
+
+        threads = [threading.Thread(target=get_expired_status) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert results == [None, None]
+        assert coordinator.requests() == ()
+    finally:
         coordinator.close()
 
 
@@ -943,6 +1211,60 @@ def test_root_shutdown_wakes_round_waiter_while_branch_callback_is_pending(tmp_p
         assert registry.active() is None
     finally:
         cancellation_received.set()
+        thread.join(timeout=1)
+
+
+def test_root_shutdown_after_final_aggregate_fences_finalization(tmp_path):
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(tmp_path)
+    _configure_branch_result(
+        tmp_path=tmp_path,
+        artifacts=artifacts,
+        workspace=workspace,
+        server=server,
+        registry=registry,
+        outcome=PreparationOutcome.READY,
+    )
+    aggregate = server.execute_hierarchy_round.return_value
+    aggregate_ready = threading.Event()
+    allow_return = threading.Event()
+
+    def finish_aggregate(**_kwargs):
+        aggregate_ready.set()
+        assert allow_return.wait(1)
+        return aggregate
+
+    server.execute_hierarchy_round.side_effect = finish_aggregate
+    server.cancel_hierarchy_preparation.side_effect = (
+        lambda _process_id, _reason: allow_return.set()
+    )
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    assert aggregate_ready.wait(1)
+    thread = threading.Thread(target=coordinator.close)
+    thread.start()
+    thread.join(timeout=1)
+
+    try:
+        assert thread.is_alive() is False
+        snapshot = coordinator.get(REQUEST_A_ID)
+        assert snapshot.state is RootRequestState.FAILED
+        assert snapshot.failure_cause == "SHUTDOWN"
+        server.finalize_hierarchy_candidate.assert_not_called()
+        assert registry.active() is None
+    finally:
+        allow_return.set()
         thread.join(timeout=1)
 
 

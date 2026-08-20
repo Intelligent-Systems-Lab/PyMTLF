@@ -544,9 +544,7 @@ def test_hierarchy_preparation_rolls_back_partial_dispatch(tmp_path):
             targets=targets,
         )
 
-    process = orchestrator.processes()[-1]
-    assert process.state is FLServerState.FAILED
-    assert process.hierarchy_cleanup_complete is True
+    assert orchestrator.processes() == ()
     assert calls[-1] == ("DELETE", "http://go.example/subscriptions/first")
     assert registry.active().server_process_id is None
     orchestrator.close()
@@ -1814,6 +1812,7 @@ def test_parent_cancel_during_hierarchy_round_wakes_waiter_and_cleans_resources(
         assert failures == ["parent cancelled"]
         assert process.state is FLServerState.FAILED
         assert process.hierarchy_cleanup_complete is True
+        assert orchestrator.processes() == ()
         workspace.download.assert_not_called()
         workspace.publish.assert_not_called()
         client.delete.assert_called_once_with(participant.resource_location)
@@ -1884,6 +1883,281 @@ def test_parent_cancel_during_lower_patch_fanout_fences_remaining_dispatches(
         assert process.state is FLServerState.FAILED
         assert process.hierarchy_cleanup_complete is True
     finally:
+        orchestrator.close()
+
+
+def test_go_generation_reset_during_lower_patch_fences_remaining_fanout(tmp_path):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    patch_started = threading.Event()
+    allow_patch = threading.Event()
+    client = Mock()
+
+    def delayed_patch(*_args, **_kwargs):
+        patch_started.set()
+        assert allow_patch.wait(1)
+        return Mock(status_code=204)
+
+    client.patch.side_effect = delayed_patch
+    client.delete.return_value = Mock(status_code=404)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+    failures = []
+
+    def execute_round():
+        try:
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=0,
+                round_input_url="http://branch.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
+        except Exception as error:
+            failures.append(str(error))
+
+    thread = threading.Thread(
+        target=execute_round,
+    )
+    thread.start()
+    assert patch_started.wait(1)
+    orchestrator.abort_generation("containing NWDAF process generation changed")
+    allow_patch.set()
+    thread.join(timeout=1)
+
+    try:
+        assert thread.is_alive() is False
+        assert failures == ["containing NWDAF process generation changed"]
+        assert client.patch.call_count == 1
+        assert orchestrator.processes() == ()
+    finally:
+        orchestrator.close()
+
+
+def test_go_generation_reset_discards_server_process_and_callbacks(tmp_path):
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_server("process-1")
+    policy = Mock()
+    participant = FLParticipant(
+        scope=scope(
+            "scope-a",
+            "000001",
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        candidate=candidate(
+            "11111111-1111-4111-8111-111111111111",
+            "000001",
+        ),
+        notification_correlation_id="old-callback",
+        resource_location="http://go.example/subscriptions/old-resource",
+    )
+    intent = SimpleNamespace(family_key=("UE_COMMUNICATION", "001122"))
+    process = FLProcess(
+        process_id="process-1",
+        intent=intent,
+        experiment_reservation_id=reservation.reservation_id,
+        participants=[participant],
+    )
+    client = Mock()
+    client.delete.return_value = Mock(status_code=404)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        policy,
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    old_location = participant.resource_location
+
+    try:
+        orchestrator.abort_generation("containing NWDAF process generation changed")
+
+        assert orchestrator.processes() == ()
+        with pytest.raises(KeyError):
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(notifCorreId="old-callback", termTrainReq="STOP")
+            )
+        client.delete.assert_called_once_with(old_location)
+        policy.complete_retrain.assert_called_once_with(intent.family_key)
+    finally:
+        registry.reset_generation()
+        orchestrator.close()
+
+
+def test_hierarchy_cleanup_failure_records_error_but_releases_local_owner(tmp_path):
+    registry = FLExperimentRegistry()
+    plan_id = "11111111-1111-4111-8111-111111111112"
+    reservation = registry.reserve_root(plan_id)
+    participant = FLParticipant(
+        scope=scope(
+            "scope-a",
+            "000001",
+            "22222222-2222-4222-8222-222222222222",
+        ),
+        candidate=candidate(
+            "22222222-2222-4222-8222-222222222222",
+            "000001",
+        ),
+        notification_correlation_id="cleanup-correlation",
+        resource_location="http://go.example/subscriptions/unreachable",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        experiment_reservation_id=reservation.reservation_id,
+        hierarchy_plan_id=plan_id,
+        participants=[participant],
+    )
+    registry.attach_server(reservation.reservation_id, plan_id, process.process_id)
+    client = Mock()
+    client.delete.return_value = Mock(status_code=503)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+
+    try:
+        orchestrator.close_hierarchy_training(
+            process.process_id,
+            retain_for_adoption=False,
+        )
+
+        assert "cleanup returned 503" in process.cleanup_failure
+        assert orchestrator.processes() == ()
+        assert registry.active().server_process_id is None
+        assert client.delete.call_count == 1
+        with pytest.raises(KeyError):
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(
+                    notifCorreId=participant.notification_correlation_id,
+                    termTrainReq="STOP",
+                )
+            )
+    finally:
+        registry.reset_generation()
+        orchestrator.close()
+
+
+def test_go_generation_reset_cleans_preparation_created_during_abort(tmp_path):
+    registry = FLExperimentRegistry()
+    plan_id = "11111111-1111-4111-8111-111111111112"
+    reservation = registry.reserve_root(plan_id)
+    request_started = threading.Event()
+    allow_response = threading.Event()
+    client = Mock()
+
+    def create_after_abort(*_args, **_kwargs):
+        request_started.set()
+        assert allow_response.wait(1)
+        return Mock(
+            status_code=201,
+            headers={"Location": "http://go.example/subscriptions/late-resource"},
+        )
+
+    client.post.side_effect = create_after_abort
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        context_client(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    failures = []
+
+    def dispatch():
+        try:
+            orchestrator.start_hierarchy_preparation(
+                plan_id=plan_id,
+                reservation_id=reservation.reservation_id,
+                family_key=None,
+                model_id=None,
+                ml_event="UE_COMMUNICATION",
+                ml_event_filter={},
+                target_ue=None,
+                model_interoperability="001122",
+                targets=(
+                    HierarchyPreparationTarget(
+                        participant_nf_instance_id=(
+                            "22222222-2222-4222-8222-222222222222"
+                        ),
+                        candidate=candidate(
+                            "22222222-2222-4222-8222-222222222222",
+                            "000001",
+                        ),
+                        assignment_url="http://branch.example/assignment",
+                    ),
+                ),
+            )
+        except Exception as error:
+            failures.append(str(error))
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    assert request_started.wait(1)
+    orchestrator.abort_generation("containing NWDAF process generation changed")
+    allow_response.set()
+    thread.join(timeout=1)
+
+    try:
+        assert thread.is_alive() is False
+        assert failures == ["containing NWDAF process generation changed"]
+        client.delete.assert_called_once_with(
+            "http://go.example/subscriptions/late-resource"
+        )
+        assert orchestrator.processes() == ()
+        assert registry.active().server_process_id is None
+    finally:
+        registry.reset_generation()
         orchestrator.close()
 
 
@@ -2233,7 +2507,7 @@ def test_hierarchy_cancellation_wakes_collection_and_late_callback_is_rejected(t
         process.state = FLServerState.READY
         process.failure = ""
         orchestrator._correlations[participant.notification_correlation_id] = process.process_id
-        with pytest.raises(ValueError, match="after the active stage"):
+        with pytest.raises(KeyError):
             orchestrator.receive_notification(
                 NwdafMLModelTrainNotif(
                     notifCorreId=participant.notification_correlation_id,

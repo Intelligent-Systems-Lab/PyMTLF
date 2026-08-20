@@ -3,6 +3,7 @@ import pytest
 
 from py_mtlf.core.nwdaf_context import (
     CapabilityConsistencyChecker,
+    ContainingNwdafGenerationMonitor,
     FLCapabilityType,
     MLAnalyticsCapability,
     NwdafContext,
@@ -68,9 +69,109 @@ def test_context_client_refresh_recovers_after_go_becomes_available():
     assert client.get(refresh=True).ml_analytics_capabilities == ()
 
 
+@pytest.mark.parametrize("field", ["processInstanceId", "nfInstanceId"])
+def test_context_client_requires_generation_and_identity(field):
+    payload = _context_payload([])
+    payload.pop(field)
+    client = _context_client(
+        lambda request: httpx.Response(200, json=payload, request=request)
+    )
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        client.get(refresh=True)
+
+
+@pytest.mark.parametrize(
+    "process_instance_id",
+    [
+        "22222222-2222-1222-8222-222222222222",
+        "22222222-2222-4222-8222-22222222222A",
+    ],
+)
+def test_context_client_requires_canonical_uuid4_process_generation(
+    process_instance_id,
+):
+    payload = _context_payload([])
+    payload["processInstanceId"] = process_instance_id
+    client = _context_client(
+        lambda request: httpx.Response(200, json=payload, request=request)
+    )
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        client.get(refresh=True)
+
+
+def test_generation_monitor_resets_once_then_binds_only_after_cleanup():
+    first = _context("22222222-2222-4222-8222-222222222222")
+    second = _context("33333333-3333-4333-8333-333333333333")
+    client = SequenceContextClient([first, first, second])
+    checker = CapabilityConsistencyChecker(
+        client,
+        configured_server=False,
+        configured_client=False,
+    )
+    monitor = ContainingNwdafGenerationMonitor(
+        client,
+        checker,
+        configured_server=False,
+        configured_client=False,
+    )
+    observed = []
+    monitor.set_reset_callback(
+        lambda reason: observed.append((reason, monitor.snapshot().resetting))
+    )
+
+    initial = monitor.refresh_once()
+    unchanged = monitor.refresh_once()
+    changed = monitor.refresh_once()
+
+    assert initial.ready is True
+    assert unchanged.ready is True
+    assert changed.ready is True
+    assert changed.containing_nwdaf_process_instance_id == (
+        second.containing_nwdaf_process_instance_id
+    )
+    assert observed == [("containing NWDAF process generation changed", True)]
+    assert client.refresh_values == [True, True, True]
+
+
+def test_generation_monitor_unavailability_discards_active_generation_once():
+    context = _context("22222222-2222-4222-8222-222222222222")
+    client = SequenceContextClient(
+        [
+            context,
+            RuntimeError("Go unavailable"),
+            RuntimeError("Go still unavailable"),
+            context,
+        ]
+    )
+    checker = CapabilityConsistencyChecker(
+        client,
+        configured_server=False,
+        configured_client=False,
+    )
+    monitor = ContainingNwdafGenerationMonitor(
+        client,
+        checker,
+        configured_server=False,
+        configured_client=False,
+    )
+    resets = []
+    monitor.set_reset_callback(resets.append)
+
+    assert monitor.refresh_once().ready is True
+    assert monitor.refresh_once().ready is False
+    assert monitor.refresh_once().ready is False
+    assert monitor.refresh_once().ready is True
+
+    assert len(resets) == 1
+    assert "unavailable" in resets[0]
+
+
 def test_capability_checker_requires_exact_engine_match_and_recovers():
     matching = NwdafContext(
         nf_instance_id="11111111-1111-4111-8111-111111111111",
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://go.example",
         internal_api_root="http://go-internal.example",
         ml_analytics_capabilities=(
@@ -85,6 +186,9 @@ def test_capability_checker_requires_exact_engine_match_and_recovers():
             RuntimeError("Go is starting"),
             NwdafContext(
                 nf_instance_id=matching.nf_instance_id,
+                containing_nwdaf_process_instance_id=(
+                    matching.containing_nwdaf_process_instance_id
+                ),
                 api_root=matching.api_root,
                 internal_api_root=matching.internal_api_root,
                 ml_analytics_capabilities=(
@@ -143,6 +247,7 @@ def test_capability_checker_accepts_each_exact_engine_profile(
     )
     context = NwdafContext(
         nf_instance_id="11111111-1111-4111-8111-111111111111",
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://go.example",
         internal_api_root="http://go-internal.example",
         ml_analytics_capabilities=capabilities,
@@ -172,10 +277,20 @@ class SequenceContextClient:
 def _context_payload(capabilities):
     return {
         "nfInstanceId": "11111111-1111-4111-8111-111111111111",
+        "processInstanceId": "22222222-2222-4222-8222-222222222222",
         "apiRoot": "http://go.example",
         "internalApiRoot": "http://go-internal.example",
         "mlAnalyticsCapabilities": capabilities,
     }
+
+
+def _context(process_instance_id):
+    return NwdafContext(
+        nf_instance_id="11111111-1111-4111-8111-111111111111",
+        containing_nwdaf_process_instance_id=process_instance_id,
+        api_root="http://go.example",
+        internal_api_root="http://go-internal.example",
+    )
 
 
 def _context_client(handler):

@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 
 import httpx
 import joblib
@@ -167,6 +168,7 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
         service = HierarchyArtifactService(branch_workspace)
         upper = base_bundle()
         lower_input = service.publish_round_input(
+            plan_id=PLAN,
             base=upper,
             process_id="lower-process",
             server_nf_instance_id=BRANCH,
@@ -215,6 +217,7 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
         upper_result = service.publish_hierarchy_aggregate(
             upper_input=upper,
             lower_global=lower_global,
+            plan_id=PLAN,
             upper_process_id="upper-process",
             branch_nf_instance_id=BRANCH,
             upper_round_indicator=2,
@@ -237,6 +240,7 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
             service.publish_hierarchy_aggregate(
                 upper_input=upper,
                 lower_global=lower_global,
+                plan_id=PLAN,
                 upper_process_id="upper-process",
                 branch_nf_instance_id=BRANCH,
                 upper_round_indicator=3,
@@ -344,6 +348,7 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
             branch_workspace
         ).publish_hierarchy_validation_result(
             upper_candidate=loaded_candidate,
+            plan_id=PLAN,
             upper_process_id="root-process",
             branch_nf_instance_id=BRANCH,
             upper_round_indicator=2,
@@ -929,23 +934,226 @@ def test_release_plan_is_exact_and_idempotent(tmp_path) -> None:
         root_workspace.close()
 
 
-def test_cleanup_expired_removes_stale_staging_and_plan_but_keeps_current_plan(tmp_path) -> None:
+def test_release_plan_removes_all_explicitly_owned_process_directories(tmp_path) -> None:
     root_workspace = workspace(tmp_path / "root", "http://root.example")
     try:
-        stale = publish_root_assignment(root_workspace, PLAN)
-        current = publish_root_assignment(root_workspace, PLAN_B)
+        owned = root_workspace.publish(
+            process_id="root-process",
+            participant_id=ROOT,
+            round_indicator=0,
+            role="ROUND_INPUT",
+            base=base_bundle(),
+            model=base_bundle().model,
+            metadata={
+                "artifact_role": "ROUND_INPUT",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": "root-process",
+                    "round_ind": 0,
+                    "model_contract_digest": "1" * 64,
+                    "preprocessing_contract_digest": "2" * 64,
+                    "weights_digest": "3" * 64,
+                    "client_training": {"epochs": 1},
+                },
+            },
+            owner_plan_id=PLAN,
+        )
+        unowned_flat = root_workspace.publish(
+            process_id="flat-process",
+            participant_id=ROOT,
+            round_indicator=0,
+            role="ROUND_INPUT",
+            base=base_bundle(),
+            model=base_bundle().model,
+            metadata={
+                "artifact_role": "ROUND_INPUT",
+                "fl_metadata": {
+                    "contract_version": "1.0",
+                    "ml_corre_id": "flat-process",
+                    "round_ind": 0,
+                    "model_contract_digest": "1" * 64,
+                    "preprocessing_contract_digest": "2" * 64,
+                    "weights_digest": "3" * 64,
+                    "client_training": {"epochs": 1},
+                },
+            },
+        )
+        sibling = publish_root_assignment(root_workspace, PLAN_B)
+
+        root_workspace.release_plan(PLAN)
+
+        assert not owned.path.exists()
+        assert sibling.path.exists()
+        assert unowned_flat.path.exists()
+    finally:
+        root_workspace.close()
+
+
+def test_late_worker_cannot_republish_after_plan_release(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    root_workspace.release_plan(PLAN)
+    try:
+        with pytest.raises(FLWorkspaceError, match="already released"):
+            root_workspace.publish(
+                process_id="late-process",
+                participant_id=ROOT,
+                round_indicator=0,
+                role="ROUND_INPUT",
+                base=base_bundle(),
+                model=base_bundle().model,
+                metadata={
+                    "artifact_role": "ROUND_INPUT",
+                    "fl_metadata": {
+                        "contract_version": "1.0",
+                        "ml_corre_id": "late-process",
+                        "round_ind": 0,
+                        "model_contract_digest": "1" * 64,
+                        "preprocessing_contract_digest": "2" * 64,
+                        "weights_digest": "3" * 64,
+                        "client_training": {"epochs": 1},
+                    },
+                },
+                owner_plan_id=PLAN,
+            )
+
+        assert not (tmp_path / "root" / "late-process").exists()
+    finally:
+        root_workspace.close()
+
+
+def test_open_clears_previous_process_workspace_before_admission(tmp_path) -> None:
+    root = tmp_path / "root"
+    stale = root / "old-process" / "downloads" / "artifact.tar.gz"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+    root_workspace = FLWorkspace(
+        FederatedLearningSettings(
+            workspace_root=root,
+            public_base_url="http://root.example",
+        ),
+        ArtifactSettings(),
+    )
+    try:
+        root_workspace.open()
+
+        assert root.exists()
+        assert tuple(root.iterdir()) == ()
+    finally:
+        root_workspace.close()
+
+
+def test_open_fails_instead_of_admitting_with_partially_cleared_workspace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "root"
+    stale = root / "old-process" / "artifact.tar.gz"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+    root_workspace = FLWorkspace(
+        FederatedLearningSettings(
+            workspace_root=root,
+            public_base_url="http://root.example",
+        ),
+        ArtifactSettings(),
+    )
+    monkeypatch.setattr(
+        root_workspace,
+        "_delete_direct_child",
+        Mock(side_effect=OSError("busy")),
+    )
+
+    try:
+        with pytest.raises(FLWorkspaceError, match="startup cleanup failed"):
+            root_workspace.open()
+
+        assert stale.exists()
+    finally:
+        root_workspace.close()
+
+
+def test_cleanup_expired_removes_stale_staging_but_keeps_active_plan(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    try:
+        active = publish_root_assignment(root_workspace, PLAN)
         staging = tmp_path / "root" / ".staging"
         staging.mkdir()
         staged_file = staging / "abandoned.tar.gz"
         staged_file.write_bytes(b"partial")
         old = time.time() - 7200
-        os.utime(stale.path.parents[3], (old, old))
+        os.utime(active.path.parents[3], (old, old))
         os.utime(staged_file, (old, old))
 
         root_workspace.cleanup_expired()
 
-        assert not stale.path.exists()
+        assert active.path.exists()
         assert not staged_file.exists()
-        assert current.path.exists()
+    finally:
+        root_workspace.close()
+
+
+def test_failed_plan_deletion_is_retried_by_later_workspace_operation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    artifact = publish_root_assignment(root_workspace, PLAN)
+    original_delete = root_workspace._delete_direct_child
+    failed_once = False
+
+    def fail_once(path):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("busy")
+        original_delete(path)
+
+    monkeypatch.setattr(root_workspace, "_delete_direct_child", fail_once)
+    try:
+        with pytest.raises(FLWorkspaceError, match="release failed"):
+            root_workspace.release_plan(PLAN)
+        assert artifact.path.exists()
+        with root_workspace._lock:
+            for path in root_workspace._cleanup_failures:
+                root_workspace._cleanup_failures[path] = (
+                    time.time() - root_workspace._settings.workspace_ttl_seconds - 1
+                )
+
+        root_workspace.cleanup_expired()
+
+        assert not artifact.path.exists()
+        assert root_workspace._cleanup_failures == {}
+    finally:
+        root_workspace.close()
+
+
+def test_open_reader_finishes_after_plan_release_and_new_resolve_is_not_found(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    try:
+        artifact = publish_root_assignment(root_workspace, PLAN)
+        reader = root_workspace.open_artifact(
+            artifact.process_id,
+            artifact.participant_id,
+            artifact.round_indicator,
+            artifact.role,
+            artifact.digest,
+        )
+        assert reader is not None
+
+        root_workspace.release_plan(PLAN)
+
+        assert artifact.path.exists()
+        assert (
+            root_workspace.resolve(
+                artifact.process_id,
+                artifact.participant_id,
+                artifact.round_indicator,
+                artifact.role,
+                artifact.digest,
+            )
+            is None
+        )
+        assert b"".join(reader.iter_bytes())
+        assert not artifact.path.exists()
     finally:
         root_workspace.close()

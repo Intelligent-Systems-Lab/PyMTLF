@@ -59,8 +59,13 @@ artifact:
 federated_learning:
   # Root directory for temporary per-process and per-round FL artifacts.
   workspace_root: "data/fl-workspaces"
-  # Seconds to retain completed temporary FL artifacts before cleanup.
+  # Seconds before a failed staging or cleanup path is retried opportunistically.
   workspace_ttl_seconds: 3600
+  lifecycle:
+    # Seconds to retain queryable Root terminal status snapshots.
+    terminal_status_ttl_seconds: 3600
+    # Seconds to retain duplicate-cleanup and retired-plan tombstones.
+    tombstone_ttl_seconds: 3600
   # Externally reachable origin used for temporary FL artifact URLs.
   public_base_url: "http://127.0.0.1:9092"
   # Seconds allowed for one outbound Model Training HTTP request.

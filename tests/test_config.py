@@ -10,6 +10,7 @@ from py_mtlf.config import (
     FederatedStrategySettings,
     FittingSettings,
     FLClientSettings,
+    FLLifecycleSettings,
     FLServerSettings,
     ModelProvisionSettings,
     RuntimeSettings,
@@ -34,6 +35,33 @@ def test_defaults_use_confirmed_phase_one_values():
     assert FittingSettings().validation_ratio == 0.10
     assert FLServerSettings().preparation_data_window_seconds == 3600
     assert FLServerSettings().client_training.epochs == 18
+    assert FLLifecycleSettings().terminal_status_ttl_seconds == 3600
+    assert FLLifecycleSettings().tombstone_ttl_seconds == 3600
+
+
+def test_workspace_must_not_overlap_durable_roots(tmp_path):
+    workspace_root = tmp_path / "fl-workspaces"
+
+    with pytest.raises(ValidationError, match="must not overlap durable storage"):
+        Settings(
+            storage=StorageSettings(artifact_root=workspace_root / "artifacts"),
+            federated_learning=FederatedLearningSettings(
+                workspace_root=workspace_root,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "workspace_root",
+    [Path("/"), Path.cwd(), Path(__file__).resolve().parents[2]],
+)
+def test_workspace_rejects_broad_cleanup_roots(workspace_root):
+    with pytest.raises(ValidationError, match="workspace_root is unsafe"):
+        Settings(
+            federated_learning=FederatedLearningSettings(
+                workspace_root=workspace_root,
+            )
+        )
 
 
 def test_federated_epochs_are_server_owned() -> None:

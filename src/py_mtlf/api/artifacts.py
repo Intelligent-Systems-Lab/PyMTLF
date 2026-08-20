@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, status
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from py_mtlf.core.artifacts import (
     ArtifactNotFoundError,
@@ -48,10 +48,10 @@ async def get_fl_artifact(
     digest: str,
     request: Request,
 ) -> Response:
-    path = request.app.state.fl_workspace.resolve(
+    reader = request.app.state.fl_workspace.open_artifact(
         process_id, participant_id, round_indicator, role, digest
     )
-    if path is None:
+    if reader is None:
         return JSONResponse(
             PrivateError(
                 code="ARTIFACT_NOT_FOUND",
@@ -61,14 +61,14 @@ async def get_fl_artifact(
             ).model_dump(mode="json"),
             status_code=status.HTTP_404_NOT_FOUND,
         )
-    return FileResponse(
-        path,
+    return StreamingResponse(
+        reader.iter_bytes(),
         media_type="application/gzip",
         headers={
             "ETag": f'"sha256:{digest}"',
             "X-Artifact-SHA256": digest,
             "Cache-Control": "public, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
         },
-        content_disposition_type="inline",
     )

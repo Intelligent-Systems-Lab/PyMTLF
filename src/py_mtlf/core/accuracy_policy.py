@@ -258,6 +258,13 @@ class AccuracyPolicy:
         with self._lock:
             self._in_flight.discard(family_key)
 
+    def abort_generation(self) -> None:
+        """Discard process-local training and cutover ownership after Go restart."""
+        with self._lock:
+            self._intents.clear()
+            self._in_flight.clear()
+            self._adoptions.clear()
+
     def begin_generation(
         self,
         family_key: FamilyKey,

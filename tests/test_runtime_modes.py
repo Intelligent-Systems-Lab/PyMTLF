@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from nwdaf_context import verified_capability_checker
+from nwdaf_context import context_client, verified_capability_checker
 from pydantic import ValidationError
 
 from py_mtlf.api.ml_model_monitor import _dispatch_retrain_intents
@@ -16,6 +16,7 @@ from py_mtlf.config import (
 )
 from py_mtlf.core.accuracy_policy import PolicyDecision
 from py_mtlf.core.fl_experiment import ExperimentRole
+from py_mtlf.core.nwdaf_context import NwdafContext
 
 
 def with_engines(
@@ -80,6 +81,7 @@ def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
     app = create_app(
         with_engines(settings, tmp_path / "local"),
         capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "local"
@@ -95,6 +97,7 @@ def test_fl_server_owns_model_services_without_local_training(settings, tmp_path
     app = create_app(
         with_engines(settings, tmp_path / "server", server=True),
         capability_checker=verified_capability_checker(server=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
@@ -118,6 +121,7 @@ def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_p
     app = create_app(
         with_engines(settings, workspace, client=True),
         capability_checker=verified_capability_checker(client=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
@@ -143,6 +147,7 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
     app = create_app(
         with_engines(settings, tmp_path / "combined", server=True, client=True),
         capability_checker=verified_capability_checker(server=True, client=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(app) as client:
         assert client.get("/health/ready").json()["runtimeMode"] == "federated"
@@ -179,10 +184,12 @@ def test_hierarchy_private_api_is_mounted_only_when_enabled(settings, tmp_path):
     disabled = create_app(
         with_hierarchy(settings, tmp_path / "disabled", topology_path, private_api=False),
         capability_checker=verified_capability_checker(server=True),
+        nwdaf_context_client=context_client(),
     )
     enabled = create_app(
         with_hierarchy(settings, tmp_path / "enabled", topology_path, private_api=True),
         capability_checker=verified_capability_checker(server=True),
+        nwdaf_context_client=context_client(),
     )
 
     with TestClient(disabled) as client:
@@ -227,6 +234,7 @@ def test_combined_profile_exposes_upper_client_lower_server_pairing_seam(
     app = create_app(
         with_engines(settings, tmp_path / "combined", server=True, client=True),
         capability_checker=verified_capability_checker(server=True, client=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(app):
         reservation = app.state.fl_experiments.reserve_client(
@@ -254,16 +262,45 @@ def test_new_app_construction_uses_a_fresh_experiment_registry(settings, tmp_pat
     first = create_app(
         with_engines(settings, tmp_path / "first", client=True),
         capability_checker=verified_capability_checker(client=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(first):
         first.state.fl_experiments.reserve_client("subscription-a", "correlation-a")
     second = create_app(
         with_engines(settings, tmp_path / "second", client=True),
         capability_checker=verified_capability_checker(client=True),
+        nwdaf_context_client=context_client(),
     )
     with TestClient(second):
         assert second.state.fl_experiments is not first.state.fl_experiments
         assert second.state.fl_experiments.active() is None
+
+
+def test_app_generation_change_clears_old_slot_and_workspace_before_reopening(
+    settings,
+):
+    context = MutableContextClient()
+    app = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context,
+    )
+    old_plan = str(uuid4())
+    new_plan = str(uuid4())
+
+    with TestClient(app):
+        app.state.fl_experiments.reserve_root(old_plan)
+        old_directory = settings.federated_learning.workspace_root / old_plan
+        old_directory.mkdir()
+        (old_directory / "old-artifact").write_bytes(b"old")
+        context.process_instance_id = "33333333-3333-4333-8333-333333333333"
+
+        snapshot = app.state.generation_monitor.refresh_once()
+
+        assert snapshot.ready is True
+        assert app.state.fl_experiments.active() is None
+        assert not old_directory.exists()
+        assert app.state.fl_experiments.reserve_root(new_plan).plan_id == new_plan
 
 
 def test_registry_fences_admission_before_server_and_publication_stop(settings, tmp_path):
@@ -271,7 +308,9 @@ def test_registry_fences_admission_before_server_and_publication_stop(settings, 
     shutdown_order = []
     shutdown_registry = app.state.fl_experiments.shutdown
     close_server = app.state.fl_server.close
+    stop_publication = app.state.publication.stop
     close_publication = app.state.publication.close
+    stop_generation_monitor = app.state.generation_monitor.stop
 
     def record_registry_shutdown():
         shutdown_order.append("registry")
@@ -281,18 +320,55 @@ def test_registry_fences_admission_before_server_and_publication_stop(settings, 
         shutdown_order.append("server")
         close_server()
 
+    def record_publication_stop():
+        shutdown_order.append("publication-stop")
+        stop_publication()
+
     def record_publication_close():
-        shutdown_order.append("publication")
+        shutdown_order.append("publication-close")
+        app.state.publication.stop = stop_publication
         close_publication()
+
+    def record_generation_monitor_stop():
+        shutdown_order.append("generation-monitor")
+        stop_generation_monitor()
 
     app.state.fl_experiments.shutdown = record_registry_shutdown
     app.state.fl_server.close = record_server_close
+    app.state.publication.stop = record_publication_stop
     app.state.publication.close = record_publication_close
+    app.state.generation_monitor.stop = record_generation_monitor_stop
 
     with TestClient(app):
         pass
 
-    assert shutdown_order == ["registry", "server", "publication"]
+    assert shutdown_order == [
+        "generation-monitor",
+        "publication-stop",
+        "registry",
+        "server",
+        "publication-close",
+    ]
+
+
+class MutableContextClient:
+    def __init__(self):
+        self.process_instance_id = "22222222-2222-4222-8222-222222222222"
+
+    def open(self):
+        return None
+
+    def close(self):
+        return None
+
+    def get(self, *, refresh=False):
+        del refresh
+        return NwdafContext(
+            nf_instance_id="11111111-1111-4111-8111-111111111111",
+            containing_nwdaf_process_instance_id=self.process_instance_id,
+            api_root="http://go.example",
+            internal_api_root="http://go-internal.example",
+        )
 
 
 def test_only_local_mode_dispatches_current_dataset_training_path():

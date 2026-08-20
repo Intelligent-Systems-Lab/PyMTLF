@@ -48,7 +48,11 @@ from py_mtlf.core.monitor_store import (
     MonitorSubscriptionProjectionStore,
 )
 from py_mtlf.core.notification_delivery import ProvisionNotificationDispatcher
-from py_mtlf.core.nwdaf_context import CapabilityConsistencyChecker, NwdafContextClient
+from py_mtlf.core.nwdaf_context import (
+    CapabilityConsistencyChecker,
+    ContainingNwdafGenerationMonitor,
+    NwdafContextClient,
+)
 from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.publication import PublicationCoordinator
@@ -76,6 +80,7 @@ def create_app(
     *,
     artifact_repository: ArtifactRepository | None = None,
     capability_checker: CapabilityConsistencyChecker | None = None,
+    nwdaf_context_client: NwdafContextClient | None = None,
 ) -> FastAPI:
     artifact_repository = artifact_repository or ArtifactRepository(
         settings.storage.artifact_root, settings.artifact
@@ -98,12 +103,18 @@ def create_app(
         seed_catalog,
     )
     runtime = RuntimeState(process_instance_id=str(uuid4()), mode=settings.runtime.mode)
-    nwdaf_context = NwdafContextClient(
+    nwdaf_context = nwdaf_context_client or NwdafContextClient(
         settings.containing_nwdaf.internal_api_root,
         settings.containing_nwdaf.request_timeout_seconds,
     )
     capability_checker = capability_checker or CapabilityConsistencyChecker(
         nwdaf_context,
+        configured_server=settings.federated_learning.server is not None,
+        configured_client=settings.federated_learning.client is not None,
+    )
+    generation_monitor = ContainingNwdafGenerationMonitor(
+        nwdaf_context,
+        capability_checker,
         configured_server=settings.federated_learning.server is not None,
         configured_client=settings.federated_learning.client is not None,
     )
@@ -114,7 +125,12 @@ def create_app(
     local_training = settings.local_training
     fl_client_settings = settings.federated_learning.client
     fl_server_settings = settings.federated_learning.server
-    fl_experiments = FLExperimentRegistry()
+    fl_experiments = FLExperimentRegistry(
+        tombstone_ttl_seconds=(
+            settings.federated_learning.lifecycle.tombstone_ttl_seconds
+        ),
+        admission_ready=generation_monitor.ready,
+    )
 
     def resume_published_cutover(publication_record, model) -> None:
         family_key = seed_catalog.family_key_for_id(publication_record.family_id)
@@ -225,6 +241,9 @@ def create_app(
             nwdaf_context=nwdaf_context,
             artifact_service=HierarchyArtifactService(fl_workspace),
             server=fl_server,
+            tombstone_ttl_seconds=(
+                settings.federated_learning.lifecycle.tombstone_ttl_seconds
+            ),
         )
     fl_client = (
         FLClientEngine(
@@ -263,13 +282,44 @@ def create_app(
             server=fl_server,
             policy=accuracy_policy,
             experiments=fl_experiments,
+            terminal_status_ttl_seconds=(
+                settings.federated_learning.lifecycle.terminal_status_ttl_seconds
+            ),
         )
+
+    def reset_containing_nwdaf_generation(reason: str) -> None:
+        logger.warning("Discarding FL state after containing NWDAF reset: %s", reason)
+        publication.abort_generation()
+        errors: list[Exception] = []
+        for owner in (fl_root, fl_client, fl_server):
+            if owner is None:
+                continue
+            try:
+                owner.abort_generation(reason)
+            except Exception as error:
+                errors.append(error)
+                logger.exception(
+                    "Containing NWDAF generation cleanup failed owner=%s",
+                    type(owner).__name__,
+                )
+        accuracy_policy.abort_generation()
+        fl_experiments.reset_generation()
+        try:
+            fl_workspace.reset_generation()
+        except Exception as error:
+            errors.append(error)
+            logger.exception("Containing NWDAF generation workspace cleanup failed")
+        if errors:
+            raise RuntimeError("containing NWDAF generation cleanup was incomplete")
+
+    generation_monitor.set_reset_callback(reset_containing_nwdaf_generation)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         del app
         logger.info("MTLF backend startup begin mode=%s", settings.runtime.mode)
         try:
+            nwdaf_context.open()
             _prepare_workspace(settings.federated_learning.workspace_root)
             fl_workspace.open()
             artifact_repository.open()
@@ -283,11 +333,14 @@ def create_app(
             if training_coordinator is not None:
                 training_coordinator.open()
             runtime.artifact_status = "ready"
+            generation_monitor.open()
             runtime.accepting_requests = True
             logger.info("MTLF backend startup complete ready=%s", runtime.ready)
             yield
         finally:
             runtime.accepting_requests = False
+            generation_monitor.stop()
+            publication.stop()
             if fl_root is not None:
                 fl_root.close()
             if fl_branch is not None:
@@ -296,9 +349,15 @@ def create_app(
             if training_coordinator is not None:
                 training_coordinator.shutdown()
             if fl_client is not None:
+                fl_client.abort_generation("PyMTLF is shutting down")
                 fl_client.close()
             if fl_server is not None:
                 fl_server.close()
+            fl_experiments.reset_generation()
+            try:
+                fl_workspace.reset_generation()
+            except RuntimeError:
+                logger.exception("FL workspace shutdown cleanup failed")
             publication.close()
             fl_workspace.close()
             dataset_coordinator.shutdown()
@@ -322,6 +381,7 @@ def create_app(
     app.state.provision_notifications = provision_notifications
     app.state.nwdaf_context = nwdaf_context
     app.state.capability_checker = capability_checker
+    app.state.generation_monitor = generation_monitor
     app.state.monitor_registrations = monitor_registrations
     app.state.monitor_subscriptions = monitor_subscriptions
     app.state.monitor_reconciler = monitor_reconciler

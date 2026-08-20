@@ -41,6 +41,9 @@ federated_learning:
   # Temporary workspace for downloaded global and generated local artifacts.
   workspace_root: "data/fl-workspaces"
   workspace_ttl_seconds: 3600
+  lifecycle:
+    terminal_status_ttl_seconds: 3600
+    tombstone_ttl_seconds: 3600
   # Origin advertised to the Server for round-local bundle downloads.
   public_base_url: "http://127.0.0.1:9093"
   # Timeout for outbound callback and supporting HTTP requests.

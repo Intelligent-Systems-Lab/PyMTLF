@@ -17,6 +17,7 @@ from py_mtlf.core.fl_artifacts import (
     RoundLocalResultType,
 )
 from py_mtlf.core.fl_experiment import (
+    ExperimentAdmissionClosedError,
     ExperimentConflictError,
     ExperimentLifecycle,
     FLExperimentRegistry,
@@ -136,6 +137,7 @@ class RootRequestSnapshot:
     completed_rounds: int = 0
     candidate_url: str = ""
     candidate_digest: str = ""
+    published_model_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,10 @@ class _RootRequestRecord:
     completed_rounds: int = 0
     candidate_url: str = ""
     candidate_digest: str = ""
+    published_model_id: int | None = None
+    terminal_at: float | None = None
+    terminal_deadline: float | None = None
+    generation: int = 0
     future: Future | None = field(default=None, repr=False)
 
 
@@ -179,7 +185,11 @@ class FLRootCoordinator:
         policy: AccuracyPolicy,
         experiments: FLExperimentRegistry,
         loader: TrustedBundleLoader | None = None,
+        terminal_status_ttl_seconds: int = 3600,
+        clock=time.monotonic,
     ) -> None:
+        if terminal_status_ttl_seconds <= 0:
+            raise ValueError("terminal_status_ttl_seconds must be positive")
         self._strategy = FederatedStrategy(
             algorithm=FedProxAlgorithm(
                 name=strategy.algorithm.name,
@@ -200,9 +210,12 @@ class FLRootCoordinator:
         self._policy = policy
         self._experiments = experiments
         self._loader = loader or TrustedBundleLoader()
+        self._terminal_status_ttl_seconds = terminal_status_ttl_seconds
+        self._clock = clock
         self._condition = threading.Condition(threading.RLock())
         self._records: dict[str, _RootRequestRecord] = {}
         self._active_request_id: str | None = None
+        self._generation = 0
         self._failure_latched = False
         self._closing = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fl-root")
@@ -255,11 +268,13 @@ class FLRootCoordinator:
         except ValueError:
             return None
         with self._condition:
+            self._prune_terminal_records_locked()
             record = self._records.get(normalized)
             return self._snapshot(record) if record is not None else None
 
     def requests(self) -> tuple[RootRequestSnapshot, ...]:
         with self._condition:
+            self._prune_terminal_records_locked()
             return tuple(self._snapshot(self._records[key]) for key in sorted(self._records))
 
     def wait_for_state(
@@ -272,6 +287,7 @@ class FLRootCoordinator:
         deadline = time.monotonic() + timeout
         with self._condition:
             while True:
+                self._prune_terminal_records_locked()
                 record = self._records.get(request_id)
                 if record is None:
                     raise KeyError(request_id)
@@ -313,9 +329,45 @@ class FLRootCoordinator:
                 active.state = RootRequestState.FAILED
                 active.failure_cause = RootFailureCause.SHUTDOWN.value
                 active.failure_detail = "Root coordinator is closing"
+                self._retain_terminal_record_locked(active)
                 self._active_request_id = None
                 self._condition.notify_all()
         self._resolver.close()
+
+    def abort_generation(self, reason: str) -> None:
+        """Discard the old containing-Go Root request without closing this coordinator."""
+        with self._condition:
+            self._generation += 1
+            active = (
+                self._records.get(self._active_request_id)
+                if self._active_request_id is not None
+                else None
+            )
+            self._active_request_id = None
+            self._records.clear()
+            self._failure_latched = False
+            self._condition.notify_all()
+        if active is None:
+            return
+        if active.server_process_id:
+            try:
+                self._server.cancel_hierarchy_preparation(
+                    active.server_process_id,
+                    reason,
+                )
+            except RuntimeError:
+                logger.exception(
+                    "Failed to cancel Root Server process during generation reset process_id=%s",
+                    active.server_process_id,
+                )
+        self._cleanup_attempt(
+            active,
+            cancel_server=False,
+            reason=reason,
+        )
+        active.state = RootRequestState.FAILED
+        active.failure_cause = RootFailureCause.SHUTDOWN.value
+        active.failure_detail = "containing NWDAF process generation changed"
 
     def _submit_policy_intent(self, intent: RetrainIntent) -> RootRequestSnapshot:
         return self._submit(
@@ -336,6 +388,7 @@ class FLRootCoordinator:
         manual: bool,
     ) -> RootRequestSnapshot:
         with self._condition:
+            self._prune_terminal_records_locked()
             existing = self._records.get(request_id)
             if existing is not None:
                 if existing.initiation.model_family_id != model_family_id:
@@ -357,6 +410,8 @@ class FLRootCoordinator:
             plan_id = str(uuid4())
             try:
                 reservation = self._experiments.reserve_root(plan_id)
+            except ExperimentAdmissionClosedError as error:
+                raise RootCoordinatorUnavailableError(str(error)) from error
             except ExperimentConflictError as error:
                 raise RootRequestConflictError(str(error)) from error
             initiation = RootInitiation(
@@ -369,6 +424,7 @@ class FLRootCoordinator:
             record = _RootRequestRecord(
                 initiation=initiation,
                 reservation_id=reservation.reservation_id,
+                generation=self._generation,
             )
             self._records[request_id] = record
             self._active_request_id = request_id
@@ -385,6 +441,7 @@ class FLRootCoordinator:
                     RootFailureCause.VALIDATION_FAILED
                 )
                 self._failure_latched = True
+                self._retain_terminal_record_locked(record)
                 raise RootCoordinatorUnavailableError(
                     "Root request executor is unavailable"
                 ) from error
@@ -410,7 +467,7 @@ class FLRootCoordinator:
                 raise RuntimeError("hierarchical FL V1 only supports UE_COMMUNICATION")
             if not descriptor.model_interoperability:
                 raise RuntimeError("FL base model has no model interoperability identifier")
-            context = self._nwdaf_context.get(refresh=True)
+            context = self._nwdaf_context.get()
             if not any(
                 descriptor.event in capability.ml_analytics_ids
                 and capability.fl_capability_type
@@ -451,6 +508,7 @@ class FLRootCoordinator:
             targets = []
             branch_assignments = {}
             for branch, resolved in resolved_branches:
+                self._ensure_active_generation(record)
                 artifact = self._artifact_service.publish_branch_assignment(
                     base=base,
                     plan_id=record.initiation.plan_id,
@@ -477,6 +535,7 @@ class FLRootCoordinator:
                 raise RuntimeError("FL base model changed during assignment publication")
 
             cause = RootFailureCause.PREPARATION_DISPATCH_FAILED
+            self._ensure_active_generation(record)
             process = self._server.start_hierarchy_preparation(
                 plan_id=record.initiation.plan_id,
                 reservation_id=record.reservation_id,
@@ -530,6 +589,7 @@ class FLRootCoordinator:
                     round_indicator,
                 )
                 round_input = self._artifact_service.publish_round_input(
+                    plan_id=record.initiation.plan_id,
                     base=source,
                     process_id=process.process_id,
                     server_nf_instance_id=context.nf_instance_id,
@@ -550,6 +610,7 @@ class FLRootCoordinator:
                         )
                     ),
                 )
+                self._ensure_active_generation(record)
                 source = self._loader.load(
                     ArtifactMetadata(
                         key=aggregate.digest,
@@ -559,12 +620,21 @@ class FLRootCoordinator:
                     )
                 )
                 with self._condition:
+                    if (
+                        self._closing
+                        or record.generation != self._generation
+                        or self._active_request_id != record.initiation.request_id
+                    ):
+                        raise RootCoordinatorUnavailableError(
+                            "Root coordinator is closing"
+                        )
                     record.completed_rounds = round_indicator + 1
                     record.candidate_url = aggregate.url
                     record.candidate_digest = aggregate.digest
                     self._condition.notify_all()
             cause = RootFailureCause.FINAL_VALIDATION_FAILED
-            self._server.finalize_hierarchy_candidate(
+            self._ensure_active_generation(record)
+            result = self._server.finalize_hierarchy_candidate(
                 process_id=process.process_id,
                 validation_round=self._server_settings.round_count,
                 candidate=aggregate,
@@ -575,6 +645,14 @@ class FLRootCoordinator:
                     state,
                 ),
             )
+            with self._condition:
+                if record.generation == self._generation:
+                    record.published_model_id = getattr(
+                        result,
+                        "published_model_id",
+                        None,
+                    )
+            self._close_training_outcome(record, result.state)
         except Exception as error:
             if isinstance(error, HierarchyDiscoveryError):
                 cause = RootFailureCause.DISCOVERY_FAILED
@@ -594,12 +672,19 @@ class FLRootCoordinator:
             )
             self._cleanup_attempt(record, cancel_server=True, reason=str(error))
             with self._condition:
+                if record.generation != self._generation:
+                    self._condition.notify_all()
+                    return
+                if record.terminal_deadline is not None:
+                    self._condition.notify_all()
+                    return
                 record.state = RootRequestState.FAILED
                 record.failure_cause = cause.value
                 record.failure_detail = _public_failure_detail(cause)
                 if self._active_request_id == record.initiation.request_id:
                     self._active_request_id = None
                 self._failure_latched = True
+                self._retain_terminal_record_locked(record)
                 self._condition.notify_all()
 
     def _evaluate_preparation(
@@ -744,6 +829,16 @@ class FLRootCoordinator:
             record.state = state
             self._condition.notify_all()
 
+    def _ensure_active_generation(self, record: _RootRequestRecord) -> None:
+        with self._condition:
+            if self._closing:
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            if (
+                record.generation != self._generation
+                or self._active_request_id != record.initiation.request_id
+            ):
+                raise RootRequestConflictError("Root request is stale")
+
     def _set_round_state(
         self,
         record: _RootRequestRecord,
@@ -789,14 +884,59 @@ class FLRootCoordinator:
             FLServerState.FINAL_VALIDATION_EVALUATING: (
                 RootRequestState.FINAL_VALIDATION_EVALUATING
             ),
-            FLServerState.VALIDATION_REJECTED: RootRequestState.VALIDATION_REJECTED,
             FLServerState.CANDIDATE_READY: RootRequestState.CANDIDATE_READY,
             FLServerState.PUBLISHING: RootRequestState.PUBLISHING,
-            FLServerState.CUTOVER_PENDING: RootRequestState.CUTOVER_PENDING,
-            FLServerState.COMPLETE: RootRequestState.COMPLETE,
         }.get(state)
         if projected is not None:
-            self._set_state(record, projected)
+            with self._condition:
+                if self._closing:
+                    raise RootCoordinatorUnavailableError("Root coordinator is closing")
+                if self._active_request_id != record.initiation.request_id:
+                    raise RootRequestConflictError("Root request is stale")
+                record.state = projected
+                self._condition.notify_all()
+            return
+        if state is FLServerState.COMPLETE:
+            with self._condition:
+                adoption_completed = record.state is RootRequestState.CUTOVER_PENDING
+            if adoption_completed:
+                self._close_training_outcome(record, state)
+
+    def _close_training_outcome(
+        self,
+        record: _RootRequestRecord,
+        state: FLServerState,
+    ) -> None:
+        retain_top_level = state is FLServerState.CUTOVER_PENDING
+        process_id = record.server_process_id
+        if process_id:
+            try:
+                self._server.close_hierarchy_training(
+                    process_id,
+                    retain_for_adoption=retain_top_level,
+                )
+            except (KeyError, RuntimeError):
+                logger.exception("Failed to close hierarchy Server process %s", process_id)
+        try:
+            self._workspace.release_plan(record.initiation.plan_id)
+        except RuntimeError:
+            logger.exception(
+                "Failed to release hierarchy workspace plan_id=%s",
+                record.initiation.plan_id,
+            )
+        record.candidate_url = ""
+        if retain_top_level:
+            with self._condition:
+                record.state = RootRequestState.CUTOVER_PENDING
+                self._condition.notify_all()
+            return
+        self._release_reservation(record, state.value)
+        with self._condition:
+            record.state = RootRequestState(state.value)
+            if self._active_request_id == record.initiation.request_id:
+                self._active_request_id = None
+            self._retain_terminal_record_locked(record)
+            self._condition.notify_all()
 
     def _cleanup_attempt(
         self,
@@ -821,12 +961,15 @@ class FLRootCoordinator:
                 "Failed to release hierarchy workspace plan_id=%s",
                 record.initiation.plan_id,
             )
+        self._release_reservation(record, RootRequestState.FAILED.value)
+
+    def _release_reservation(self, record: _RootRequestRecord, outcome: str) -> None:
         active = self._experiments.active()
         if active is None or active.reservation_id != record.reservation_id:
             return
         try:
             if active.lifecycle in {ExperimentLifecycle.PROVISIONAL, ExperimentLifecycle.ACTIVE}:
-                self._experiments.mark_terminal(record.reservation_id, "FAILED")
+                self._experiments.mark_terminal(record.reservation_id, outcome)
                 active = self._experiments.active()
             if active is not None and active.lifecycle is ExperimentLifecycle.TERMINAL:
                 self._experiments.begin_cleanup(record.reservation_id)
@@ -838,6 +981,22 @@ class FLRootCoordinator:
                 "Failed to release hierarchy registry reservation request_id=%s",
                 record.initiation.request_id,
             )
+
+    def _retain_terminal_record_locked(self, record: _RootRequestRecord) -> None:
+        record.candidate_url = ""
+        if record.terminal_deadline is None:
+            record.terminal_at = self._clock()
+            record.terminal_deadline = (
+                record.terminal_at + self._terminal_status_ttl_seconds
+            )
+
+    def _prune_terminal_records_locked(self) -> None:
+        now = self._clock()
+        self._records = {
+            request_id: record
+            for request_id, record in self._records.items()
+            if record.terminal_deadline is None or record.terminal_deadline > now
+        }
 
     @staticmethod
     def _snapshot(record: _RootRequestRecord) -> RootRequestSnapshot:
@@ -853,6 +1012,7 @@ class FLRootCoordinator:
             completed_rounds=record.completed_rounds,
             candidate_url=record.candidate_url,
             candidate_digest=record.candidate_digest,
+            published_model_id=record.published_model_id,
         )
 
 

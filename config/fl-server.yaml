@@ -44,6 +44,9 @@ federated_learning:
   # Temporary per-process and per-round artifacts; these are not completed models.
   workspace_root: "data/fl-workspaces"
   workspace_ttl_seconds: 3600
+  lifecycle:
+    terminal_status_ttl_seconds: 3600
+    tombstone_ttl_seconds: 3600
   # Origin advertised for temporary global-model downloads by Clients.
   public_base_url: "http://127.0.0.1:9092"
   # Timeout for discovery, subscription, update, and cleanup HTTP requests.

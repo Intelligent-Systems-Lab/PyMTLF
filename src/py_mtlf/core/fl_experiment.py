@@ -1,4 +1,6 @@
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID, uuid4
@@ -26,6 +28,10 @@ class ExperimentConflictError(ExperimentRegistryError):
 
 
 class ExperimentStateError(ExperimentRegistryError):
+    pass
+
+
+class ExperimentAdmissionClosedError(ExperimentStateError):
     pass
 
 
@@ -62,10 +68,21 @@ class FLExperimentRegistry:
     acquire a registry reservation before entering an engine-owned state lock.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tombstone_ttl_seconds: int = 3600,
+        clock=time.monotonic,
+        admission_ready: Callable[[], bool] | None = None,
+    ) -> None:
+        if tombstone_ttl_seconds <= 0:
+            raise ValueError("tombstone_ttl_seconds must be positive")
         self._lock = threading.RLock()
         self._active: _ExperimentRecord | None = None
-        self._retired_plan_ids: set[str] = set()
+        self._retired_plan_ids: dict[str, float] = {}
+        self._tombstone_ttl_seconds = tombstone_ttl_seconds
+        self._clock = clock
+        self._admission_ready = admission_ready or (lambda: True)
         self._shutting_down = False
 
     def reserve_client(
@@ -76,6 +93,7 @@ class FLExperimentRegistry:
         subscription_id = _required_identity(subscription_id, "subscription_id")
         ml_correlation_id = _required_identity(ml_correlation_id, "ml_correlation_id")
         with self._lock:
+            self._prune_retired_locked()
             self._ensure_admission_open()
             if self._active is None:
                 self._active = _ExperimentRecord(
@@ -157,6 +175,7 @@ class FLExperimentRegistry:
         if role not in {ExperimentRole.BRANCH, ExperimentRole.LEAF}:
             raise ExperimentStateError("an upper client group can only bind BRANCH or LEAF")
         with self._lock:
+            self._prune_retired_locked()
             self._ensure_admission_open()
             record = self._required(reservation_id)
             if plan_id in self._retired_plan_ids:
@@ -176,6 +195,7 @@ class FLExperimentRegistry:
     def reserve_root(self, plan_id: str) -> ExperimentSnapshot:
         plan_id = _uuid4_identity(plan_id, "plan_id")
         with self._lock:
+            self._prune_retired_locked()
             self._ensure_admission_open()
             self._ensure_slot_available()
             if plan_id in self._retired_plan_ids:
@@ -191,6 +211,7 @@ class FLExperimentRegistry:
     def reserve_server(self, process_id: str) -> ExperimentSnapshot:
         process_id = _required_identity(process_id, "process_id")
         with self._lock:
+            self._prune_retired_locked()
             self._ensure_admission_open()
             self._ensure_slot_available()
             self._active = _ExperimentRecord(
@@ -267,7 +288,9 @@ class FLExperimentRegistry:
             if record.lifecycle is not ExperimentLifecycle.CLEANING:
                 raise ExperimentStateError("release requires completed cleanup")
             if record.plan_id is not None:
-                self._retired_plan_ids.add(record.plan_id)
+                self._retired_plan_ids[record.plan_id] = (
+                    self._clock() + self._tombstone_ttl_seconds
+                )
             self._active = None
 
     def active(self) -> ExperimentSnapshot | None:
@@ -290,23 +313,43 @@ class FLExperimentRegistry:
 
     def is_retired(self, plan_id: str) -> bool:
         with self._lock:
+            self._prune_retired_locked()
             return plan_id in self._retired_plan_ids
 
     def retired_plan_ids(self) -> frozenset[str]:
         with self._lock:
+            self._prune_retired_locked()
             return frozenset(self._retired_plan_ids)
 
     def shutdown(self) -> None:
         with self._lock:
             self._shutting_down = True
 
+    def reset_generation(self) -> None:
+        """Discard all process-local experiment and replay state for a new Go boot."""
+        with self._lock:
+            self._active = None
+            self._retired_plan_ids.clear()
+
     def _ensure_admission_open(self) -> None:
         if self._shutting_down:
             raise ExperimentStateError("experiment registry is shutting down")
+        if not self._admission_ready():
+            raise ExperimentAdmissionClosedError(
+                "containing NWDAF generation is unavailable"
+            )
 
     def _ensure_slot_available(self) -> None:
         if self._active is not None:
             raise ExperimentConflictError("another top-level experiment is active")
+
+    def _prune_retired_locked(self) -> None:
+        now = self._clock()
+        self._retired_plan_ids = {
+            plan_id: deadline
+            for plan_id, deadline in self._retired_plan_ids.items()
+            if deadline > now
+        }
 
     def _required(self, reservation_id: str) -> _ExperimentRecord:
         if self._active is None or self._active.reservation_id != reservation_id:

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from conftest import build_bundle
 
@@ -6,7 +8,14 @@ from py_mtlf.core.artifacts import (
     ArtifactRepository,
     InvalidArtifactError,
 )
-from py_mtlf.core.model_records import AdrfReference
+from py_mtlf.core.model_records import (
+    AdrfReference,
+    CompletedRevision,
+    DurableModelState,
+    ModelCatalogRecord,
+    ParticipantSampleCount,
+    RevisionOrigin,
+)
 from py_mtlf.core.seed_catalog import SeedCatalog
 from py_mtlf.wire.ml_model import MLEventSubscription
 
@@ -162,3 +171,84 @@ def test_catalog_promotes_candidate_with_new_model_identity(
     assert catalog.family_for_version(1) == family_key
     assert catalog.family_for_version(2) == family_key
     assert promoted.artifact.key == candidate.key
+
+
+def test_catalog_restore_serves_completed_federated_revision_to_new_consumer(
+    settings,
+    bundle_path,
+    tmp_path,
+):
+    repository = ArtifactRepository(settings.storage.artifact_root, settings.artifact)
+    repository.open()
+    seed = repository.publish(bundle_path)
+    candidate_path = tmp_path / "completed.tar.gz"
+    build_bundle(
+        candidate_path,
+        mutate_manifest={
+            "model_generation": 2,
+            "model_identity": {"model_unique_id": 2},
+        },
+    )
+    candidate = repository.publish(candidate_path)
+    descriptor = SeedModelSettings(
+        family_id="ue-communication-default",
+        model_id=1,
+        artifact_key=seed.key,
+        event="UE_COMMUNICATION",
+    )
+    created_at = datetime.now(UTC)
+    catalog_record = ModelCatalogRecord(
+        schema_version="1.0",
+        latest_model_id=2,
+        next_model_id=3,
+        revisions=(
+            CompletedRevision(
+                model_unique_id=1,
+                origin=RevisionOrigin.SEED,
+                artifact_key=seed.key,
+                artifact_digest=seed.key,
+                created_at=created_at,
+            ),
+            CompletedRevision(
+                model_unique_id=2,
+                previous_model_unique_id=1,
+                origin=RevisionOrigin.FEDERATED,
+                artifact_key=candidate.key,
+                artifact_digest=candidate.key,
+                created_at=created_at,
+                generation=2,
+                ml_corre_id="completed-process",
+                participants=(
+                    ParticipantSampleCount(
+                        participant_nf_instance_id=(
+                            "11111111-1111-4111-8111-111111111111"
+                        ),
+                        sample_count=10,
+                    ),
+                ),
+                adrf_reference=AdrfReference(
+                    adrf_instance_id="22222222-2222-4222-8222-222222222222",
+                    store_trans_id="store-2",
+                    resource_location="http://adrf.example/models/store-2",
+                ),
+            ),
+        ),
+    )
+    restored = SeedCatalog(ModelProvisionSettings(seed_models=(descriptor,)), repository)
+    restored.open()
+    restored.restore(
+        DurableModelState(
+            schema_version="2.0",
+            last_allocated_model_id=2,
+            families={descriptor.family_id: catalog_record},
+        )
+    )
+
+    current = restored.resolve(
+        MLEventSubscription(mLEvent="UE_COMMUNICATION", mLEventFilter={})
+    )
+
+    assert current is not None
+    assert current.model_id == 2
+    assert current.artifact == candidate
+    assert current.event_notification("new-consumer").model_unique_id == 2

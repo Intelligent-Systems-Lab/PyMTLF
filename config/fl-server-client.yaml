@@ -24,6 +24,9 @@ artifact:
 federated_learning:
   workspace_root: "data/fl-workspaces"
   workspace_ttl_seconds: 3600
+  lifecycle:
+    terminal_status_ttl_seconds: 3600
+    tombstone_ttl_seconds: 3600
   public_base_url: "http://127.0.0.1:9092"
   request_timeout_seconds: 300
   artifact_download:

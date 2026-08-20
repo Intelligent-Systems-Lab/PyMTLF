@@ -22,7 +22,11 @@ from py_mtlf.core.model_records import (
     PendingPublication,
     PublicationState,
 )
-from py_mtlf.core.publication import PublicationCoordinator
+from py_mtlf.core.publication import (
+    PublicationAbandonedError,
+    PublicationCoordinator,
+    RecoverablePublicationError,
+)
 from py_mtlf.wire.private import SelectedTarget
 
 NWDAF_ID = "11111111-1111-4111-8111-111111111111"
@@ -30,6 +34,13 @@ ADRF_ID = "22222222-2222-4222-8222-222222222222"
 CLIENT_ID = "33333333-3333-4333-8333-333333333333"
 LEAF_ID = "44444444-4444-4444-8444-444444444444"
 DIGEST = "a" * 64
+
+
+def _capture_error(target, operation):
+    try:
+        operation()
+    except Exception as error:
+        target.append(error)
 
 
 def nwdaf_context_client():
@@ -278,10 +289,80 @@ def test_restart_reannounces_cutover_pending_publication():
 
     coordinator.open()
     try:
+        assert coordinator._worker is None
         coordinator.resume()
         assert announced.wait(timeout=1)
     finally:
         coordinator.close()
+
+
+def test_production_open_does_not_resume_or_rewrite_unfinished_journal(tmp_path):
+    state = Mock()
+    coordinator = PublicationCoordinator(
+        PublicationSettings(directory=tmp_path / "publications"),
+        state,
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        nwdaf_context_client(),
+        Mock(),
+    )
+
+    coordinator.open()
+    try:
+        assert coordinator._worker is None
+        assert coordinator._recovery_enabled is False
+        state.snapshot.assert_not_called()
+        state.update.assert_not_called()
+    finally:
+        coordinator.close()
+
+
+def test_generation_reset_wakes_retry_and_abandons_without_terminal_rewrite():
+    coordinator = PublicationCoordinator(
+        PublicationSettings(
+            retry_interval_seconds=30,
+            retry_max_interval_seconds=30,
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        nwdaf_context_client(),
+        Mock(),
+    )
+    publication = pending_publication()
+    attempted = threading.Event()
+    coordinator._reserve = Mock(return_value=publication)
+
+    def fail_recoverably(_publication, *, generation):
+        del generation
+        attempted.set()
+        raise RecoverablePublicationError("ADRF unavailable")
+
+    coordinator._advance = Mock(side_effect=fail_recoverably)
+    coordinator._record_retry = Mock(return_value=publication)
+    coordinator._mark_terminal = Mock()
+    failures = []
+
+    thread = threading.Thread(
+        target=lambda: _capture_error(
+            failures,
+            lambda: coordinator.publish(Mock()),
+        )
+    )
+    thread.start()
+    assert attempted.wait(timeout=1)
+
+    coordinator.abort_generation()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], PublicationAbandonedError)
+    coordinator._mark_terminal.assert_not_called()
 
 
 def test_final_bundle_receives_durable_hierarchy_validation(

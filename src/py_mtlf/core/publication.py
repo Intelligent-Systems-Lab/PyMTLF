@@ -51,6 +51,10 @@ class RecoverablePublicationError(RuntimeError):
     """A publication failure that may succeed without changing its identity."""
 
 
+class PublicationAbandonedError(RuntimeError):
+    """The containing Go generation changed while this process-local action ran."""
+
+
 @dataclass(frozen=True)
 class ValidatedCandidate:
     process_id: str
@@ -100,26 +104,26 @@ class PublicationCoordinator:
         self._recovery_enabled = False
         self._worker: threading.Thread | None = None
         self._announced: set[str] = set()
+        self._generation = 0
 
     def open(self) -> None:
         self._settings.directory.mkdir(parents=True, exist_ok=True)
         with self._condition:
-            if self._worker is not None:
-                return
             self._closing = False
-            self._worker = threading.Thread(
-                target=self._recovery_loop,
-                name="model-publication-reconciler",
-                daemon=True,
-            )
-            self._worker.start()
 
     def resume(self) -> None:
         with self._condition:
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._recovery_loop,
+                    name="model-publication-reconciler",
+                    daemon=True,
+                )
+                self._worker.start()
             self._recovery_enabled = True
             self._condition.notify_all()
 
-    def close(self) -> None:
+    def stop(self) -> None:
         with self._condition:
             self._closing = True
             self._condition.notify_all()
@@ -128,19 +132,32 @@ class PublicationCoordinator:
             worker.join(timeout=self._settings.request_timeout_seconds + 1)
         with self._condition:
             self._worker = None
+
+    def close(self) -> None:
+        self.stop()
         if self._owns_client:
             self._client.close()
 
+    def abort_generation(self) -> None:
+        """Fence in-flight publication without enabling cross-generation resume."""
+        with self._condition:
+            self._generation += 1
+            self._condition.notify_all()
+
     def publish(self, candidate: ValidatedCandidate) -> CatalogModel:
+        with self._condition:
+            generation = self._generation
         publication = self._reserve(candidate)
         delay = self._settings.retry_interval_seconds
         while True:
             try:
                 with self._advance_lock:
-                    publication, model = self._advance(publication)
+                    publication, model = self._advance(publication, generation=generation)
                 with self._condition:
                     self._announced.add(publication.publication_id)
                 return model
+            except PublicationAbandonedError:
+                raise
             except RecoverablePublicationError as error:
                 publication = self._record_retry(publication.publication_id, error)
                 logger.warning(
@@ -152,7 +169,9 @@ class PublicationCoordinator:
                 with self._condition:
                     if self._closing:
                         raise RuntimeError("publication coordinator is shutting down") from error
+                    self._ensure_generation(generation)
                     self._condition.wait(timeout=delay)
+                    self._ensure_generation(generation)
                 delay = min(delay * 2, self._settings.retry_max_interval_seconds)
             except Exception as error:
                 self._mark_terminal(publication.publication_id, error)
@@ -597,16 +616,22 @@ class PublicationCoordinator:
     def _advance(
         self,
         publication: PendingPublication,
+        *,
+        generation: int | None = None,
     ) -> tuple[PendingPublication, CatalogModel]:
+        self._ensure_generation(generation)
         if publication.state is PublicationState.RESERVED:
             publication = self._build_final_bundle(publication)
+            self._ensure_generation(generation)
         if publication.state in {
             PublicationState.FINAL_BUNDLE_READY,
             PublicationState.STORE_IN_FLIGHT,
         }:
             publication = self._store_in_adrf(publication)
+            self._ensure_generation(generation)
         if publication.state is PublicationState.STORE_ACCEPTED:
             publication = self._commit_catalog(publication)
+            self._ensure_generation(generation)
         family_key = self._catalog.family_key_for_id(publication.family_id)
         model = self._catalog.current(family_key)
         if model is None or model.model_id != publication.reserved_model_id:
@@ -632,6 +657,15 @@ class PublicationCoordinator:
             len(publication.required_cutover_scopes),
         )
         return publication, model
+
+    def _ensure_generation(self, generation: int | None) -> None:
+        if generation is None:
+            return
+        with self._condition:
+            if generation != self._generation:
+                raise PublicationAbandonedError(
+                    "publication abandoned after containing NWDAF generation changed"
+                )
 
     def _announce(self, publication: PendingPublication, model: CatalogModel) -> None:
         with self._condition:

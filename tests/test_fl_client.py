@@ -330,6 +330,91 @@ def test_create_failure_rolls_back_experiment_reservation(tmp_path, monkeypatch)
         service.close()
 
 
+def test_go_generation_reset_discards_idle_prepared_client_resource(
+    tmp_path,
+    monkeypatch,
+):
+    registry = FLExperimentRegistry()
+    workspace = Mock()
+    branch = Mock()
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        workspace,
+        experiments=registry,
+        branch_coordinator=branch,
+    )
+
+    def finish_immediately(resource):
+        resource.state = FLClientState.READY
+        resource.callback_slot_owned = False
+        resource.work_slot_owned = False
+        service._capacity.release()
+        service._outbox_capacity.release()
+
+    monkeypatch.setattr(service, "_start_operation", finish_immediately)
+    resource = service.create(
+        NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+    )
+    plan_id = "11111111-1111-4111-8111-111111111111"
+    registry.bind_plan(
+        resource.experiment_reservation_id,
+        plan_id,
+        ExperimentRole.LEAF,
+    )
+
+    try:
+        service.abort_generation("containing NWDAF process generation changed")
+
+        with pytest.raises(KeyError):
+            service.get(resource.subscription_id)
+        branch.abort_generation.assert_called_once()
+        workspace.release_plan.assert_called_once_with(plan_id)
+        assert service._closing.is_set() is False
+    finally:
+        registry.reset_generation()
+        service.close()
+
+
+def test_go_generation_reset_releases_active_client_capacity_for_new_work(
+    tmp_path,
+    monkeypatch,
+):
+    registry = FLExperimentRegistry()
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+
+    first = service.create(
+        NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+    )
+    service.abort_generation("containing NWDAF process generation changed")
+    registry.reset_generation()
+
+    try:
+        second_payload = preparation_payload()
+        second_payload["notifCorreId"] = "notify-new"
+        second = service.create(
+            NwdafMLModelTrainSubsc.model_validate(second_payload)
+        )
+
+        assert second.subscription_id != first.subscription_id
+    finally:
+        service.abort_generation("test cleanup")
+        registry.reset_generation()
+        service.close()
+
+
 def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
     service = FLClientEngine(
@@ -383,6 +468,61 @@ def test_delete_cancels_bound_leaf_and_is_idempotent(tmp_path, monkeypatch):
         assert registry.active() is None
         assert registry.is_retired(plan_id)
         workspace.release_plan.assert_called_once_with(plan_id)
+    finally:
+        service.close()
+
+
+def test_cancelled_client_resource_tombstone_is_pruned_lazily(tmp_path, monkeypatch):
+    now = [10.0]
+    registry = FLExperimentRegistry()
+    settings = FederatedLearningSettings(
+        workspace_root=tmp_path,
+        lifecycle={"tombstone_ttl_seconds": 5},
+    )
+    service = FLClientEngine(
+        settings,
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        experiments=registry,
+        clock=lambda: now[0],
+    )
+    monkeypatch.setattr(service, "_start_operation", Mock())
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
+        active = registry.active()
+        registry.bind_plan(
+            active.reservation_id,
+            "11111111-1111-4111-8111-111111111111",
+            ExperimentRole.LEAF,
+        )
+        service.delete(resource.subscription_id)
+        service.delete(resource.subscription_id)
+
+        now[0] = 16.0
+
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def delete_expired_tombstone():
+            barrier.wait()
+            try:
+                service.delete(resource.subscription_id)
+            except KeyError:
+                outcomes.append("not-found")
+
+        threads = [threading.Thread(target=delete_expired_tombstone) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert outcomes == ["not-found", "not-found"]
     finally:
         service.close()
 
@@ -635,6 +775,7 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
     context_client = Mock()
     context_client.get.return_value = NwdafContext(
         nf_instance_id=leaf_id,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://leaf.example",
         internal_api_root="http://leaf-internal.example",
         ml_analytics_capabilities=(
@@ -772,6 +913,7 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id=branch_id,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://branch.example",
         internal_api_root="http://branch-internal.example",
         ml_analytics_capabilities=(
@@ -1463,6 +1605,7 @@ def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_pa
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id=metadata.intended_recipient_nf_instance_id,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://branch.example",
         internal_api_root="http://branch-internal.example",
         ml_analytics_capabilities=(
@@ -1627,6 +1770,106 @@ def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
         service.close()
 
 
+def test_go_generation_reset_drops_leaf_result_published_during_abort(tmp_path):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://branch.example/round-input.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    base = round_input_bundle(epochs=1)
+    assignment = hierarchy_assignment(tmp_path, branch=False)
+    plan_id = assignment.contract.hierarchy_metadata.plan_id
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("resource-1", value.ml_correlation_id)
+    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.LEAF)
+    publish_started = threading.Event()
+    allow_publish = threading.Event()
+    workspace = Mock()
+    workspace.download.return_value = Mock()
+
+    def publish_during_abort(**_kwargs):
+        publish_started.set()
+        assert allow_publish.wait(1)
+        return Mock(url="http://leaf.example/local.tar.gz")
+
+    workspace.publish.side_effect = publish_during_abort
+    context = Mock()
+    context.get.return_value.nf_instance_id = (
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        workspace,
+        experiments=registry,
+    )
+    service._loader = Mock()
+    service._loader.load.return_value = base
+    service._dataset_builder = Mock(
+        build=Mock(return_value=Mock(training_scopes=(Mock(training_sample_count=10),)))
+    )
+    service._trainer = Mock(
+        train=Mock(
+            return_value=Mock(
+                model=torch.nn.Linear(2, 1),
+                training_sample_count=10,
+            )
+        )
+    )
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.ROUND_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        dataset_snapshot=Mock(),
+        prepared_training_sample_count=10,
+        expected_model_contract_digest=model_contract_digest(base.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            base.manifest
+        ),
+        hierarchy_assignment=assignment,
+        experiment_reservation_id=reservation.reservation_id,
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    assert service._outbox_capacity.acquire(blocking=False)
+    thread = threading.Thread(
+        target=service._run_round,
+        args=(resource.subscription_id, resource.revision),
+    )
+    thread.start()
+    assert publish_started.wait(1)
+
+    service.abort_generation("containing NWDAF process generation changed")
+    allow_publish.set()
+    thread.join(timeout=1)
+
+    try:
+        assert thread.is_alive() is False
+        service._enqueue_delivery.assert_not_called()
+        workspace.release_plan.assert_called_once_with(plan_id)
+        assert service._capacity.acquire(blocking=False)
+        service._capacity.release()
+    finally:
+        registry.reset_generation()
+        service.close()
+
+
 def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_path):
     payload = preparation_payload()
     payload.update(
@@ -1697,36 +1940,5 @@ def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_pat
             proximal_mu=None,
         )
         assert service.get(resource.subscription_id).state is FLClientState.RESULT_PENDING
-    finally:
-        service.close()
-
-
-def test_restart_terminal_resource_rejects_future_update(tmp_path):
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        Mock(),
-        Mock(),
-        Mock(),
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(preparation_payload())
-    service._resources["resource-1"] = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.FAILED_RESTART,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        restart_terminal=True,
-    )
-    try:
-        try:
-            service.patch(
-                "resource-1",
-                NwdafMLModelTrainSubscPatch.model_validate({"mLTrainRepInfo": {"maxResTime": 600}}),
-            )
-        except RuntimeError as error:
-            assert "NOT_AVAILABLE_FOR_FL_PROCESS_ANYMORE" in str(error)
-        else:
-            raise AssertionError("restart terminal resource accepted an update")
     finally:
         service.close()

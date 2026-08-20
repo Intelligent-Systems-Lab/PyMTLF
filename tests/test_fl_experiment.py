@@ -164,6 +164,25 @@ def test_new_registry_does_not_restore_active_or_retired_state():
     assert replacement.retired_plan_ids() == frozenset()
 
 
+def test_retired_plan_is_pruned_lazily_after_tombstone_ttl():
+    now = [10.0]
+    registry = FLExperimentRegistry(
+        tombstone_ttl_seconds=5,
+        clock=lambda: now[0],
+    )
+    plan_id = str(uuid4())
+    root = registry.reserve_root(plan_id)
+    registry.mark_terminal(root.reservation_id, "COMPLETE")
+    registry.begin_cleanup(root.reservation_id)
+    registry.release(root.reservation_id)
+
+    assert registry.is_retired(plan_id) is True
+    now[0] = 16.0
+
+    assert registry.is_retired(plan_id) is False
+    assert registry.retired_plan_ids() == frozenset()
+
+
 def test_lookup_miss_does_not_create_a_record_and_snapshots_are_immutable():
     registry = FLExperimentRegistry()
 

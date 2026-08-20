@@ -143,10 +143,11 @@ def _node(nf_instance_id: str) -> ResolvedHierarchyNode:
     )
 
 
-def _coordinator(resolver, artifacts, server) -> FLBranchPreparationCoordinator:
+def _coordinator(resolver, artifacts, server, **kwargs) -> FLBranchPreparationCoordinator:
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id=BRANCH,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
         api_root="http://branch.example",
         internal_api_root="http://branch-internal.example",
         ml_analytics_capabilities=(
@@ -161,6 +162,7 @@ def _coordinator(resolver, artifacts, server) -> FLBranchPreparationCoordinator:
         nwdaf_context=context,
         artifact_service=artifacts,
         server=server,
+        **kwargs,
     )
 
 
@@ -284,6 +286,50 @@ def test_parent_cancellation_fences_pre_dispatch_publication(tmp_path):
     artifacts.republish_leaf_assignment.assert_not_called()
     artifacts.publish_preparation_result.assert_not_called()
     server.start_hierarchy_preparation.assert_not_called()
+
+
+def test_go_generation_reset_discards_branch_mappings_without_closing(tmp_path):
+    server = Mock()
+    coordinator = _coordinator(Mock(), Mock(), server)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=_assignment(tmp_path),
+        leaf_nodes=(_node(LEAF_A),),
+        leaf_assignments=(Mock(),),
+        process_id="lower-process",
+    )
+    coordinator._rounds[(PLAN, "upper-process", 0)] = Mock()
+    coordinator._cancelled_plan_ids[PLAN] = 9999999999
+
+    coordinator.abort_generation("containing NWDAF process generation changed")
+
+    assert coordinator._executions == {}
+    assert coordinator._rounds == {}
+    assert coordinator._cancelled_plan_ids == {}
+    assert coordinator._closing is False
+    server.cancel_hierarchy_preparation.assert_called_once_with(
+        "lower-process",
+        "containing NWDAF process generation changed",
+    )
+
+
+def test_cancelled_branch_plan_tombstone_is_pruned_lazily():
+    now = [10.0]
+    coordinator = _coordinator(
+        Mock(),
+        Mock(),
+        Mock(),
+        tombstone_ttl_seconds=5,
+        clock=lambda: now[0],
+    )
+    coordinator.cancel(PLAN, "parent cancelled")
+
+    with pytest.raises(BranchPreparationCancelled):
+        coordinator._ensure_dispatch_active(PLAN)
+
+    now[0] = 16.0
+
+    coordinator._ensure_dispatch_active(PLAN)
 
 
 def test_parent_cancellation_after_upper_validation_fences_lower_round_publication(

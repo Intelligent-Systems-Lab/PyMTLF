@@ -30,6 +30,8 @@ from py_mtlf.core.fl_artifacts import (
     wape,
 )
 from py_mtlf.core.fl_experiment import (
+    ExperimentAdmissionClosedError,
+    ExperimentLifecycle,
     ExperimentRegistryError,
     FLExperimentRegistry,
 )
@@ -137,6 +139,7 @@ class FLParticipant:
 class FLProcess:
     process_id: str
     intent: RetrainIntent | None
+    generation: int = 0
     state: FLServerState = FLServerState.CREATED
     participants: list[FLParticipant] = field(default_factory=list)
     current_global_url: str = ""
@@ -346,6 +349,7 @@ class FLServerEngine:
         self._lock = threading.RLock()
         self._processes: dict[str, FLProcess] = {}
         self._correlations: dict[str, str] = {}
+        self._generation = 0
         self._executor = ThreadPoolExecutor(
             max_workers=server_settings.max_active_processes,
             thread_name_prefix="fl-server",
@@ -368,14 +372,60 @@ class FLServerEngine:
         if self._owns_client:
             self._client.close()
 
+    def abort_generation(self, reason: str) -> None:
+        """Discard all Training processes owned by the previous Go lifetime."""
+        with self._lock:
+            self._generation += 1
+            processes = tuple(self._processes.values())
+        for process in processes:
+            with process.condition:
+                process.state = FLServerState.FAILED
+                if not process.failure:
+                    process.failure = reason
+                process.condition.notify_all()
+        for process in processes:
+            if process.hierarchy_plan_id:
+                self.close_hierarchy_training(
+                    process.process_id,
+                    retain_for_adoption=False,
+                )
+            else:
+                for participant in process.participants:
+                    if participant.resource_location:
+                        failure = self._cleanup_participant(process, participant)
+                        if failure:
+                            process.cleanup_failure = (
+                                f"{process.cleanup_failure}; {failure}".strip("; ")
+                            )
+                        participant.resource_location = ""
+                if process.intent is not None:
+                    self._policy.complete_retrain(process.intent.family_key)
+        with self._lock:
+            self._processes.clear()
+            self._correlations.clear()
+
     def accept_policy_intents(self) -> None:
         if self._closing.is_set():
             return
+        with self._lock:
+            generation = self._generation
         for intent in self._policy.take_intents():
-            process = FLProcess(process_id=str(uuid4()), intent=intent)
+            with self._lock:
+                stale_generation = generation != self._generation
+            if stale_generation:
+                self._policy.complete_retrain(intent.family_key)
+                continue
+            process = FLProcess(
+                process_id=str(uuid4()),
+                intent=intent,
+                generation=generation,
+            )
             try:
                 reservation = self._experiments.reserve_server(process.process_id)
                 process.experiment_reservation_id = reservation.reservation_id
+            except ExperimentAdmissionClosedError:
+                self._policy.complete_retrain(intent.family_key)
+                continue
             except ExperimentRegistryError as error:
                 process.state = FLServerState.FAILED
                 process.failure = str(error)
@@ -384,18 +434,26 @@ class FLServerEngine:
                 self._policy.complete_retrain(intent.family_key)
                 continue
             with self._lock:
-                self._processes[process.process_id] = process
-                active = sum(
-                    item.state
-                    not in {
-                        FLServerState.CANDIDATE_READY,
-                        FLServerState.VALIDATION_REJECTED,
-                        FLServerState.CUTOVER_PENDING,
-                        FLServerState.COMPLETE,
-                        FLServerState.FAILED,
-                    }
-                    for item in self._processes.values()
-                )
+                stale_generation = process.generation != self._generation
+                if not stale_generation:
+                    self._processes[process.process_id] = process
+                    active = sum(
+                        item.state
+                        not in {
+                            FLServerState.CANDIDATE_READY,
+                            FLServerState.VALIDATION_REJECTED,
+                            FLServerState.CUTOVER_PENDING,
+                            FLServerState.COMPLETE,
+                            FLServerState.FAILED,
+                        }
+                        for item in self._processes.values()
+                    )
+            if stale_generation:
+                process.state = FLServerState.FAILED
+                process.failure = "containing NWDAF process generation changed"
+                self._finish_experiment(process)
+                self._policy.complete_retrain(intent.family_key)
+                continue
             if active > self._server_settings.max_active_processes:
                 process.state = FLServerState.FAILED
                 process.failure = "FL Server process capacity is exhausted"
@@ -428,8 +486,10 @@ class FLServerEngine:
         targets: tuple[HierarchyPreparationTarget, ...],
         active_scopes: tuple[ScopeReference, ...] = (),
     ) -> FLProcess:
-        if self._closing.is_set():
-            raise RuntimeError("FL Server is closing")
+        with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("FL Server is closing")
+            generation = self._generation
         if not targets:
             raise ValueError("hierarchy preparation requires at least one participant target")
         participant_ids = tuple(item.participant_nf_instance_id for item in targets)
@@ -450,6 +510,7 @@ class FLServerEngine:
         process = FLProcess(
             process_id=str(uuid4()),
             intent=None,
+            generation=generation,
             experiment_reservation_id=reservation_id,
             hierarchy_plan_id=plan_id,
             hierarchy_family_key=family_key,
@@ -472,19 +533,28 @@ class FLServerEngine:
             for target in targets
         ]
         with self._lock:
-            self._processes[process.process_id] = process
-            for participant in process.participants:
-                self._correlations[participant.notification_correlation_id] = process.process_id
+            stale_generation = generation != self._generation
+            if not stale_generation:
+                self._processes[process.process_id] = process
+                for participant in process.participants:
+                    self._correlations[participant.notification_correlation_id] = (
+                        process.process_id
+                    )
+        if stale_generation:
+            self._experiments.detach_server(reservation_id, process.process_id)
+            raise RuntimeError("containing NWDAF process generation changed")
 
         try:
             process.state = FLServerState.PREPARATION_CREATING
             for participant, target in zip(process.participants, targets, strict=True):
+                self._ensure_process_generation(process)
                 self._create_preparation(
                     process,
                     participant,
                     model_interoperability,
                     target.assignment_url,
                 )
+            self._ensure_process_generation(process)
             process.state = FLServerState.PREPARATION_WAITING
             logger.info(
                 "Hierarchy preparation dispatched plan_id=%s process_id=%s participants=%s",
@@ -497,27 +567,57 @@ class FLServerEngine:
             process.state = FLServerState.FAILED
             process.failure = str(error)
             self._cleanup_hierarchy_process(process)
-            self._experiments.detach_server(reservation_id, process.process_id)
+            if self._experiments.for_server_process(process.process_id) is not None:
+                self._experiments.detach_server(reservation_id, process.process_id)
+            with self._lock:
+                self._processes.pop(process.process_id, None)
             raise
 
     def cancel_hierarchy_preparation(self, process_id: str, reason: str) -> None:
         with self._lock:
             process = self._processes.get(process_id)
-        if process is None or not process.hierarchy_plan_id:
+        if process is None:
+            return
+        if not process.hierarchy_plan_id:
             raise KeyError(process_id)
         with process.condition:
             process.state = FLServerState.FAILED
             if not process.failure:
                 process.failure = reason
             process.condition.notify_all()
-        if not process.hierarchy_cleanup_complete:
-            self._cleanup_hierarchy_process(process)
+        self.close_hierarchy_training(process_id, retain_for_adoption=False)
+
+    def close_hierarchy_training(
+        self,
+        process_id: str,
+        *,
+        retain_for_adoption: bool,
+    ) -> None:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None:
+            return
+        if not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        self._cleanup_hierarchy_process(process)
         active = self._experiments.for_server_process(process.process_id)
         if active is not None:
             self._experiments.detach_server(
                 process.experiment_reservation_id,
                 process.process_id,
             )
+        with self._lock:
+            if not retain_for_adoption:
+                self._processes.pop(process_id, None)
+            else:
+                # Adoption completion only needs the published model/family and
+                # Root observer; drop the completed Training procedure payload.
+                process.participants.clear()
+                process.hierarchy_active_scopes = ()
+                process.current_global_url = ""
+                process.candidate_url = ""
+                process.candidate_artifact = None
+                process.validation_summaries = ()
 
     def receive_notification(self, notification: NwdafMLModelTrainNotif) -> None:
         with self._lock:
@@ -715,14 +815,6 @@ class FLServerEngine:
                 process.condition.notify_all()
                 raise ValueError(failure)
             process.condition.notify_all()
-
-    def discard_restored_routes(self, subscription_ids: tuple[str, ...]) -> None:
-        if not subscription_ids:
-            return
-        future = self._executor.submit(self._delete_restored_routes, subscription_ids)
-        with self._lock:
-            self._futures.add(future)
-        future.add_done_callback(self._future_done)
 
     def processes(self) -> tuple[FLProcess, ...]:
         with self._lock:
@@ -1309,6 +1401,7 @@ class FLServerEngine:
                         process.current_global_url,
                         process.process_id,
                         f"round-{round_indicator}-global-source",
+                        owner_plan_id=process.hierarchy_plan_id or None,
                     )
                 )
                 source_bundle = self._loader.load(source_artifact)
@@ -1318,6 +1411,7 @@ class FLServerEngine:
                     round_indicator=round_indicator,
                     base=source_bundle,
                     epochs=self._server_settings.client_training.epochs,
+                    owner_plan_id=process.hierarchy_plan_id or None,
                 )
                 process.state = FLServerState.ROUND_DISPATCH
                 for participant in process.participants:
@@ -1468,11 +1562,22 @@ class FLServerEngine:
         reservation_id = process.experiment_reservation_id
         if not reservation_id:
             return
-        self._experiments.mark_terminal(reservation_id, process.state.value)
-        self._experiments.begin_cleanup(reservation_id)
+        active = self._experiments.active()
+        if active is None or active.reservation_id != reservation_id:
+            return
+        if active.lifecycle in {ExperimentLifecycle.PROVISIONAL, ExperimentLifecycle.ACTIVE}:
+            active = self._experiments.mark_terminal(reservation_id, process.state.value)
+        if active.lifecycle is ExperimentLifecycle.TERMINAL:
+            self._experiments.begin_cleanup(reservation_id)
 
     def _release_experiment(self, process: FLProcess) -> None:
-        if process.experiment_reservation_id:
+        active = self._experiments.active()
+        if (
+            process.experiment_reservation_id
+            and active is not None
+            and active.reservation_id == process.experiment_reservation_id
+            and active.lifecycle is ExperimentLifecycle.CLEANING
+        ):
             self._experiments.release(process.experiment_reservation_id)
 
     def _finish_experiment(self, process: FLProcess) -> None:
@@ -1544,6 +1649,12 @@ class FLServerEngine:
         participant.expected_scope_digest = TrainingScopeDescriptor.from_training_request(
             value, 0
         ).scope_digest
+        with process.condition:
+            aborted = bool(process.failure)
+        if aborted:
+            self._cleanup_participant(process, participant)
+            participant.resource_location = ""
+            raise RuntimeError(process.failure)
 
     def _patch_round(
         self,
@@ -1685,6 +1796,13 @@ class FLServerEngine:
             if process.failure:
                 raise RuntimeError(process.failure)
 
+    def _ensure_process_generation(self, process: FLProcess) -> None:
+        with self._lock:
+            current = process.generation == self._generation
+        if not current:
+            raise RuntimeError("containing NWDAF process generation changed")
+        self._raise_if_failed(process)
+
     @staticmethod
     def _set_hierarchy_state(
         process: FLProcess,
@@ -1759,6 +1877,7 @@ class FLServerEngine:
             round_input_url,
             process.process_id,
             f"round-{round_indicator}-input-for-aggregation",
+            owner_plan_id=process.hierarchy_plan_id or None,
         )
         base = self._loader.load(base_artifact)
         input_contract = validate_fl_artifact(_artifact_projection(base.manifest))
@@ -1796,6 +1915,7 @@ class FLServerEngine:
                 str(address.model_url),
                 process.process_id,
                 f"round-{round_indicator}-{participant.candidate.target.nf_instance_id}",
+                owner_plan_id=process.hierarchy_plan_id or None,
             )
             bundle = self._loader.load(artifact)
             projection = _artifact_projection(bundle.manifest)
@@ -1851,6 +1971,7 @@ class FLServerEngine:
             role="ROUND_GLOBAL",
             base=base,
             model=aggregate,
+            owner_plan_id=process.hierarchy_plan_id or None,
             metadata={
                 "artifact_role": "ROUND_GLOBAL",
                 "fl_metadata": {
@@ -1880,6 +2001,7 @@ class FLServerEngine:
             process.candidate_url,
             process.process_id,
             "final-validation-candidate",
+            owner_plan_id=process.hierarchy_plan_id or None,
         )
         base = self._loader.load(base_artifact)
         candidate = self._loader.load(candidate_artifact)
@@ -1906,6 +2028,7 @@ class FLServerEngine:
                 str(address.model_url),
                 process.process_id,
                 f"validation-{participant.candidate.target.nf_instance_id}",
+                owner_plan_id=process.hierarchy_plan_id or None,
             )
             bundle = self._loader.load(artifact)
             contract = validate_fl_artifact(_artifact_projection(bundle.manifest))
@@ -2040,6 +2163,7 @@ class FLServerEngine:
                 str(address.model_url),
                 process.process_id,
                 f"validation-{participant.candidate.target.nf_instance_id}",
+                owner_plan_id=process.hierarchy_plan_id or None,
             )
             bundle = self._loader.load(artifact)
             contract = validate_fl_artifact(_artifact_projection(bundle.manifest))
@@ -2203,33 +2327,6 @@ class FLServerEngine:
     def _future_done(self, future: Future) -> None:
         with self._lock:
             self._futures.discard(future)
-
-    def _delete_restored_routes(self, subscription_ids: tuple[str, ...]) -> None:
-        base = self._go_base()
-        for subscription_id in subscription_ids:
-            last_error = ""
-            for attempt in range(self._server_settings.cleanup.max_attempts):
-                try:
-                    response = self._client.delete(
-                        base + "/internal/v1/ml-model-training/subscriptions/" + subscription_id
-                    )
-                    if response.status_code in {204, 404}:
-                        last_error = ""
-                        break
-                    last_error = f"status {response.status_code}"
-                except httpx.TransportError as error:
-                    last_error = str(error)
-                if attempt + 1 < self._server_settings.cleanup.max_attempts and self._closing.wait(
-                    self._server_settings.cleanup.retry_backoff_seconds
-                ):
-                    break
-            if last_error:
-                logger.warning(
-                    "Restored outbound FL route cleanup failed route=%s error=%s",
-                    subscription_id,
-                    last_error,
-                )
-
 
 def _assign(
     scopes: tuple[ScopeReference, ...],

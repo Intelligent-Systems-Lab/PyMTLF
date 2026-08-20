@@ -6,10 +6,13 @@ import os
 import shutil
 import tarfile
 import tempfile
+import threading
 import time
+from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
 import httpx
@@ -81,6 +84,30 @@ class ValidatedHierarchyArtifact:
     contract: HierarchyAssignmentArtifact | HierarchyPreparationResultArtifact
 
 
+class FLArtifactReader:
+    def __init__(self, workspace: "FLWorkspace", path: Path, stream: BinaryIO) -> None:
+        self._workspace = workspace
+        self._path = path
+        self._stream = stream
+        self._closed = False
+
+    def iter_bytes(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        try:
+            while chunk := self._stream.read(chunk_size):
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.close()
+        finally:
+            self._workspace._release_reader(self._path)
+
+
 class FLWorkspace:
     def __init__(
         self,
@@ -96,10 +123,27 @@ class FLWorkspace:
             follow_redirects=False,
         )
         self._owns_client = client is None
+        self._lock = threading.RLock()
+        self._owned_directories: dict[str, set[Path]] = {}
+        self._released_plan_ids: dict[str, float] = {}
+        self._pending_release: set[Path] = set()
+        self._cleanup_failures: dict[Path, float] = {}
+        self._active_readers: dict[Path, int] = {}
 
     def open(self) -> None:
-        self._root.mkdir(parents=True, exist_ok=True)
-        self.cleanup_expired()
+        self._validate_workspace_root()
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            for child in tuple(self._root.iterdir()):
+                self._delete_direct_child(child)
+        except (OSError, FLWorkspaceError) as error:
+            raise FLWorkspaceError("FL workspace startup cleanup failed") from error
+        with self._lock:
+            self._owned_directories.clear()
+            self._released_plan_ids.clear()
+            self._pending_release.clear()
+            self._cleanup_failures.clear()
+            self._active_readers.clear()
 
     def close(self) -> None:
         if self._owns_client:
@@ -115,11 +159,19 @@ class FLWorkspace:
                             shutil.rmtree(staged, ignore_errors=True)
                         else:
                             staged.unlink(missing_ok=True)
-                continue
-            if child.is_dir() and child.stat().st_mtime < cutoff:
-                shutil.rmtree(child, ignore_errors=True)
+        self._retry_cleanup_failures(cutoff=cutoff)
+        with self._lock:
+            self._prune_released_plans_locked()
 
-    def download(self, url: str, process_id: str, label: str) -> ArtifactMetadata:
+    def download(
+        self,
+        url: str,
+        process_id: str,
+        label: str,
+        *,
+        owner_plan_id: str | None = None,
+    ) -> ArtifactMetadata:
+        self.cleanup_expired()
         allowed = set(self._settings.artifact_download.allowed_origins)
         origin = _origin(url)
         if allowed and origin not in allowed:
@@ -147,12 +199,15 @@ class FLWorkspace:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-        return ArtifactMetadata(
+        artifact = ArtifactMetadata(
             key=digest.hexdigest(),
             size_bytes=size,
             path=path,
             url=url,
         )
+        if owner_plan_id is not None:
+            self._register_owned_directory(owner_plan_id, directory.parent)
+        return artifact
 
     def download_hierarchy(
         self,
@@ -202,6 +257,7 @@ class FLWorkspace:
         intended_recipient_nf_instance_id: str,
         expected_plan_id: str | None,
     ) -> ValidatedHierarchyArtifact:
+        self.cleanup_expired()
         if expected_role not in {
             ArtifactRole.HIERARCHY_ASSIGNMENT,
             ArtifactRole.HIERARCHY_PREPARATION_RESULT,
@@ -335,6 +391,7 @@ class FLWorkspace:
                 path=destination,
                 url=url,
             )
+            self._register_owned_directory(metadata.plan_id, directory.parent)
             return ValidatedHierarchyArtifact(
                 metadata=artifact_metadata,
                 manifest=validated.manifest,
@@ -348,15 +405,51 @@ class FLWorkspace:
             _remove_hierarchy_staging(temporary)
 
     def release_plan(self, plan_id: str) -> None:
+        self.cleanup_expired()
         normalized = normalize_plan_id(plan_id)
-        directory = self._root / normalized
+        plan_directory = self._direct_child(normalized)
+        with self._lock:
+            self._prune_released_plans_locked()
+            self._released_plan_ids[normalized] = (
+                time.monotonic() + self._settings.lifecycle.tombstone_ttl_seconds
+            )
+            directories = self._owned_directories.pop(normalized, set())
+            directories.add(plan_directory)
+            self._pending_release.update(directories)
+        failures = self._release_directories(directories)
+        if failures:
+            raise FLWorkspaceError("FL plan workspace release failed")
+
+    def reset_generation(self) -> None:
+        """Release every scratch artifact owned by the previous containing Go boot."""
+        if not self._root.exists():
+            with self._lock:
+                self._owned_directories.clear()
+                self._pending_release.clear()
+                self._cleanup_failures.clear()
+            return
         try:
-            if directory.is_file():
-                raise FLWorkspaceError("FL plan workspace path is not a directory")
-            with suppress(FileNotFoundError):
-                shutil.rmtree(directory)
-        except OSError as error:
-            raise FLWorkspaceError("FL plan workspace release failed") from error
+            directories = {
+                self._direct_child(child.name)
+                for child in self._root.iterdir()
+            }
+        except (OSError, FLWorkspaceError) as error:
+            raise FLWorkspaceError("FL workspace generation reset failed") from error
+        with self._lock:
+            self._owned_directories.clear()
+            self._pending_release.update(directories)
+        failures = self._release_directories(directories)
+        if failures:
+            raise FLWorkspaceError("FL workspace generation reset failed")
+
+    def claim_artifact(self, owner_plan_id: str, artifact: ArtifactMetadata) -> None:
+        try:
+            relative = artifact.path.resolve().relative_to(self._root.resolve())
+        except ValueError as error:
+            raise FLWorkspaceError("FL artifact is outside the workspace") from error
+        if len(relative.parts) < 2:
+            raise FLWorkspaceError("FL artifact has no process directory")
+        self._register_owned_directory(owner_plan_id, self._root / relative.parts[0])
 
     def republish_validation_candidate(
         self,
@@ -424,6 +517,7 @@ class FLWorkspace:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+        self._register_owned_directory(normalized_plan, directory.parents[2])
 
         base_url = self._settings.public_base_url.rstrip("/")
         url = (
@@ -523,7 +617,9 @@ class FLWorkspace:
         base: LoadedBundle,
         model: torch.nn.Module,
         metadata: dict[str, object],
+        owner_plan_id: str | None = None,
     ) -> FLWorkspaceArtifact:
+        self.cleanup_expired()
         weights = np.empty(len(model.state_dict()), dtype=object)
         weights[:] = [value.detach().cpu().numpy() for value in model.state_dict().values()]
         weights_stream = io.BytesIO()
@@ -581,6 +677,8 @@ class FLWorkspace:
             raise FLWorkspaceError(
                 "FL artifact publication workspace operation failed"
             ) from error
+        if owner_plan_id is not None:
+            self._register_owned_directory(owner_plan_id, directory.parents[2])
         base_url = self._settings.public_base_url.rstrip("/")
         url = (
             f"{base_url}/internal/v1/fl-artifacts/{quote(_safe(process_id))}/"
@@ -606,6 +704,7 @@ class FLWorkspace:
         round_indicator: int,
         base: LoadedBundle,
         epochs: int,
+        owner_plan_id: str | None = None,
     ) -> FLWorkspaceArtifact:
         return self.publish(
             process_id=process_id,
@@ -614,6 +713,7 @@ class FLWorkspace:
             role="ROUND_INPUT",
             base=base,
             model=base.model,
+            owner_plan_id=owner_plan_id,
             metadata={
                 "artifact_role": "ROUND_INPUT",
                 "fl_metadata": {
@@ -648,7 +748,141 @@ class FLWorkspace:
             / _safe(role)
             / f"{digest}.tar.gz"
         )
-        return path if path.is_file() else None
+        with self._lock:
+            if self._is_pending_release(path):
+                return None
+            return path if path.is_file() else None
+
+    def open_artifact(
+        self,
+        process_id: str,
+        participant_id: str,
+        round_indicator: int,
+        role: str,
+        digest: str,
+    ) -> FLArtifactReader | None:
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            return None
+        path = (
+            self._root
+            / _safe(process_id)
+            / _safe(participant_id)
+            / str(round_indicator)
+            / _safe(role)
+            / f"{digest}.tar.gz"
+        )
+        with self._lock:
+            if self._is_pending_release(path):
+                return None
+            try:
+                stream = path.open("rb")
+            except (OSError, FLWorkspaceError):
+                return None
+            self._active_readers[path] = self._active_readers.get(path, 0) + 1
+        return FLArtifactReader(self, path, stream)
+
+    def _register_owned_directory(self, plan_id: str, directory: Path) -> None:
+        normalized = normalize_plan_id(plan_id)
+        direct_child = self._direct_child(directory.name)
+        if directory.resolve() != direct_child:
+            raise FLWorkspaceError("FL artifact ownership path is not a direct workspace child")
+        with self._lock:
+            self._prune_released_plans_locked()
+            released = normalized in self._released_plan_ids
+            if released:
+                self._pending_release.add(direct_child)
+            if direct_child in self._pending_release:
+                error = FLWorkspaceError("FL artifact owner was already released")
+            else:
+                self._owned_directories.setdefault(normalized, set()).add(direct_child)
+                return
+        self._release_directories({direct_child})
+        raise error
+
+    def _prune_released_plans_locked(self) -> None:
+        now = time.monotonic()
+        self._released_plan_ids = {
+            plan_id: deadline
+            for plan_id, deadline in self._released_plan_ids.items()
+            if deadline > now
+        }
+
+    def _release_reader(self, path: Path) -> None:
+        with self._lock:
+            count = self._active_readers.get(path, 0)
+            if count <= 1:
+                self._active_readers.pop(path, None)
+            else:
+                self._active_readers[path] = count - 1
+            ready = {
+                directory
+                for directory in self._pending_release
+                if not self._has_active_reader(directory)
+            }
+        self._release_directories(ready)
+
+    def _release_directories(self, directories: set[Path]) -> set[Path]:
+        failures: set[Path] = set()
+        for directory in directories:
+            with self._lock:
+                if self._has_active_reader(directory):
+                    continue
+            try:
+                self._delete_direct_child(directory)
+            except (OSError, FLWorkspaceError):
+                failures.add(directory)
+                with self._lock:
+                    self._cleanup_failures[directory] = time.time()
+                continue
+            with self._lock:
+                self._pending_release.discard(directory)
+                self._cleanup_failures.pop(directory, None)
+        return failures
+
+    def _retry_cleanup_failures(self, *, cutoff: float | None = None) -> None:
+        threshold = time.time() if cutoff is None else cutoff
+        with self._lock:
+            ready = {
+                path
+                for path, failed_at in self._cleanup_failures.items()
+                if failed_at <= threshold and not self._has_active_reader(path)
+            }
+        self._release_directories(ready)
+
+    def _has_active_reader(self, directory: Path) -> bool:
+        return any(
+            count > 0 and path.is_relative_to(directory)
+            for path, count in self._active_readers.items()
+        )
+
+    def _is_pending_release(self, path: Path) -> bool:
+        return any(path.is_relative_to(directory) for directory in self._pending_release)
+
+    def _direct_child(self, name: str) -> Path:
+        child = (self._root / name).resolve()
+        root = self._root.resolve()
+        if child.parent != root:
+            raise FLWorkspaceError("FL workspace path is not a direct child")
+        return child
+
+    def _delete_direct_child(self, child: Path) -> None:
+        direct_child = self._direct_child(child.name)
+        if child.resolve() != direct_child:
+            raise FLWorkspaceError("FL workspace cleanup target is not a direct child")
+        if direct_child.is_dir():
+            shutil.rmtree(direct_child)
+        else:
+            direct_child.unlink(missing_ok=True)
+
+    def _validate_workspace_root(self) -> None:
+        root = self._root.resolve()
+        repository_root = Path(__file__).resolve().parents[3]
+        if (
+            root == Path(root.anchor)
+            or Path.cwd().resolve().is_relative_to(root)
+            or repository_root.is_relative_to(root)
+        ):
+            raise FLWorkspaceError("FL workspace root is unsafe")
 
 
 def model_contract_digest(manifest: dict[str, object]) -> str:

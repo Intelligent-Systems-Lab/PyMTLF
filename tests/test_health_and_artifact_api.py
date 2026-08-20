@@ -1,16 +1,23 @@
 import hashlib
+from unittest.mock import Mock
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
-from nwdaf_context import verified_capability_checker
+from nwdaf_context import context_client, verified_capability_checker
 
 from py_mtlf.app import create_app
+from py_mtlf.core.fl_workspace import FLWorkspaceError
 from py_mtlf.core.nwdaf_context import CapabilityVerification
 
 
 def test_health_is_ready_after_startup(settings):
     with TestClient(
-        create_app(settings, capability_checker=verified_capability_checker())
+        create_app(
+            settings,
+            capability_checker=verified_capability_checker(),
+            nwdaf_context_client=context_client(),
+        )
     ) as client:
         assert client.get("/health/live").status_code == 404
         assert client.post("/internal/v1/sync", json={}).status_code == 404
@@ -22,15 +29,61 @@ def test_health_is_ready_after_startup(settings):
 
 
 def test_app_supports_repeated_startup_and_shutdown(settings):
-    app = create_app(settings, capability_checker=verified_capability_checker())
+    app = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
+    )
 
     for _ in range(2):
         with TestClient(app) as client:
             assert client.get("/health/ready").status_code == 200
 
 
+def test_new_app_lifetime_uses_fresh_backend_process_instance_id(settings):
+    first = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
+    )
+    with TestClient(first) as client:
+        first_id = client.get("/health/ready").json()["processInstanceId"]
+
+    second = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
+    )
+    with TestClient(second) as client:
+        second_id = client.get("/health/ready").json()["processInstanceId"]
+
+    assert first_id != second_id
+
+
+def test_workspace_startup_cleanup_failure_prevents_app_startup(settings):
+    stale = settings.federated_learning.workspace_root / "stale" / "artifact"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"old")
+    app = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
+    )
+    app.state.fl_workspace._delete_direct_child = Mock(side_effect=OSError("busy"))
+
+    with (
+        pytest.raises(FLWorkspaceError, match="startup cleanup failed"),
+        TestClient(app),
+    ):
+        pass
+
+
 def test_readiness_detects_artifact_storage_failure(settings, monkeypatch):
-    app = create_app(settings, capability_checker=verified_capability_checker())
+    app = create_app(
+        settings,
+        capability_checker=verified_capability_checker(),
+        nwdaf_context_client=context_client(),
+    )
     with TestClient(app) as client:
 
         def fail_probe():
@@ -72,11 +125,17 @@ def test_readiness_recovers_after_capability_unavailable_and_mismatch(settings):
             ),
         ]
     )
-    app = create_app(settings, capability_checker=checker)
+    app = create_app(
+        settings,
+        capability_checker=checker,
+        nwdaf_context_client=context_client(),
+    )
 
     with TestClient(app) as client:
         unavailable = client.get("/health/ready")
+        app.state.generation_monitor.refresh_once()
         mismatch = client.get("/health/ready")
+        app.state.generation_monitor.refresh_once()
         recovered = client.get("/health/ready")
 
     assert unavailable.status_code == 503
@@ -137,10 +196,9 @@ def test_hierarchy_fl_artifact_uses_existing_serving_route(settings, bundle_path
         / role
         / f"{digest}.tar.gz"
     )
-    path.parent.mkdir(parents=True)
-    path.write_bytes(content)
-
     with TestClient(create_app(settings)) as client:
+        path.parent.mkdir(parents=True)
+        path.write_bytes(content)
         response = client.get(
             f"/internal/v1/fl-artifacts/{process_id}/{participant_id}/0/{role}/{digest}"
         )

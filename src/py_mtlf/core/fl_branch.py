@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
@@ -119,7 +120,11 @@ class FLBranchPreparationCoordinator:
         nwdaf_context: NwdafContextClient,
         artifact_service: HierarchyArtifactService,
         server: FLServerEngine,
+        tombstone_ttl_seconds: int = 3600,
+        clock=time.monotonic,
     ) -> None:
+        if tombstone_ttl_seconds <= 0:
+            raise ValueError("tombstone_ttl_seconds must be positive")
         self._resolver = resolver
         self._nwdaf_context = nwdaf_context
         self._artifact_service = artifact_service
@@ -132,7 +137,9 @@ class FLBranchPreparationCoordinator:
             tuple[str, str, int], BranchValidationExecution
         ] = {}
         self._next_lower_round: dict[str, int] = {}
-        self._cancelled_plan_ids: set[str] = set()
+        self._cancelled_plan_ids: dict[str, float] = {}
+        self._tombstone_ttl_seconds = tombstone_ttl_seconds
+        self._clock = clock
         self._closing = False
 
     def dispatch(
@@ -150,7 +157,7 @@ class FLBranchPreparationCoordinator:
         ):
             raise ValueError("Branch coordinator requires a BRANCH_ASSIGNMENT")
         event = representation.ml_event_subscriptions[0]
-        context = self._nwdaf_context.get(refresh=True)
+        context = self._nwdaf_context.get()
         if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
             raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
         if not any(
@@ -162,6 +169,7 @@ class FLBranchPreparationCoordinator:
                 "containing NWDAF does not advertise the required Branch capability"
             )
         with self._lock:
+            self._prune_cancelled_locked()
             if self._closing:
                 raise RuntimeError("Branch preparation coordinator is closing")
             if metadata.plan_id in self._cancelled_plan_ids:
@@ -241,6 +249,7 @@ class FLBranchPreparationCoordinator:
             process_id=process.process_id,
         )
         with self._lock:
+            self._prune_cancelled_locked()
             if self._closing or metadata.plan_id in self._cancelled_plan_ids:
                 self._server.cancel_hierarchy_preparation(
                     process.process_id,
@@ -376,7 +385,7 @@ class FLBranchPreparationCoordinator:
         parent_budget = report.maximum_response_time if report is not None else None
         if parent_budget is None or parent_budget <= callback_margin_seconds:
             raise RuntimeError("Branch upper round budget cannot contain lower execution")
-        context = self._nwdaf_context.get(refresh=True)
+        context = self._nwdaf_context.get()
         if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
             raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
         epochs = _round_epochs(upper_input)
@@ -434,6 +443,7 @@ class FLBranchPreparationCoordinator:
                 if current is None:
                     raise RuntimeError("Branch round mapping disappeared")
                 lower_input = self._artifact_service.publish_round_input(
+                    plan_id=execution.plan_id,
                     base=upper_input,
                     process_id=execution.process_id,
                     server_nf_instance_id=context.nf_instance_id,
@@ -465,6 +475,7 @@ class FLBranchPreparationCoordinator:
                 upper_result = self._artifact_service.publish_hierarchy_aggregate(
                     upper_input=upper_input,
                     lower_global=lower_global,
+                    plan_id=execution.plan_id,
                     upper_process_id=upper_process_id,
                     branch_nf_instance_id=context.nf_instance_id,
                     upper_round_indicator=upper_round,
@@ -516,7 +527,7 @@ class FLBranchPreparationCoordinator:
         parent_budget = report.maximum_response_time if report is not None else None
         if parent_budget is None or parent_budget <= callback_margin_seconds:
             raise RuntimeError("Branch upper validation budget cannot contain lower execution")
-        context = self._nwdaf_context.get(refresh=True)
+        context = self._nwdaf_context.get()
         if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
             raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
         key = (metadata.plan_id, upper_process_id, upper_round)
@@ -602,6 +613,7 @@ class FLBranchPreparationCoordinator:
                     raise RuntimeError("Branch validation mapping disappeared")
                 upper_result = self._artifact_service.publish_hierarchy_validation_result(
                     upper_candidate=upper_candidate,
+                    plan_id=metadata.plan_id,
                     upper_process_id=upper_process_id,
                     branch_nf_instance_id=context.nf_instance_id,
                     upper_round_indicator=upper_round,
@@ -672,6 +684,7 @@ class FLBranchPreparationCoordinator:
 
     def _ensure_dispatch_active(self, plan_id: str) -> None:
         with self._lock:
+            self._prune_cancelled_locked()
             if self._closing:
                 raise BranchPreparationCancelled(
                     "Branch preparation coordinator is closing"
@@ -681,7 +694,10 @@ class FLBranchPreparationCoordinator:
 
     def cancel(self, plan_id: str, reason: str) -> None:
         with self._condition:
-            self._cancelled_plan_ids.add(plan_id)
+            self._prune_cancelled_locked()
+            self._cancelled_plan_ids[plan_id] = (
+                self._clock() + self._tombstone_ttl_seconds
+            )
             execution = self._executions.pop(plan_id, None)
             self._rounds = {
                 key: value for key, value in self._rounds.items() if key[0] != plan_id
@@ -700,7 +716,10 @@ class FLBranchPreparationCoordinator:
         with self._condition:
             self._closing = True
             executions = tuple(self._executions.values())
-            self._cancelled_plan_ids.update(self._executions)
+            deadline = self._clock() + self._tombstone_ttl_seconds
+            self._cancelled_plan_ids.update(
+                {plan_id: deadline for plan_id in self._executions}
+            )
             self._executions.clear()
             self._rounds.clear()
             self._validations.clear()
@@ -712,6 +731,32 @@ class FLBranchPreparationCoordinator:
                 "Branch preparation coordinator is closing",
             )
         self._resolver.close()
+
+    def abort_generation(self, reason: str) -> None:
+        """Discard paired upper/lower state without closing the coordinator."""
+        with self._condition:
+            executions = tuple(self._executions.values())
+            self._executions.clear()
+            self._rounds.clear()
+            self._validations.clear()
+            self._next_lower_round.clear()
+            self._cancelled_plan_ids.clear()
+            self._condition.notify_all()
+        for execution in executions:
+            try:
+                self._server.cancel_hierarchy_preparation(execution.process_id, reason)
+            except RuntimeError:
+                # Continue clearing every local mapping; the app-level Server abort
+                # retries process cleanup after the Branch ownership pass.
+                continue
+
+    def _prune_cancelled_locked(self) -> None:
+        now = self._clock()
+        self._cancelled_plan_ids = {
+            plan_id: deadline
+            for plan_id, deadline in self._cancelled_plan_ids.items()
+            if deadline > now
+        }
 
 
 def _round_epochs(bundle: LoadedBundle) -> int:

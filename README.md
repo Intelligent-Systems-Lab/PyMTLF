@@ -76,8 +76,10 @@ requires at least one `federated_learning.server` or
 `federated_learning.client` section, permits both, and rejects local-training
 settings. The first federated Server implementation requires
 `max_active_processes: 1`. Every profile validates that
-`federated_learning.workspace_root` is writable at startup, and readiness
-includes `runtimeMode`.
+`federated_learning.workspace_root` must be an exclusively owned scratch
+directory that does not overlap durable model or publication storage. Startup
+clears its existing contents before readiness, and readiness includes
+`runtimeMode`.
 
 See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
 standard-shaped operations PyMTLF sends through the containing Go NWDAF.

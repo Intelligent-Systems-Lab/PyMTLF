@@ -1,3 +1,5 @@
+import httpx
+
 from py_mtlf.core.nwdaf_context import (
     CapabilityVerification,
     NwdafContext,
@@ -10,15 +12,33 @@ def context_client(
     nf_instance_id: str = "11111111-1111-4111-8111-111111111111",
     api_root: str = "http://go.example",
     internal_api_root: str = "http://go-internal.example",
+    process_instance_id: str = "22222222-2222-4222-8222-222222222222",
 ) -> NwdafContextClient:
+    context = NwdafContext(
+        nf_instance_id=nf_instance_id,
+        containing_nwdaf_process_instance_id=process_instance_id,
+        api_root=api_root,
+        internal_api_root=internal_api_root,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "nfInstanceId": context.nf_instance_id,
+                "processInstanceId": context.containing_nwdaf_process_instance_id,
+                "apiRoot": context.api_root,
+                "internalApiRoot": context.internal_api_root,
+                "mlAnalyticsCapabilities": [],
+            },
+        )
+
     return NwdafContextClient(
         internal_api_root,
         30,
-        initial=NwdafContext(
-            nf_instance_id=nf_instance_id,
-            api_root=api_root,
-            internal_api_root=internal_api_root,
-        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        initial=context,
     )
 
 
