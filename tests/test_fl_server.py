@@ -326,15 +326,32 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
     )
     workspace = Mock()
     source = SimpleNamespace(name="flat-base")
-    round_input = SimpleNamespace(url="http://root.example/round-input/0")
-    workspace.publish_round_input.return_value = round_input
+    round_inputs = (
+        SimpleNamespace(url="http://root.example/round-input/0"),
+        SimpleNamespace(url="http://root.example/round-input/1"),
+    )
+    workspace.publish_round_input.side_effect = round_inputs
+    aggregate_paths = (
+        tmp_path / "round-global-0.tar.gz",
+        tmp_path / "round-global-1.tar.gz",
+    )
+    for path in aggregate_paths:
+        path.write_bytes(b"round-global")
+    aggregates = tuple(
+        SimpleNamespace(
+            digest=str(index + 1) * 64,
+            path=path,
+            url=f"http://root.example/round-global/{index}",
+        )
+        for index, path in enumerate(aggregate_paths)
+    )
     policy = Mock()
     client = Mock()
     client.delete.return_value = Mock(status_code=204)
     orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(
-            round_count=1,
+            round_count=2,
             client_training={"epochs": 9},
             cleanup={"max_attempts": 1},
         ),
@@ -346,7 +363,7 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
         client=client,
     )
     orchestrator._loader = Mock()
-    orchestrator._loader.load.return_value = source
+    orchestrator._loader.load.side_effect = (source, source)
 
     def prepare(_process, participant, _model_interoperability, _base_url):
         participant.resource_location = (
@@ -367,23 +384,295 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
     orchestrator._create_preparation = Mock(side_effect=prepare)
     orchestrator._wait = Mock()
     orchestrator._patch_round = Mock(side_effect=patch_round)
-    orchestrator._aggregate_round = Mock(
-        return_value=SimpleNamespace(url="http://root.example/round-global/0")
-    )
+    orchestrator._aggregate_round = Mock(side_effect=aggregates)
     orchestrator._patch_validation = Mock(side_effect=patch_validation)
     orchestrator._evaluate_final_validation = Mock(side_effect=evaluate_validation)
     process = FLProcess(process_id="process-1", intent=intent)
     try:
         orchestrator._run(process)
 
-        publication = workspace.publish_round_input.call_args.kwargs
-        assert publication["base"] is source
-        assert publication["process_id"] == process.process_id
-        assert publication["round_indicator"] == 0
-        assert publication["epochs"] == 9
-        assert orchestrator._patch_round.call_args.args[3] == round_input.url
-        assert process.candidate_url == "http://root.example/round-global/0"
+        publications = workspace.publish_round_input.call_args_list
+        assert [item.kwargs["base"] for item in publications] == [source, source]
+        assert [item.kwargs["process_id"] for item in publications] == [
+            process.process_id,
+            process.process_id,
+        ]
+        assert [item.kwargs["round_indicator"] for item in publications] == [0, 1]
+        assert [item.kwargs["epochs"] for item in publications] == [9, 9]
+        assert [item.args[3] for item in orchestrator._patch_round.call_args_list] == [
+            round_inputs[0].url,
+            round_inputs[0].url,
+            round_inputs[1].url,
+            round_inputs[1].url,
+        ]
+        assert orchestrator._aggregate_round.call_args_list == [
+            call(
+                process,
+                round_inputs[0].url,
+                0,
+                round_input_artifact=round_inputs[0],
+            ),
+            call(
+                process,
+                round_inputs[1].url,
+                1,
+                round_input_artifact=round_inputs[1],
+            ),
+        ]
+        workspace.download.assert_not_called()
+        assert orchestrator._loader.load.call_args_list[1].args[0].url == aggregates[0].url
+        assert orchestrator._loader.load.call_args_list[1].args[0].path == aggregates[0].path
+        assert process.current_global_artifact.url == aggregates[1].url
+        assert process.current_global_artifact.path == aggregates[1].path
+        assert process.candidate_url == aggregates[1].url
+        validation_call = orchestrator._evaluate_final_validation.call_args
+        assert validation_call.args[2] is process.current_global_artifact
         assert process.state is FLServerState.CANDIDATE_READY
+    finally:
+        orchestrator.close()
+
+
+def test_server_aggregation_does_not_download_missing_owned_round_input(tmp_path):
+    workspace = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=Mock(),
+    )
+    missing = SimpleNamespace(
+        digest="a" * 64,
+        path=tmp_path / "missing-round-input.tar.gz",
+        url="http://root.example/round-input.tar.gz",
+    )
+    try:
+        with pytest.raises(FileNotFoundError):
+            orchestrator._aggregate_round(
+                FLProcess(process_id="process-1", intent=Mock()),
+                missing.url,
+                0,
+                round_input_artifact=missing,
+            )
+
+        workspace.download.assert_not_called()
+    finally:
+        orchestrator.close()
+
+
+def test_server_aggregation_rejects_owned_round_input_url_mismatch_without_download(
+    tmp_path,
+):
+    workspace = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=Mock(),
+    )
+    round_input = SimpleNamespace(
+        digest="a" * 64,
+        path=tmp_path / "round-input.tar.gz",
+        url="http://root.example/round-input.tar.gz",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="input URL does not match artifact"):
+            orchestrator._aggregate_round(
+                FLProcess(process_id="process-1", intent=Mock()),
+                "http://root.example/different-round-input.tar.gz",
+                0,
+                round_input_artifact=round_input,
+            )
+
+        workspace.download.assert_not_called()
+    finally:
+        orchestrator.close()
+
+
+def test_final_validation_rejects_owned_candidate_url_mismatch_without_download(
+    tmp_path,
+):
+    workspace = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=Mock(),
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=Mock(),
+        candidate_url="http://root.example/candidate.tar.gz",
+    )
+    candidate_artifact = ArtifactMetadata(
+        key="a" * 64,
+        size_bytes=1,
+        path=tmp_path / "candidate.tar.gz",
+        url="http://root.example/different-candidate.tar.gz",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="candidate URL does not match artifact"):
+            orchestrator._evaluate_final_validation(
+                process,
+                Mock(),
+                candidate_artifact,
+                2,
+            )
+
+        workspace.download.assert_not_called()
+    finally:
+        orchestrator.close()
+
+
+def test_final_validation_uses_owned_candidate_and_downloads_only_peer_result(
+    tmp_path,
+    monkeypatch,
+):
+    participant_id = "11111111-1111-4111-8111-111111111111"
+    base_digest = "b" * 64
+    candidate_digest = "c" * 64
+    model_digest = "d" * 64
+    preprocessing_digest = "e" * 64
+    start = datetime(2026, 8, 20, tzinfo=UTC)
+    local_contract = RoundLocalArtifact.model_validate(
+        {
+            "bundle_schema_version": "1.0",
+            "artifact_role": "ROUND_LOCAL",
+            "result_type": "ACCURACY_CHECK",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "fl_metadata": {
+                "contract_version": "1.0",
+                "ml_corre_id": "process-1",
+                "round_ind": 2,
+                "participant_nf_instance_id": participant_id,
+                "scope_digest": "a" * 64,
+                "input_global_weights_digest": candidate_digest,
+                "model_contract_digest": model_digest,
+                "preprocessing_contract_digest": preprocessing_digest,
+                "base_weights_digest": candidate_digest,
+                "weights_digest": candidate_digest,
+                "evaluation": {
+                    "evaluation_stage": "FINAL_VALIDATION",
+                    "evaluation_sample_count": 10,
+                    "start_time": start,
+                    "end_time": start + timedelta(minutes=1),
+                    "base_model_weights_digest": base_digest,
+                    "candidate_weights_digest": candidate_digest,
+                    "base": {
+                        "absolute_error_sum": 10,
+                        "absolute_actual_sum": 100,
+                    },
+                    "candidate": {
+                        "absolute_error_sum": 5,
+                        "absolute_actual_sum": 100,
+                    },
+                },
+            },
+        }
+    )
+    peer_url = "http://client.example/validation.tar.gz"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", participant_id),
+        candidate=candidate(participant_id, "000001"),
+        notification_correlation_id="validation-client-a",
+        expected_scope_digest="a" * 64,
+        notification=NwdafMLModelTrainNotif.model_validate(
+            {
+                "notifCorreId": "validation-client-a",
+                "mlCorreId": "process-1",
+                "roundInd": 2,
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {"mLModelUrl": peer_url},
+                    }
+                ],
+            }
+        ),
+    )
+    candidate_artifact = ArtifactMetadata(
+        key="4" * 64,
+        size_bytes=1,
+        path=tmp_path / "candidate.tar.gz",
+        url="http://root.example/candidate.tar.gz",
+    )
+    base_artifact = Mock()
+    peer_artifact = Mock()
+    process = FLProcess(
+        process_id="process-1",
+        intent=SimpleNamespace(triggering_scope_key="scope-a"),
+        participants=[participant],
+        candidate_url=candidate_artifact.url,
+    )
+    workspace = Mock()
+    workspace.download.return_value = peer_artifact
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        workspace,
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._loader = Mock()
+    orchestrator._loader.load.side_effect = [
+        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=base_digest)),
+        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=candidate_digest)),
+        SimpleNamespace(
+            manifest=local_contract.model_dump(mode="json"),
+            model=SimpleNamespace(digest=candidate_digest),
+        ),
+    ]
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.weights_digest",
+        lambda model: model.digest,
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.model_contract_digest",
+        lambda _manifest: model_digest,
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.preprocessing_contract_digest",
+        lambda _manifest: preprocessing_digest,
+    )
+    try:
+        orchestrator._evaluate_final_validation(
+            process,
+            base_artifact,
+            candidate_artifact,
+            2,
+        )
+
+        assert orchestrator._loader.load.call_args_list[:2] == [
+            call(base_artifact),
+            call(candidate_artifact),
+        ]
+        workspace.download.assert_called_once_with(
+            peer_url,
+            process.process_id,
+            f"validation-{participant_id}",
+            owner_plan_id=None,
+        )
+        assert orchestrator._loader.load.call_args_list[2] == call(peer_artifact)
+        assert process.candidate_artifact is candidate_artifact
+        assert process.gate_would_accept is True
     finally:
         orchestrator.close()
 
@@ -2918,6 +3207,13 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
     local = Mock(manifest=local_manifest)
     workspace = Mock()
     workspace.download.return_value = Mock(key="6" * 64)
+    round_input_path = tmp_path / "round-input.tar.gz"
+    round_input_path.write_bytes(b"round-input")
+    round_input = SimpleNamespace(
+        digest="7" * 64,
+        path=round_input_path,
+        url="http://root.example/round-input.tar.gz",
+    )
     orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
@@ -2957,7 +3253,13 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
         participant.notification = duplicate
         orchestrator._loader.load.side_effect = [base]
         with pytest.raises(RuntimeError, match="notification is missing or invalid"):
-            orchestrator._aggregate_round(process, Mock(), 0)
+            orchestrator._aggregate_round(
+                process,
+                round_input.url,
+                0,
+                round_input_artifact=round_input,
+            )
+        workspace.download.assert_not_called()
 
         participant.notification = NwdafMLModelTrainNotif.model_validate(
             {
@@ -2976,6 +3278,17 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
         )
         orchestrator._loader.load.side_effect = [base, local]
         with pytest.raises(RuntimeError, match="identity does not match"):
-            orchestrator._aggregate_round(process, Mock(), 0)
+            orchestrator._aggregate_round(
+                process,
+                round_input.url,
+                0,
+                round_input_artifact=round_input,
+            )
+        workspace.download.assert_called_once_with(
+            "http://client.example/local.tar.gz",
+            process.process_id,
+            f"round-0-{participant_id}",
+            owner_plan_id=None,
+        )
     finally:
         orchestrator.close()

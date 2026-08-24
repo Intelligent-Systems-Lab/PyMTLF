@@ -143,6 +143,7 @@ class FLProcess:
     state: FLServerState = FLServerState.CREATED
     participants: list[FLParticipant] = field(default_factory=list)
     current_global_url: str = ""
+    current_global_artifact: ArtifactMetadata | None = None
     candidate_url: str = ""
     failure: str = ""
     cleanup_failure: str = ""
@@ -615,6 +616,7 @@ class FLServerEngine:
                 process.participants.clear()
                 process.hierarchy_active_scopes = ()
                 process.current_global_url = ""
+                process.current_global_artifact = None
                 process.candidate_url = ""
                 process.candidate_artifact = None
                 process.validation_summaries = ()
@@ -1023,6 +1025,8 @@ class FLServerEngine:
             process.state = FLServerState.AGGREGATING
             if state_observer is not None:
                 state_observer(process.state)
+            if round_input_artifact is None:
+                raise RuntimeError("Server aggregation requires its owned ROUND_INPUT artifact")
             result = self._aggregate_round(
                 process,
                 round_input_url,
@@ -1407,18 +1411,14 @@ class FLServerEngine:
             current = self._catalog.current(process.intent.family_key)
             if current is None or current.artifact.key != process.base_artifact_key:
                 raise RuntimeError("FL base model changed while participants were preparing")
+            process.current_global_artifact = current.artifact
             process.current_global_url = current.artifact.url
             for round_indicator in range(self._server_settings.round_count):
-                source_artifact = (
-                    current.artifact
-                    if round_indicator == 0
-                    else self._workspace.download(
-                        process.current_global_url,
-                        process.process_id,
-                        f"round-{round_indicator}-global-source",
-                        owner_plan_id=process.hierarchy_plan_id or None,
-                    )
-                )
+                source_artifact = process.current_global_artifact
+                if source_artifact is None:
+                    raise RuntimeError("FL Server has no current global artifact")
+                if source_artifact.url != process.current_global_url:
+                    raise RuntimeError("FL Server global artifact URL does not match state")
                 source_bundle = self._loader.load(source_artifact)
                 round_input = self._workspace.publish_round_input(
                     process_id=process.process_id,
@@ -1450,9 +1450,14 @@ class FLServerEngine:
                     self._server_settings.round_timeout_seconds,
                 )
                 process.state = FLServerState.AGGREGATING
-                process.current_global_url = self._aggregate_round(
-                    process, round_input.url, round_indicator
-                ).url
+                aggregate = self._aggregate_round(
+                    process,
+                    round_input.url,
+                    round_indicator,
+                    round_input_artifact=round_input,
+                )
+                process.current_global_artifact = _workspace_artifact_metadata(aggregate)
+                process.current_global_url = process.current_global_artifact.url
                 self._raise_if_failed(process)
                 logger.info(
                     "Federated round aggregated process_id=%s round=%s artifact=%s",
@@ -1463,7 +1468,12 @@ class FLServerEngine:
             with process.condition:
                 if process.failure:
                     raise RuntimeError(process.failure)
-                process.candidate_url = process.current_global_url
+                candidate_artifact = process.current_global_artifact
+                if candidate_artifact is None:
+                    raise RuntimeError("FL Server has no final candidate artifact")
+                if candidate_artifact.url != process.current_global_url:
+                    raise RuntimeError("FL Server candidate artifact URL does not match state")
+                process.candidate_url = candidate_artifact.url
             process.state = FLServerState.FINAL_VALIDATION_DISPATCH
             validation_round = self._server_settings.round_count
             for participant in process.participants:
@@ -1487,7 +1497,12 @@ class FLServerEngine:
                 self._server_settings.round_timeout_seconds,
             )
             process.state = FLServerState.FINAL_VALIDATION_EVALUATING
-            self._evaluate_final_validation(process, current.artifact, validation_round)
+            self._evaluate_final_validation(
+                process,
+                current.artifact,
+                candidate_artifact,
+                validation_round,
+            )
             if (
                 self._server_settings.final_validation.enforce_performance_gate
                 and not process.gate_would_accept
@@ -1885,26 +1900,13 @@ class FLServerEngine:
         round_input_url: str,
         round_indicator: int,
         *,
-        round_input_artifact: FLWorkspaceArtifact | None = None,
+        round_input_artifact: FLWorkspaceArtifact,
         expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
     ) -> FLWorkspaceArtifact:
-        if round_input_artifact is None:
-            base_artifact = self._workspace.download(
-                round_input_url,
-                process.process_id,
-                f"round-{round_indicator}-input-for-aggregation",
-                owner_plan_id=process.hierarchy_plan_id or None,
-            )
-        else:
-            if round_input_artifact.url != round_input_url:
-                raise RuntimeError("Server aggregation input URL does not match artifact")
-            base_artifact = ArtifactMetadata(
-                key=round_input_artifact.digest,
-                size_bytes=round_input_artifact.path.stat().st_size,
-                path=round_input_artifact.path,
-                url=round_input_artifact.url,
-            )
+        if round_input_artifact.url != round_input_url:
+            raise RuntimeError("Server aggregation input URL does not match artifact")
+        base_artifact = _workspace_artifact_metadata(round_input_artifact)
         base = self._loader.load(base_artifact)
         input_contract = validate_fl_artifact(_artifact_projection(base.manifest))
         if not isinstance(input_contract, RoundInputArtifact):
@@ -2021,14 +2023,11 @@ class FLServerEngine:
         self,
         process: FLProcess,
         base_artifact: ArtifactMetadata,
+        candidate_artifact: ArtifactMetadata,
         round_indicator: int,
     ) -> None:
-        candidate_artifact = self._workspace.download(
-            process.candidate_url,
-            process.process_id,
-            "final-validation-candidate",
-            owner_plan_id=process.hierarchy_plan_id or None,
-        )
+        if candidate_artifact.url != process.candidate_url:
+            raise RuntimeError("Server candidate URL does not match artifact")
         base = self._loader.load(base_artifact)
         candidate = self._loader.load(candidate_artifact)
         process.candidate_artifact = candidate_artifact
@@ -2466,3 +2465,12 @@ def _artifact_projection(manifest: dict[str, object]) -> dict[str, object]:
     if "result_type" in manifest:
         keys.add("result_type")
     return {key: manifest[key] for key in keys}
+
+
+def _workspace_artifact_metadata(artifact: FLWorkspaceArtifact) -> ArtifactMetadata:
+    return ArtifactMetadata(
+        key=artifact.digest,
+        size_bytes=artifact.path.stat().st_size,
+        path=artifact.path,
+        url=artifact.url,
+    )
