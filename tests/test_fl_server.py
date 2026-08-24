@@ -2790,8 +2790,14 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         )
     process = FLProcess(process_id="process-1", intent=None, participants=participants)
     workspace = Mock()
+    owned_round_input_path = tmp_path / "owned-round-input.tar.gz"
+    owned_round_input_path.write_bytes(b"owned-round-input")
+    owned_round_input = SimpleNamespace(
+        digest="0" * 64,
+        path=owned_round_input_path,
+        url="http://root.example/round-input",
+    )
     workspace.download.side_effect = [
-        SimpleNamespace(key="0" * 64),
         SimpleNamespace(key="4" * 64),
         SimpleNamespace(key="5" * 64),
     ]
@@ -2814,6 +2820,7 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
             process,
             "http://root.example/round-input",
             0,
+            round_input_artifact=owned_round_input,
             expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
             expected_subordinates={
                 branch_id: (leaf_id,)
@@ -2822,6 +2829,10 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         )
 
         assert result is published
+        assert [item.args[0] for item in workspace.download.call_args_list] == [
+            "http://branch-1.example/aggregate.tar.gz",
+            "http://branch-2.example/aggregate.tar.gz",
+        ]
         publication = workspace.publish.call_args.kwargs
         assert publication["model"].weight.item() == pytest.approx(8.0)
         assert publication["metadata"]["fl_metadata"]["participants"] == [

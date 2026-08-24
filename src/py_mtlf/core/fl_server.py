@@ -944,6 +944,7 @@ class FLServerEngine:
         process_id: str,
         round_indicator: int,
         round_input_url: str,
+        round_input_artifact: FLWorkspaceArtifact | None = None,
         expected_result_type: RoundLocalResultType,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
         timeout_seconds: int | None = None,
@@ -1026,6 +1027,7 @@ class FLServerEngine:
                 process,
                 round_input_url,
                 round_indicator,
+                round_input_artifact=round_input_artifact,
                 expected_result_type=expected_result_type,
                 expected_subordinates=expected_subordinates,
             )
@@ -1883,15 +1885,26 @@ class FLServerEngine:
         round_input_url: str,
         round_indicator: int,
         *,
+        round_input_artifact: FLWorkspaceArtifact | None = None,
         expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
     ) -> FLWorkspaceArtifact:
-        base_artifact = self._workspace.download(
-            round_input_url,
-            process.process_id,
-            f"round-{round_indicator}-input-for-aggregation",
-            owner_plan_id=process.hierarchy_plan_id or None,
-        )
+        if round_input_artifact is None:
+            base_artifact = self._workspace.download(
+                round_input_url,
+                process.process_id,
+                f"round-{round_indicator}-input-for-aggregation",
+                owner_plan_id=process.hierarchy_plan_id or None,
+            )
+        else:
+            if round_input_artifact.url != round_input_url:
+                raise RuntimeError("Server aggregation input URL does not match artifact")
+            base_artifact = ArtifactMetadata(
+                key=round_input_artifact.digest,
+                size_bytes=round_input_artifact.path.stat().st_size,
+                path=round_input_artifact.path,
+                url=round_input_artifact.url,
+            )
         base = self._loader.load(base_artifact)
         input_contract = validate_fl_artifact(_artifact_projection(base.manifest))
         if not isinstance(input_contract, RoundInputArtifact):

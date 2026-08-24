@@ -460,6 +460,7 @@ class FLBranchPreparationCoordinator:
                 process_id=execution.process_id,
                 round_indicator=lower_round,
                 round_input_url=lower_input.url,
+                round_input_artifact=lower_input,
                 expected_result_type=RoundLocalResultType.TRAINING,
                 timeout_seconds=parent_budget - callback_margin_seconds,
             )

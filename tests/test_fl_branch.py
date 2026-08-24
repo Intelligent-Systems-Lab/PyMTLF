@@ -563,6 +563,7 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
     assert lower_publication["epochs"] == 7
     lower_execution = server.execute_hierarchy_round.call_args.kwargs
     assert lower_execution["timeout_seconds"] == 295
+    assert lower_execution["round_input_artifact"] is lower_input
     artifacts.publish_round_input.assert_called_once()
     artifacts.publish_hierarchy_aggregate.assert_called_once()
     mapping = coordinator._rounds[(PLAN, "root-process", 4)]

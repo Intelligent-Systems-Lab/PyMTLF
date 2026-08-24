@@ -751,6 +751,9 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
         round_input = artifacts.publish_round_input.call_args.kwargs
         assert round_input["epochs"] == 3
         upper_round = server.execute_hierarchy_round.call_args.kwargs
+        assert upper_round["round_input_artifact"] is (
+            artifacts.publish_round_input.return_value
+        )
         assert upper_round["expected_subordinates"] == {
             BRANCH_ID: (LEAF_A_ID, LEAF_B_ID)
         }

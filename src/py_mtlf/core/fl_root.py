@@ -601,6 +601,7 @@ class FLRootCoordinator:
                     process_id=process.process_id,
                     round_indicator=round_indicator,
                     round_input_url=round_input.url,
+                    round_input_artifact=round_input,
                     expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
                     expected_subordinates=expected_subordinates,
                     state_observer=lambda state, current_round=round_indicator: (
