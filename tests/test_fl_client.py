@@ -266,6 +266,32 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
         service.close()
 
 
+def test_create_defers_training_scope_resolution_to_preparation_worker(
+    tmp_path, monkeypatch
+):
+    datasets = Mock()
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        datasets,
+        Mock(),
+    )
+    submit = Mock()
+    monkeypatch.setattr(service, "_submit", submit)
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
+
+        assert resource.state is FLClientState.PREPARING
+        datasets.validate_external_scope.assert_not_called()
+        submit.assert_called_once()
+    finally:
+        service.close()
+
+
 def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, monkeypatch):
     registry = FLExperimentRegistry()
     service = FLClientEngine(
@@ -615,7 +641,8 @@ def test_preparation_rejects_unsupported_contract_requirements(
         service.close()
 
 
-def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
+def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path, caplog):
+    caplog.set_level("INFO")
     service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
@@ -656,6 +683,7 @@ def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path):
         updated = service.get(resource.subscription_id)
         assert updated.state is FLClientState.FAILED
         assert "minNumSamples" in updated.last_error
+        assert "prepared training dataset does not meet minNumSamples" in caplog.text
         service._enqueue_delivery.assert_called_once()
     finally:
         service.close()
@@ -707,7 +735,11 @@ def test_preparation_success_returns_validated_input_model_url(tmp_path):
         service.close()
 
 
-def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
+@pytest.mark.parametrize("scope_available", [True, False], ids=("ready", "missing"))
+def test_leaf_assignment_binds_plan_before_local_data_preparation(
+    tmp_path,
+    scope_available,
+):
     branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     plan_id = "11111111-1111-4111-8111-111111111111"
@@ -787,6 +819,10 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
     )
     datasets = Mock()
     datasets.submit_external.return_value = "dataset-job-1"
+    if not scope_available:
+        datasets.validate_external_scope.side_effect = RuntimeError(
+            "scope has no usable training-data descriptor"
+        )
     registry = FLExperimentRegistry()
     reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
     service = FLClientEngine(
@@ -809,6 +845,7 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
     service._loader = Mock()
     service._enqueue_delivery = Mock()
     service._loader.load.return_value.manifest = manifest
+    assert service._capacity.acquire(blocking=False)
     try:
         service._run_preparation(
             resource.subscription_id,
@@ -824,7 +861,14 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(tmp_path):
         assert active.assigned_role is ExperimentRole.LEAF
         assert updated.hierarchy_assignment == admitted
         assert updated.preparation_base_artifact == admitted_metadata
-        datasets.submit_external.assert_called_once()
+        if scope_available:
+            datasets.submit_external.assert_called_once()
+        else:
+            assert updated.state is FLClientState.FAILED
+            assert "no usable training-data descriptor" in updated.last_error
+            datasets.submit_external.assert_not_called()
+            notification = service._enqueue_delivery.call_args.args[1]
+            assert notification.termination_request == "NOT_AVAILABLE_ML_TRAIN"
         assert not generic_path.exists()
         workspace.download_assignment.assert_called_once_with(
             assignment_url,
@@ -974,6 +1018,7 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
             representation=value,
             reservation_id=reservation.reservation_id,
         )
+        datasets.validate_external_scope.assert_not_called()
         datasets.submit_external.assert_not_called()
         service._loader.load.assert_not_called()
         notification = service._enqueue_delivery.call_args.args[1]
@@ -1024,6 +1069,58 @@ def test_preparation_rejects_base_bundle_with_different_interoperability(tmp_pat
         assert updated.state is FLClientState.FAILED
         assert "interoperability" in updated.last_error
         datasets.submit_external.assert_not_called()
+    finally:
+        service.close()
+
+
+def test_leaf_scope_failure_is_reported_as_async_preparation_termination(tmp_path):
+    datasets = Mock()
+    datasets.validate_external_scope.side_effect = RuntimeError(
+        "scope has no usable training-data descriptor"
+    )
+    workspace = Mock()
+    workspace.inspect_artifact.return_value = None
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        datasets,
+        workspace,
+    )
+    value = NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.PREPARING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+    )
+    service._resources[resource.subscription_id] = resource
+    service._loader = Mock()
+    service._loader.load.return_value.manifest = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+    }
+    service._enqueue_delivery = Mock()
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_preparation(
+            resource.subscription_id,
+            resource.revision,
+            Mock(),
+            Mock(),
+        )
+
+        updated = service.get(resource.subscription_id)
+        assert updated.state is FLClientState.FAILED
+        assert "no usable training-data descriptor" in updated.last_error
+        datasets.submit_external.assert_not_called()
+        service._enqueue_delivery.assert_called_once()
+        notification = service._enqueue_delivery.call_args.args[1]
+        assert notification.notification_correlation_id == "prep-client-a"
+        assert notification.ml_correlation_id == "fl-process-001"
+        assert notification.termination_request == "NOT_AVAILABLE_ML_TRAIN"
+        assert service._enqueue_delivery.call_args.args[2] is FLClientState.FAILED
     finally:
         service.close()
 

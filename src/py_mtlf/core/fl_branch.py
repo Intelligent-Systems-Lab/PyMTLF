@@ -351,6 +351,8 @@ class FLBranchPreparationCoordinator:
             failed_clients=failed,
             timed_out_client_nf_instance_ids=timed_out,
         )
+        if outcome is PreparationOutcome.READY:
+            self._server.admit_hierarchy_preparation(execution.process_id)
         return BranchPreparationResult(
             artifact=artifact,
             outcome=outcome,

@@ -925,6 +925,19 @@ class FLServerEngine:
             timed_out_participant_nf_instance_ids=timed_out,
         )
 
+    def admit_hierarchy_preparation(self, process_id: str) -> None:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.hierarchy_plan_id:
+            raise KeyError(process_id)
+        with process.condition:
+            if process.state is not FLServerState.PREPARATION_EVALUATING:
+                raise RuntimeError(
+                    "hierarchy Server process is not awaiting preparation admission"
+                )
+            process.state = FLServerState.READY
+            process.condition.notify_all()
+
     def execute_hierarchy_round(
         self,
         *,
@@ -2269,7 +2282,6 @@ class FLServerEngine:
             or candidate_metadata.model_contract_digest != expected_model_contract
             or candidate_metadata.preprocessing_contract_digest
             != expected_preprocessing_contract
-            or candidate_metadata.base_weights_digest != base_digest
             or candidate_metadata.weights_digest != candidate_digest
             or model_contract_digest(candidate_bundle.manifest) != expected_model_contract
             or preprocessing_contract_digest(candidate_bundle.manifest)

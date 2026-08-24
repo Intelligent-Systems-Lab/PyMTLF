@@ -264,6 +264,58 @@ def test_pre_dispatch_failure_publishes_complete_failed_partition(tmp_path):
     server.collect_hierarchy_preparation.assert_not_called()
 
 
+def test_successful_branch_preparation_admits_lower_server_process(tmp_path):
+    resolver = Mock()
+    resolver.resolve.side_effect = [_node(LEAF_A), _node(LEAF_B)]
+    published_a = Mock(url="http://branch.example/artifacts/a")
+    published_b = Mock(url="http://branch.example/artifacts/b")
+    artifacts = Mock()
+    artifacts.republish_leaf_assignment.side_effect = [published_a, published_b]
+    artifacts.publish_preparation_result.return_value = Mock(
+        url="http://branch.example/artifacts/result"
+    )
+    server = Mock()
+    server.start_hierarchy_preparation.return_value = Mock(process_id="lower-process")
+    server.collect_hierarchy_preparation.return_value = HierarchyPreparationCollection(
+        process_id="lower-process",
+        plan_id=PLAN,
+        participants=tuple(
+            HierarchyParticipantPreparationOutcome(
+                participant_nf_instance_id=leaf_id,
+                resource_location=f"http://branch.example/subscriptions/{leaf_id}",
+                assignment_url=published.url,
+                notification=NwdafMLModelTrainNotif.model_validate(
+                    {
+                        "notifCorreId": leaf_id,
+                        "mlCorreId": "lower-process",
+                        "mLModelInfos": [
+                            {
+                                "event": "UE_COMMUNICATION",
+                                "mLFileAddr": {"mLModelUrl": published.url},
+                            }
+                        ],
+                    }
+                ),
+                failure="",
+                delay_extensions=0,
+                granted_extension_seconds=0,
+            )
+            for leaf_id, published in ((LEAF_A, published_a), (LEAF_B, published_b))
+        ),
+        timed_out_participant_nf_instance_ids=(),
+    )
+    coordinator = _coordinator(resolver, artifacts, server)
+
+    result = coordinator.prepare(
+        assignment=_assignment(tmp_path),
+        representation=_representation(),
+        reservation_id="reservation-1",
+    )
+
+    assert result.outcome is PreparationOutcome.READY
+    server.admit_hierarchy_preparation.assert_called_once_with("lower-process")
+
+
 def test_parent_cancellation_fences_pre_dispatch_publication(tmp_path):
     resolver = Mock()
     artifacts = Mock()
@@ -1085,3 +1137,4 @@ def test_branch_result_partitions_all_leaf_outcomes_once(
         PreparationFailureCause.NOT_AVAILABLE_ML_TRAIN
     )
     assert published["timed_out_client_nf_instance_ids"] == ()
+    server.admit_hierarchy_preparation.assert_not_called()

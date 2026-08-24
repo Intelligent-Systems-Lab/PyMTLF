@@ -472,6 +472,17 @@ def test_hierarchy_preparation_attaches_root_process_and_uses_branch_bundle_urls
             == target.participant_nf_instance_id
         )
 
+    with pytest.raises(
+        RuntimeError,
+        match="not awaiting preparation admission",
+    ):
+        orchestrator.admit_hierarchy_preparation(process.process_id)
+    assert process.state is FLServerState.PREPARATION_WAITING
+
+    process.state = FLServerState.PREPARATION_EVALUATING
+    orchestrator.admit_hierarchy_preparation(process.process_id)
+    assert process.state is FLServerState.READY
+
     orchestrator.cancel_hierarchy_preparation(process.process_id, "test cleanup")
     orchestrator.close()
     client.close()
@@ -936,6 +947,87 @@ def test_hierarchy_validation_uses_existing_resources_and_next_round(tmp_path):
         assert collected["expected_candidate_process_id"] == "process-1"
         assert collected["expected_candidate_round"] == 1
         assert collected["expected_subordinates"] == {branch_id: ("leaf-a",)}
+    finally:
+        orchestrator.close()
+
+
+def test_multiround_hierarchy_candidate_keeps_last_round_base_digest(
+    tmp_path, monkeypatch
+):
+    candidate_path = tmp_path / "candidate.tar.gz"
+    candidate_path.write_bytes(b"candidate")
+    contract = RoundGlobalArtifact.model_validate(
+        {
+            "artifact_role": "ROUND_GLOBAL",
+            "bundle_schema_version": "1.0",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "fl_metadata": {
+                "contract_version": "1.0",
+                "ml_corre_id": "root-process",
+                "round_ind": 1,
+                "model_contract_digest": "4" * 64,
+                "preprocessing_contract_digest": "5" * 64,
+                "base_weights_digest": "6" * 64,
+                "weights_digest": "7" * 64,
+                "participants": [
+                    {
+                        "participant_nf_instance_id": (
+                            "11111111-1111-4111-8111-111111111111"
+                        ),
+                        "training_sample_count": 10,
+                        "local_artifact_digest": "8" * 64,
+                    }
+                ],
+                "aggregated_training_sample_count": 10,
+            },
+        }
+    )
+    candidate = SimpleNamespace(
+        contract=contract,
+        digest="9" * 64,
+        path=candidate_path,
+        url="http://root.example/candidate",
+    )
+    base_bundle = Mock(manifest={"kind": "same"}, model="initial")
+    candidate_bundle = Mock(manifest={"kind": "same"}, model="candidate")
+    loader = Mock()
+    loader.load.side_effect = [base_bundle, candidate_bundle]
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        loader,
+        Mock(),
+    )
+    orchestrator._loader = loader
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.weights_digest",
+        lambda model: {"initial": "a" * 64, "candidate": "7" * 64}[model],
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.model_contract_digest",
+        lambda _manifest: "4" * 64,
+    )
+    monkeypatch.setattr(
+        "py_mtlf.core.fl_server.preprocessing_contract_digest",
+        lambda _manifest: "5" * 64,
+    )
+    try:
+        validated = orchestrator._validate_hierarchy_candidate(
+            candidate=candidate,
+            base_artifact=Mock(),
+            expected_candidate_process_id="root-process",
+            expected_candidate_round=1,
+        )
+
+        assert validated.base_weights_digest == "a" * 64
+        assert validated.candidate_weights_digest == "7" * 64
     finally:
         orchestrator.close()
 

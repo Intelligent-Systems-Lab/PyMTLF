@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
+import pytest
 from nwdaf_context import context_client
 
 from py_mtlf.config import PublicationSettings
@@ -98,8 +99,31 @@ def pending_publication() -> PendingPublication:
     )
 
 
-def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference():
+@pytest.mark.parametrize("hierarchical", [False, True], ids=("flat", "hierarchical"))
+def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference(hierarchical):
     requests: list[httpx.Request] = []
+    publication = pending_publication()
+    if hierarchical:
+        publication = publication.model_copy(
+            update={
+                "hierarchy_validation": HierarchyValidation(
+                    plan_id="55555555-5555-4555-8555-555555555555",
+                    branches=(
+                        HierarchyBranchValidation(
+                            branch_nf_instance_id=CLIENT_ID,
+                            subordinate_validation_summaries=(
+                                publication.validation_evidence[0].model_copy(
+                                    update={"participant_nf_instance_id": LEAF_ID}
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            }
+        )
+    expected_consumers = [NWDAF_ID, CLIENT_ID]
+    if hierarchical:
+        expected_consumers.append(LEAF_ID)
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -126,8 +150,8 @@ def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference():
                         },
                         "mlStorageSize": 4096,
                         "allowConsumerList": [
-                            {"nfInstanceId": NWDAF_ID},
-                            {"nfInstanceId": CLIENT_ID},
+                            {"nfInstanceId": consumer_id}
+                            for consumer_id in expected_consumers
                         ],
                     }
                 ],
@@ -169,7 +193,7 @@ def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference():
     )
     coordinator._replace_publication = lambda value: value
 
-    stored = coordinator._store_in_adrf(pending_publication())
+    stored = coordinator._store_in_adrf(publication)
 
     assert stored.state is PublicationState.STORE_ACCEPTED
     assert stored.selected_adrf_instance_id == ADRF_ID
@@ -179,8 +203,7 @@ def test_store_in_adrf_uses_go_proxy_and_persists_exact_reference():
     request_body = json.loads(requests[1].content)
     assert request_body["mlModelInfo"][0]["modelUniqueId"] == 202607310001
     assert request_body["mlModelInfo"][0]["allowConsumerList"] == [
-        {"nfInstanceId": NWDAF_ID},
-        {"nfInstanceId": CLIENT_ID},
+        {"nfInstanceId": consumer_id} for consumer_id in expected_consumers
     ]
     client.close()
 

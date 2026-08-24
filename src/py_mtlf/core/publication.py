@@ -394,6 +394,13 @@ class PublicationCoordinator:
                 for item in publication.participants_and_sample_counts
             ),
         }
+        if publication.hierarchy_validation is not None:
+            for branch in publication.hierarchy_validation.branches:
+                allowed_consumer_ids.add(branch.branch_nf_instance_id)
+                allowed_consumer_ids.update(
+                    item.participant_nf_instance_id
+                    for item in branch.subordinate_validation_summaries
+                )
         if publication.state is PublicationState.FINAL_BUNDLE_READY:
             publication = self._replace_publication(
                 publication.model_copy(

@@ -554,6 +554,7 @@ class FLRootCoordinator:
                 record.server_process_id = process.process_id
                 record.state = RootRequestState.PREPARATION_WAITING
                 self._condition.notify_all()
+            self._ensure_active_generation(record)
             cause = RootFailureCause.PREPARATION_FAILED
             collection = self._server.collect_hierarchy_preparation(process.process_id)
             self._set_state(record, RootRequestState.PREPARATION_EVALUATING)
@@ -568,7 +569,7 @@ class FLRootCoordinator:
                 ml_event=descriptor.event,
                 base_artifact_key=current.artifact.key,
             )
-            process.state = FLServerState.READY
+            self._server.admit_hierarchy_preparation(process.process_id)
             with self._condition:
                 if self._active_request_id != record.initiation.request_id:
                     raise RuntimeError("Root request became stale during admission")

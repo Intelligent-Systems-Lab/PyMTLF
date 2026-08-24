@@ -297,6 +297,43 @@ def test_root_request_is_idempotent_and_rejects_conflicting_active_request(tmp_p
         coordinator.close()
 
 
+def test_root_shutdown_cancels_process_started_during_close(tmp_path):
+    coordinator, _resolver, _artifacts, _workspace, server, registry, *_ = (
+        root_coordinator(tmp_path)
+    )
+    preparation_started = threading.Event()
+    resume_preparation = threading.Event()
+
+    def start_hierarchy_preparation(**kwargs):
+        registry.attach_server(
+            kwargs["reservation_id"],
+            kwargs["plan_id"],
+            "server-process",
+        )
+        preparation_started.set()
+        assert resume_preparation.wait(timeout=2)
+        return SimpleNamespace(process_id="server-process")
+
+    server.start_hierarchy_preparation.side_effect = start_hierarchy_preparation
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    assert preparation_started.wait(timeout=2)
+    with coordinator._condition:
+        coordinator._closing = True
+        coordinator._condition.notify_all()
+    resume_preparation.set()
+
+    coordinator.close()
+
+    server.collect_hierarchy_preparation.assert_not_called()
+    server.cancel_hierarchy_preparation.assert_called_once_with(
+        "server-process",
+        "Root coordinator is closing",
+    )
+
+
 def test_failed_root_attempt_releases_slot_and_allows_explicit_new_request(tmp_path):
     failed_once = False
 
@@ -694,6 +731,7 @@ def test_root_admits_only_complete_ready_branch_results(tmp_path):
             LEAF_A_ID,
             LEAF_B_ID,
         )
+        server.admit_hierarchy_preparation.assert_called_once_with("server-process")
         assert registry.active() is None
         workspace.release_plan.assert_called_once_with(admitted.plan_id)
         server.close_hierarchy_training.assert_called_once_with(

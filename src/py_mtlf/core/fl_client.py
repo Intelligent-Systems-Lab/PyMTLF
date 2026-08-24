@@ -601,7 +601,6 @@ class FLClientEngine:
             active_scopes=(scope,),
             created_at=datetime.now(UTC),
         )
-        self._datasets.validate_external_scope(intent)
         resource.state = FLClientState.PREPARING
         self._schedule_delay(resource)
         self._submit(
@@ -790,6 +789,7 @@ class FLClientEngine:
                     return
                 current.preparation_base_artifact = artifact
                 current.hierarchy_assignment = hierarchy_assignment
+            self._datasets.validate_external_scope(intent)
             job_id = self._datasets.submit_external(
                 intent,
                 window,
@@ -885,10 +885,11 @@ class FLClientEngine:
                 final = FLClientState.FAILED
         self._enqueue_delivery(resource, notification, final)
         logger.info(
-            "FL client preparation terminal subscription_id=%s state=%s records=%s",
+            "FL client preparation terminal subscription_id=%s state=%s records=%s error=%s",
             subscription_id,
             final,
             len(job.snapshot.records) if job.snapshot is not None else 0,
+            resource.last_error or "none",
         )
         self._release_work_slot(subscription_id, revision)
 
