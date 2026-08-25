@@ -1,0 +1,77 @@
+# FL Client profile with operator-triggered UPF training-data collection.
+server:
+  binding_host: "0.0.0.0"
+  port: 9093
+
+runtime:
+  mode: "federated"
+
+containing_nwdaf:
+  internal_api_root: "http://127.0.0.1:8091"
+  request_timeout_seconds: 30
+
+storage:
+  artifact_root: "data/artifacts"
+model_state:
+  directory: "data/model-state"
+publication:
+  directory: "data/publications"
+artifact:
+  public_base_url: "http://127.0.0.1:9093"
+
+federated_learning:
+  workspace_root: "data/fl-workspaces"
+  public_base_url: "http://127.0.0.1:9093"
+  request_timeout_seconds: 300
+  artifact_download:
+    allowed_origins:
+      - "http://127.0.0.1:9092"
+  client:
+    training_data:
+      collection_trigger: "private_api"
+      # This origin must be reachable by the UPF callback producer.
+      callback_base_uri: "http://127.0.0.1:9093"
+      state_directory: "data/training-data-collections"
+      request_timeout_seconds: 30
+      retry_initial_backoff_seconds: 1
+      retry_max_backoff_seconds: 30
+      worker_count: 2
+      queue_capacity: 256
+      descriptor_retention_seconds: 3600
+      consent:
+        purpose: "model_training"
+        policy: "not_required_by_local_policy"
+      collection_profiles:
+        - profile_id: "ue-communication-default"
+          ml_event: "UE_COMMUNICATION"
+          ml_event_filter: {}
+          target_ue:
+            intGroupIds:
+              - "group-a.example"
+          dnns:
+            - "internet"
+          snssais:
+            - sst: 1
+              sd: "010203"
+          sampling_interval_seconds: 2
+          minimum_observation_count: 32
+    model_interoperability_ids:
+      - "001122"
+    training:
+      device: "cpu"
+      batch_size: 32
+      learning_rate: 0.001
+      validation_ratio: 0.10
+      random_seed: 42
+
+adrf:
+  mode: "nrf"
+
+dataset:
+  mongodb:
+    url: "mongodb://127.0.0.1:27017"
+    database: "free5gc"
+    collection: "nwdaf_raw_notifications"
+
+log:
+  level: "INFO"

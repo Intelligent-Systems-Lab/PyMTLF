@@ -15,6 +15,7 @@ from py_mtlf.core.dataset import (
     DatasetCoordinator,
     DatasetJob,
     DatasetJobState,
+    DescriptorOrigin,
 )
 from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import (
@@ -666,6 +667,53 @@ def test_mongo_skips_malformed_document_and_keeps_valid_records(mongo_client):
     coordinator.shutdown()
 
 
+@patch("pymongo.MongoClient")
+def test_mongo_retrieval_preserves_private_descriptor_metadata(mongo_client):
+    policy, intent = retrain_intent()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
+        policy,
+        Mock(close=Mock()),
+    )
+    job = DatasetJob(
+        "job-private",
+        intent,
+        TimeWindow(
+            startTime=datetime(2026, 7, 24, tzinfo=UTC),
+            stopTime=datetime(2026, 7, 24, 1, tzinfo=UTC),
+        ),
+        "mongodb",
+        descriptor_origin=DescriptorOrigin.PRIVATE_API,
+    )
+    baseline = coordinator._resolve(intent, descriptor_snapshot())[0]
+    private = baseline.__class__(
+        **{
+            **baseline.__dict__,
+            "descriptor_origin": DescriptorOrigin.PRIVATE_API,
+            "collection_group_id": "request-a/profile-a",
+        }
+    )
+    job.resources = (private,)
+    collection = mongo_client.return_value.__getitem__.return_value.__getitem__.return_value
+    collection.find.return_value.sort.return_value = [
+        {
+            "_id": "record-a",
+            "supi": private.supi,
+            "measurementTime": job.time_window.start_time,
+            "dataSub": [{"smfDataSub": private.smf_data_sub}],
+            "dataNotif": {"upfEventNotifs": [{"sample": private.supi}]},
+        }
+    ]
+
+    records, malformed = coordinator._read_mongo_once(job)
+
+    assert malformed == 0
+    assert records[0][0].descriptor_origin is DescriptorOrigin.PRIVATE_API
+    assert records[0][0].collection_group_id == "request-a/profile-a"
+    coordinator.shutdown()
+
+
 def test_mongo_query_retries_without_committing_partial_attempt():
     policy, intent = retrain_intent()
     projection = descriptor_snapshot()
@@ -769,3 +817,119 @@ def test_adrf_callback_validation_uses_standard_problem_details(settings):
 
     assert response.status_code == 400
     assert response.json()["cause"] == "INVALID_MSG_FORMAT"
+
+
+def test_anlf_descriptor_route_isolates_consumer_and_private_origins(settings):
+    descriptor_id = "11111111-1111-4111-8111-111111111112"
+    consumer = descriptor_snapshot()[0].model_copy(
+        update={"correlation_id": descriptor_id}
+    )
+    private = consumer.model_copy(update={"state": "RETAINED"})
+    app = create_app(settings)
+    coordinator = app.state.dataset_coordinator
+    coordinator.put_private_training_data_descriptor(
+        descriptor_id,
+        "request-a/profile-a",
+        private,
+    )
+
+    with TestClient(app) as client:
+        put_response = client.put(
+            f"/internal/v1/anlf/training-data-descriptors/{descriptor_id}",
+            json=consumer.model_dump(by_alias=True, exclude_none=True, mode="json"),
+        )
+        delete_response = client.delete(
+            f"/internal/v1/anlf/training-data-descriptors/{descriptor_id}"
+        )
+
+    assert put_response.status_code == 204
+    assert put_response.content == b""
+    assert delete_response.status_code == 204
+    assert coordinator._descriptor_snapshot(DescriptorOrigin.CONSUMER_SUBSCRIPTION) == ()
+    assert coordinator._descriptor_snapshot(DescriptorOrigin.PRIVATE_API) == (private,)
+
+
+def test_external_dataset_selection_does_not_fallback_across_descriptor_origins():
+    policy, intent = retrain_intent()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(), context_client(), policy, Mock(close=Mock())
+    )
+    for descriptor in descriptor_snapshot():
+        coordinator.put_consumer_training_data_descriptor(
+            descriptor.correlation_id,
+            descriptor,
+        )
+
+    with pytest.raises(RuntimeError, match="no usable training-data descriptor"):
+        coordinator.validate_external_scope(intent, DescriptorOrigin.PRIVATE_API)
+
+    coordinator.validate_external_scope(
+        intent,
+        DescriptorOrigin.CONSUMER_SUBSCRIPTION,
+    )
+    coordinator.shutdown()
+
+
+def test_private_dataset_selection_rejects_ambiguous_collection_groups():
+    policy, intent = retrain_intent()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(), context_client(), policy, Mock(close=Mock())
+    )
+    for group_id in ("request-a/profile", "request-b/profile"):
+        for descriptor in descriptor_snapshot():
+            coordinator.put_private_training_data_descriptor(
+                descriptor.correlation_id,
+                group_id,
+                descriptor,
+            )
+
+    with pytest.raises(RuntimeError, match="multiple private collection groups"):
+        coordinator.validate_external_scope(intent, DescriptorOrigin.PRIVATE_API)
+
+    coordinator.shutdown()
+
+
+def test_private_dataset_records_deduplicate_notification_content_not_transport_ids():
+    policy, intent = retrain_intent()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(), context_client(), policy, Mock(close=Mock())
+    )
+    resource = coordinator._resolve(intent, descriptor_snapshot())[0]
+    resource = resource.__class__(
+        **{
+            **resource.__dict__,
+            "descriptor_origin": DescriptorOrigin.PRIVATE_API,
+            "collection_group_id": "request-a/profile",
+        }
+    )
+    window = TimeWindow(
+        startTime=datetime(2026, 7, 24, tzinfo=UTC),
+        stopTime=datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+    job = DatasetJob(
+        "job-private",
+        intent,
+        window,
+        "mongodb",
+        descriptor_origin=DescriptorOrigin.PRIVATE_API,
+    )
+    notification = {
+        "correlationId": "delivery-a",
+        "notificationItems": [{"eventType": "USER_DATA_USAGE_MEASURES", "value": 1}],
+    }
+    first = NadrfDataStoreRecord(
+        dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
+        dataNotif=DataNotification(upfEventNotifs=[notification]),
+    )
+    second = NadrfDataStoreRecord(
+        dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
+        dataNotif=DataNotification(
+            upfEventNotifs=[{**notification, "correlationId": "delivery-b"}]
+        ),
+    )
+
+    coordinator._append_record(job, resource, first, "mongodb", window.start_time, "row-a")
+    coordinator._append_record(job, resource, second, "adrf", window.start_time, "row-b")
+
+    assert len(job.records) == 1
+    coordinator.shutdown()

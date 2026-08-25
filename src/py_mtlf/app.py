@@ -14,17 +14,21 @@ from fastapi.responses import JSONResponse
 from py_mtlf.api import (
     adrf,
     artifacts,
+    callbacks,
     federated_learning,
     health,
     ml_model_monitor,
     ml_model_provision,
     ml_model_training,
     training_data,
+    training_data_collection,
 )
-from py_mtlf.config import Settings
+from py_mtlf.api.private_collection_transport import PrivateCollectionBodyMiddleware
+from py_mtlf.config import PrivateAPITrainingDataSettings, Settings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy
 from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
+from py_mtlf.core.collection_relay import CollectionRelayClient
 from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.fl_branch import FLBranchPreparationCoordinator
 from py_mtlf.core.fl_client import FLClientEngine
@@ -58,6 +62,7 @@ from py_mtlf.core.nwdaf_discovery import NwdafMonitorResolver
 from py_mtlf.core.provision_store import ProvisionResourceStore
 from py_mtlf.core.publication import PublicationCoordinator
 from py_mtlf.core.seed_catalog import SeedCatalog
+from py_mtlf.core.training_data_collection import TrainingDataCollectionManager
 from py_mtlf.core.training_jobs import TrainingCoordinator
 from py_mtlf.models import PrivateError
 
@@ -82,6 +87,7 @@ def create_app(
     artifact_repository: ArtifactRepository | None = None,
     capability_checker: CapabilityConsistencyChecker | None = None,
     nwdaf_context_client: NwdafContextClient | None = None,
+    collection_relay_client: CollectionRelayClient | None = None,
 ) -> FastAPI:
     artifact_repository = artifact_repository or ArtifactRepository(
         settings.storage.artifact_root, settings.artifact
@@ -193,6 +199,26 @@ def create_app(
         accuracy_policy,
         adrf_resolver,
     )
+    private_collection_settings = (
+        fl_client_settings.training_data
+        if fl_client_settings is not None
+        and isinstance(fl_client_settings.training_data, PrivateAPITrainingDataSettings)
+        else None
+    )
+    training_data_collection_manager = None
+    if private_collection_settings is not None:
+        collection_relay = collection_relay_client or CollectionRelayClient(
+            nwdaf_context,
+            adrf_resolver,
+            private_collection_settings.request_timeout_seconds,
+            mongo_settings=settings.dataset.mongodb,
+        )
+        training_data_collection_manager = TrainingDataCollectionManager(
+            private_collection_settings,
+            nwdaf_context,
+            dataset_coordinator,
+            collection_relay,
+        )
     training_coordinator = (
         TrainingCoordinator(
             local_training,
@@ -317,6 +343,8 @@ def create_app(
 
     def reset_containing_nwdaf_generation(reason: str) -> None:
         logger.warning("Discarding FL state after containing NWDAF reset: %s", reason)
+        if training_data_collection_manager is not None:
+            training_data_collection_manager.abort_generation(reason)
         publication.abort_generation()
         errors: list[Exception] = []
         for owner in (fl_coordinator, fl_client, fl_server):
@@ -348,6 +376,8 @@ def create_app(
         logger.info("MTLF backend startup begin mode=%s", settings.runtime.mode)
         try:
             nwdaf_context.open()
+            if training_data_collection_manager is not None:
+                training_data_collection_manager.open()
             _prepare_workspace(settings.federated_learning.workspace_root)
             fl_workspace.open()
             artifact_repository.open()
@@ -368,6 +398,8 @@ def create_app(
         finally:
             runtime.accepting_requests = False
             generation_monitor.stop()
+            if training_data_collection_manager is not None:
+                training_data_collection_manager.shutdown()
             publication.stop()
             if fl_coordinator is not None:
                 fl_coordinator.close()
@@ -416,6 +448,7 @@ def create_app(
     app.state.nwdaf_monitor_resolver = nwdaf_monitor_resolver
     app.state.accuracy_policy = accuracy_policy
     app.state.dataset_coordinator = dataset_coordinator
+    app.state.training_data_collection_manager = training_data_collection_manager
     app.state.training_coordinator = training_coordinator
     app.state.fl_workspace = fl_workspace
     app.state.fl_client = fl_client
@@ -433,6 +466,10 @@ def create_app(
     app.include_router(artifacts.router)
     app.include_router(training_data.router)
     app.include_router(adrf.router)
+    if training_data_collection_manager is not None:
+        app.add_middleware(PrivateCollectionBodyMiddleware)
+        app.include_router(training_data_collection.router)
+        app.include_router(callbacks.router)
     if settings.runtime.mode == "local" or fl_server is not None:
         app.include_router(ml_model_provision.router)
         app.include_router(ml_model_monitor.router)
@@ -453,6 +490,8 @@ def create_app(
                 "/internal/v1/ml-model-",
                 "/internal/v1/adrf-data-management/",
                 "/internal/v1/federated-learning/",
+                "/internal/v1/training-data-collections",
+                "/callbacks/upf-event-exposure",
             )
         ):
             from py_mtlf.api.problems import problem_response

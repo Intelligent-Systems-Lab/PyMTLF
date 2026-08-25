@@ -789,7 +789,8 @@ class FLClientEngine:
                     return
                 current.preparation_base_artifact = artifact
                 current.hierarchy_assignment = hierarchy_assignment
-            self._datasets.validate_external_scope(intent)
+            collection_trigger = self._client_settings.training_data.collection_trigger
+            self._datasets.validate_external_scope(intent, collection_trigger)
             job_id = self._datasets.submit_external(
                 intent,
                 window,
@@ -801,6 +802,7 @@ class FLClientEngine:
                     expected_model_contract,
                     expected_preprocessing_contract,
                 ),
+                collection_trigger,
             )
             with self._lock:
                 current = self._resources.get(subscription_id)
@@ -885,10 +887,12 @@ class FLClientEngine:
                 final = FLClientState.FAILED
         self._enqueue_delivery(resource, notification, final)
         logger.info(
-            "FL client preparation terminal subscription_id=%s state=%s records=%s error=%s",
+            "FL client preparation terminal subscription_id=%s state=%s "
+            "records=%s samples=%s error=%s",
             subscription_id,
             final,
             len(job.snapshot.records) if job.snapshot is not None else 0,
+            training_sample_count,
             resource.last_error or "none",
         )
         self._release_work_slot(subscription_id, revision)

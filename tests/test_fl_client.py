@@ -697,7 +697,8 @@ def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path, cap
         service.close()
 
 
-def test_preparation_success_returns_validated_input_model_url(tmp_path):
+def test_preparation_success_returns_validated_input_model_url(tmp_path, caplog):
+    caplog.set_level("INFO")
     service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
@@ -739,6 +740,7 @@ def test_preparation_success_returns_validated_input_model_url(tmp_path):
         address = notification.ml_model_infos[0].model_file_address
         assert address is not None
         assert str(address.model_url) == "http://server.example/base.tar.gz"
+        assert "state=PREPARED records=1 samples=1" in caplog.text
     finally:
         service.close()
 

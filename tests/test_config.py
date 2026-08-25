@@ -260,7 +260,7 @@ def test_runtime_engine_configuration_matrix(
             Settings.model_validate(payload)
 
 
-def test_fl_client_requires_explicit_consumer_subscription_training_data_marker():
+def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
     with pytest.raises(ValidationError, match="training_data"):
         FLClientSettings()
 
@@ -271,11 +271,197 @@ def test_fl_client_requires_explicit_consumer_subscription_training_data_marker(
     )
 
     assert client.training_data.collection_trigger == "consumer_subscription"
-    for collection_trigger in ("private_api", "local_file"):
-        with pytest.raises(ValidationError):
-            FLClientSettings.model_validate(
-                {"training_data": {"collection_trigger": collection_trigger}}
-            )
+
+    private = FLClientSettings.model_validate(
+        {
+            "training_data": {
+                "collection_trigger": "private_api",
+                "callback_base_uri": "http://127.0.0.1:9092",
+                "state_directory": str(tmp_path / "collections"),
+                "consent": {
+                    "purpose": "model_training",
+                    "policy": "not_required_by_local_policy",
+                },
+                "collection_profiles": [
+                    {
+                        "profile_id": "ue-communication-default",
+                        "ml_event": "UE_COMMUNICATION",
+                        "ml_event_filter": {},
+                        "target_ue": {"intGroupIds": ["group-a.example"]},
+                        "dnns": ["internet"],
+                        "snssais": [{"sst": 1, "sd": "010203"}],
+                        "sampling_interval_seconds": 2,
+                        "minimum_observation_count": 32,
+                    }
+                ],
+            }
+        }
+    )
+
+    assert private.training_data.collection_trigger == "private_api"
+    assert private.training_data.collection_profiles[0].target_ue.int_group_ids == (
+        "group-a.example",
+    )
+
+    with pytest.raises(ValidationError):
+        FLClientSettings.model_validate(
+            {"training_data": {"collection_trigger": "local_file"}}
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"consent": {"purpose": "model_training", "policy": "required"}},
+        {"collection_profiles": []},
+        {"callback_base_uri": "http://127.0.0.1:9092/callback"},
+        {"state_directory": ""},
+        {"retry_initial_backoff_seconds": 2, "retry_max_backoff_seconds": 1},
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "ml_event_filter": {"networkArea": {"tais": []}},
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"supis": ["imsi-001"]},
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {
+                        "intGroupIds": ["group-a.example", "group-a.example"]
+                    },
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "dnns": ["invalid_dnn"],
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "snssais": [
+                        {"sst": 1, "sd": "010203"},
+                        {"sst": 1, "sd": "010203"},
+                    ],
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "sampling_interval_seconds": 0,
+                    "minimum_observation_count": 0,
+                }
+            ]
+        },
+    ],
+)
+def test_private_collection_settings_fail_closed(tmp_path, override):
+    payload = {
+        "collection_trigger": "private_api",
+        "callback_base_uri": "http://127.0.0.1:9092",
+        "state_directory": str(tmp_path / "collections"),
+        "consent": {
+            "purpose": "model_training",
+            "policy": "not_required_by_local_policy",
+        },
+        "collection_profiles": [
+            {
+                "profile_id": "ue-communication-default",
+                "ml_event": "UE_COMMUNICATION",
+                "target_ue": {"intGroupIds": ["group-a.example"]},
+                "sampling_interval_seconds": 2,
+                "minimum_observation_count": 1,
+            }
+        ],
+    }
+    payload.update(override)
+
+    with pytest.raises(ValidationError):
+        FLClientSettings.model_validate({"training_data": payload})
+
+
+def test_consumer_subscription_rejects_private_collection_fields(tmp_path):
+    with pytest.raises(ValidationError):
+        FLClientSettings.model_validate(
+            {
+                "training_data": {
+                    "collection_trigger": "consumer_subscription",
+                    "state_directory": str(tmp_path / "collections"),
+                }
+            }
+        )
+
+
+def test_load_settings_resolves_private_collection_state_directory(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+runtime:
+  mode: federated
+federated_learning:
+  client:
+    training_data:
+      collection_trigger: private_api
+      callback_base_uri: http://127.0.0.1:9092
+      state_directory: state/collections
+      consent:
+        purpose: model_training
+        policy: not_required_by_local_policy
+      collection_profiles:
+        - profile_id: ue-communication-default
+          ml_event: UE_COMMUNICATION
+          target_ue:
+            intGroupIds: [group-a.example]
+          sampling_interval_seconds: 2
+          minimum_observation_count: 1
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.federated_learning.client is not None
+    assert settings.federated_learning.client.training_data.state_directory == (
+        tmp_path / "state" / "collections"
+    )
 
 
 def test_flat_monitor_owner_requires_explicit_orchestration_and_degradation_trigger():
@@ -351,6 +537,8 @@ def test_federated_server_requires_single_active_process():
         ("fl-server.yaml", "federated"),
         ("fl-client.yaml", "federated"),
         ("fl-server-client.yaml", "federated"),
+        ("fl-client-private-collection.yaml", "federated"),
+        ("fl-server-client-private-collection.yaml", "federated"),
         ("fl-server-hierarchy.yaml", "federated"),
     ],
 )

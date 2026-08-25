@@ -41,6 +41,24 @@ class DatasetJobState(StrEnum):
     FAILED = "FAILED"
 
 
+class DescriptorOrigin(StrEnum):
+    CONSUMER_SUBSCRIPTION = "consumer_subscription"
+    PRIVATE_API = "private_api"
+
+
+@dataclass(frozen=True, order=True)
+class DescriptorKey:
+    origin: DescriptorOrigin
+    correlation_id: str
+    collection_group_id: str = ""
+
+
+@dataclass(frozen=True)
+class DescriptorEntry:
+    key: DescriptorKey
+    descriptor: TrainingDataDescriptor
+
+
 @dataclass(frozen=True)
 class ResolvedResource:
     identity: str
@@ -50,6 +68,8 @@ class ResolvedResource:
     adrf_instance_id: str = ""
     available_start: datetime | None = None
     available_stop: datetime | None = None
+    descriptor_origin: DescriptorOrigin = DescriptorOrigin.CONSUMER_SUBSCRIPTION
+    collection_group_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,6 +126,7 @@ class DatasetJob:
     last_progress: float = field(default_factory=time.monotonic)
     policy_owned: bool = True
     completion_handler: Callable[["DatasetJob"], None] | None = None
+    descriptor_origin: DescriptorOrigin | None = None
 
 
 class DatasetCoordinator:
@@ -128,7 +149,7 @@ class DatasetCoordinator:
         self._lock = threading.RLock()
         self._jobs: dict[str, DatasetJob] = {}
         self._routes: dict[str, str] = {}
-        self._descriptors: dict[str, TrainingDataDescriptor] = {}
+        self._descriptors: dict[DescriptorKey, DescriptorEntry] = {}
         self._closing = threading.Event()
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_concurrent_jobs,
@@ -163,6 +184,7 @@ class DatasetCoordinator:
         intent: RetrainIntent,
         time_window: TimeWindow,
         completion_handler: Callable[[DatasetJob], None],
+        collection_trigger: str = DescriptorOrigin.CONSUMER_SUBSCRIPTION,
     ) -> str:
         if self._closing.is_set():
             raise RuntimeError("dataset coordinator is shutting down")
@@ -173,6 +195,7 @@ class DatasetCoordinator:
             "unavailable",
             policy_owned=False,
             completion_handler=completion_handler,
+            descriptor_origin=DescriptorOrigin(collection_trigger),
         )
         with self._lock:
             self._jobs[job.job_id] = job
@@ -182,37 +205,101 @@ class DatasetCoordinator:
         future.add_done_callback(self._discard_future)
         return job.job_id
 
-    def validate_external_scope(self, intent: RetrainIntent) -> None:
-        self._resolve(intent, self._descriptor_snapshot())
+    def validate_external_scope(
+        self,
+        intent: RetrainIntent,
+        collection_trigger: str = DescriptorOrigin.CONSUMER_SUBSCRIPTION,
+    ) -> None:
+        origin = DescriptorOrigin(collection_trigger)
+        self._resolve_entries(intent, self._descriptor_entry_snapshot(origin), origin)
 
     def put_training_data_descriptor(
         self,
         descriptor_id: str,
         descriptor: TrainingDataDescriptor,
     ) -> None:
-        if descriptor_id != descriptor.correlation_id:
+        self.put_consumer_training_data_descriptor(descriptor_id, descriptor)
+
+    def put_consumer_training_data_descriptor(
+        self,
+        descriptor_id: str,
+        descriptor: TrainingDataDescriptor,
+    ) -> None:
+        self._put_descriptor(
+            DescriptorKey(DescriptorOrigin.CONSUMER_SUBSCRIPTION, descriptor_id),
+            descriptor,
+        )
+
+    def put_private_training_data_descriptor(
+        self,
+        descriptor_id: str,
+        collection_group_id: str,
+        descriptor: TrainingDataDescriptor,
+    ) -> None:
+        group_id = collection_group_id.strip()
+        if not group_id:
+            raise ValueError("private descriptor collection group must not be blank")
+        self._put_descriptor(
+            DescriptorKey(DescriptorOrigin.PRIVATE_API, descriptor_id, group_id),
+            descriptor,
+        )
+
+    def _put_descriptor(
+        self,
+        key: DescriptorKey,
+        descriptor: TrainingDataDescriptor,
+    ) -> None:
+        if key.correlation_id != descriptor.correlation_id:
             raise ValueError("descriptorId must match correlationId")
+        copied = descriptor.model_copy(deep=True)
         with self._lock:
-            self._descriptors[descriptor_id] = descriptor.model_copy(deep=True)
+            self._descriptors[key] = DescriptorEntry(key, copied)
 
     def delete_training_data_descriptor(self, descriptor_id: str) -> bool:
-        with self._lock:
-            return self._descriptors.pop(descriptor_id, None) is not None
+        return self.delete_consumer_training_data_descriptor(descriptor_id)
 
-    def _descriptor_snapshot(self) -> tuple[TrainingDataDescriptor, ...]:
+    def delete_consumer_training_data_descriptor(self, descriptor_id: str) -> bool:
+        with self._lock:
+            key = DescriptorKey(DescriptorOrigin.CONSUMER_SUBSCRIPTION, descriptor_id)
+            return self._descriptors.pop(key, None) is not None
+
+    def delete_private_training_data_descriptor(
+        self,
+        descriptor_id: str,
+        collection_group_id: str,
+    ) -> bool:
+        with self._lock:
+            key = DescriptorKey(
+                DescriptorOrigin.PRIVATE_API,
+                descriptor_id,
+                collection_group_id,
+            )
+            return self._descriptors.pop(key, None) is not None
+
+    def _descriptor_entry_snapshot(
+        self,
+        origin: DescriptorOrigin | None = None,
+    ) -> tuple[DescriptorEntry, ...]:
         now = self._clock().astimezone(UTC)
         with self._lock:
             expired = [
-                descriptor_id
-                for descriptor_id, descriptor in self._descriptors.items()
-                if descriptor.retain_until <= now
+                key
+                for key, entry in self._descriptors.items()
+                if entry.descriptor.retain_until <= now
             ]
-            for descriptor_id in expired:
-                self._descriptors.pop(descriptor_id, None)
+            for key in expired:
+                self._descriptors.pop(key, None)
             return tuple(
-                self._descriptors[key].model_copy(deep=True)
+                DescriptorEntry(key, self._descriptors[key].descriptor.model_copy(deep=True))
                 for key in sorted(self._descriptors)
+                if origin is None or key.origin is origin
             )
+
+    def _descriptor_snapshot(
+        self,
+        origin: DescriptorOrigin | None = None,
+    ) -> tuple[TrainingDataDescriptor, ...]:
+        return tuple(entry.descriptor for entry in self._descriptor_entry_snapshot(origin))
 
     def shutdown(self) -> None:
         self._closing.set()
@@ -309,8 +396,8 @@ class DatasetCoordinator:
             if self._closing.is_set():
                 raise RuntimeError("dataset coordinator is shutting down")
             job.state = DatasetJobState.RESOLVING
-            descriptors = self._descriptor_snapshot()
-            job.resources = self._resolve(job.intent, descriptors)
+            entries = self._descriptor_entry_snapshot(job.descriptor_origin)
+            job.resources = self._resolve_entries(job.intent, entries, job.descriptor_origin)
             if not job.resources:
                 raise RuntimeError("no accepted SMF collection resource matches the retrain scopes")
             self._ensure_window_coverage(job)
@@ -349,16 +436,30 @@ class DatasetCoordinator:
         intent: RetrainIntent,
         descriptors: tuple[TrainingDataDescriptor, ...],
     ) -> tuple[ResolvedResource, ...]:
-        return self._resolve_descriptors(intent, descriptors)
+        entries = tuple(
+            DescriptorEntry(
+                DescriptorKey(
+                    DescriptorOrigin.CONSUMER_SUBSCRIPTION,
+                    descriptor.correlation_id,
+                ),
+                descriptor,
+            )
+            for descriptor in descriptors
+        )
+        return self._resolve_entries(intent, entries, None)
 
-    def _resolve_descriptors(
+    def _resolve_entries(
         self,
         intent: RetrainIntent,
-        descriptors: tuple[TrainingDataDescriptor, ...],
+        entries: tuple[DescriptorEntry, ...],
+        required_origin: DescriptorOrigin | None,
     ) -> tuple[ResolvedResource, ...]:
         now = self._clock().astimezone(UTC)
         resolved: list[ResolvedResource] = []
-        for descriptor in descriptors:
+        for entry in entries:
+            if required_origin is not None and entry.key.origin is not required_origin:
+                continue
+            descriptor = entry.descriptor
             if descriptor.retain_until <= now:
                 continue
             event = descriptor.ml_event_subscription
@@ -393,8 +494,17 @@ class DatasetCoordinator:
                     adrf_instance_id=descriptor.adrf_instance_id or "",
                     available_start=descriptor.stored_data_spec.time_period.start_time,
                     available_stop=descriptor.stored_data_spec.time_period.stop_time,
+                    descriptor_origin=entry.key.origin,
+                    collection_group_id=entry.key.collection_group_id,
                 )
             )
+        private_groups = {
+            resource.collection_group_id
+            for resource in resolved
+            if resource.descriptor_origin is DescriptorOrigin.PRIVATE_API
+        }
+        if len(private_groups) > 1:
+            raise RuntimeError("multiple private collection groups match the requested dataset")
         for scope in intent.active_scope_keys:
             if not any(scope in resource.scope_keys for resource in resolved):
                 reference = next(
@@ -416,7 +526,7 @@ class DatasetCoordinator:
                             "tgtUe": item.ml_event_subscription.target_ue,
                             "retainUntil": item.retain_until.isoformat(),
                         }
-                        for item in descriptors
+                        for item in (entry.descriptor for entry in entries)
                     ],
                 )
                 raise RuntimeError(f"scope {scope} has no usable training-data descriptor")
@@ -745,6 +855,8 @@ class DatasetCoordinator:
                     ),
                     smf_data_sub=matching_resources[0].smf_data_sub,
                     supi=matching_resources[0].supi,
+                    descriptor_origin=matching_resources[0].descriptor_origin,
+                    collection_group_id=matching_resources[0].collection_group_id,
                 )
                 records.append(
                     (
@@ -770,13 +882,27 @@ class DatasetCoordinator:
         if not record.data_notif.upf_event_notifs:
             return
         payload = record.model_dump(by_alias=True, exclude_none=True, mode="json")
-        identity = (
-            native_id
-            or hashlib.sha256(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        if resource.descriptor_origin is DescriptorOrigin.PRIVATE_API:
+            notifications = payload["dataNotif"]["upfEventNotifs"]
+            canonical = self._without_transport_correlation(notifications)
+            identity = hashlib.sha256(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
-        )
-        if any(item.identity == identity and item.source == source for item in job.records):
+        else:
+            identity = (
+                native_id
+                or hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            )
+        if any(
+            item.identity == identity
+            and (
+                resource.descriptor_origin is DescriptorOrigin.PRIVATE_API
+                or item.source == source
+            )
+            for item in job.records
+        ):
             return
         if len(job.records) >= self._settings.max_records_per_job:
             raise RuntimeError("dataset exceeds max_records_per_job")
@@ -789,6 +915,20 @@ class DatasetCoordinator:
                 payload,
             )
         )
+
+    @staticmethod
+    def _without_transport_correlation(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: DatasetCoordinator._without_transport_correlation(item)
+                for key, item in value.items()
+                if key != "correlationId"
+            }
+        if isinstance(value, list):
+            return [
+                DatasetCoordinator._without_transport_correlation(item) for item in value
+            ]
+        return value
 
     def _complete(self, job: DatasetJob) -> None:
         counts = {

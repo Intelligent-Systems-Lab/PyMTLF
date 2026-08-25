@@ -49,12 +49,15 @@ class AdrfResolver:
             self._client.close()
 
     def resolve(self, required_nf_instance_id: str = "") -> str | None:
-        target = self._resolve_service(
+        target = self.resolve_data(required_nf_instance_id)
+        return target.api_root if target is not None else None
+
+    def resolve_data(self, required_nf_instance_id: str = "") -> SelectedTarget | None:
+        return self._resolve_service(
             "nadrf-datamanagement",
             "data-storage-ind",
             required_nf_instance_id,
         )
-        return target.api_root if target is not None else None
 
     def resolve_model(self) -> SelectedTarget | None:
         return self._resolve_service("nadrf-mlmodelmanagement", "ml-model-storage-ind")

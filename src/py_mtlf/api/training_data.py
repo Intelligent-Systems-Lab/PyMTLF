@@ -14,7 +14,7 @@ def put_training_data_descriptor(
     request: Request,
 ) -> Response:
     normalized_id = str(UUID(descriptor_id))
-    request.app.state.dataset_coordinator.put_training_data_descriptor(
+    request.app.state.dataset_coordinator.put_consumer_training_data_descriptor(
         normalized_id,
         descriptor,
     )
@@ -23,5 +23,7 @@ def put_training_data_descriptor(
 
 @router.delete("/{descriptor_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_training_data_descriptor(descriptor_id: str, request: Request) -> Response:
-    request.app.state.dataset_coordinator.delete_training_data_descriptor(str(UUID(descriptor_id)))
+    request.app.state.dataset_coordinator.delete_consumer_training_data_descriptor(
+        str(UUID(descriptor_id))
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

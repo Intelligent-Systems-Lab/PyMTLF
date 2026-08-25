@@ -1,7 +1,7 @@
 import re
 from math import isfinite
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -194,8 +194,149 @@ class FallbackDeadlineSettings(FrozenSettings):
     round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
 
 
-class FLTrainingDataSettings(FrozenSettings):
+class ConsumerSubscriptionTrainingDataSettings(FrozenSettings):
     collection_trigger: Literal["consumer_subscription"]
+
+
+class PrivateCollectionConsentSettings(FrozenSettings):
+    purpose: Literal["model_training"]
+    policy: Literal["not_required_by_local_policy"]
+
+
+class PrivateCollectionTargetSettings(FrozenSettings):
+    int_group_ids: tuple[str, ...] = Field(alias="intGroupIds", min_length=1)
+
+    @field_validator("int_group_ids")
+    @classmethod
+    def validate_group_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("private collection Internal Group IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("private collection Internal Group IDs must be unique")
+        return normalized
+
+
+class PrivateCollectionSnssaiSettings(FrozenSettings):
+    sst: int = Field(ge=0, le=255)
+    sd: str = ""
+
+    @field_validator("sd")
+    @classmethod
+    def validate_sd(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized and not re.fullmatch(r"[0-9A-F]{6}", normalized):
+            raise ValueError("private collection S-NSSAI sd must be six hexadecimal digits")
+        return normalized
+
+
+def _contains_area_filter(value: object) -> bool:
+    forbidden = {"area", "networkarea", "tai", "tais", "trackingarealist"}
+    if isinstance(value, dict):
+        return any(
+            str(key).replace("_", "").lower() in forbidden
+            or _contains_area_filter(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_area_filter(item) for item in value)
+    return False
+
+
+class PrivateCollectionProfileSettings(FrozenSettings):
+    profile_id: str
+    ml_event: Literal["UE_COMMUNICATION"]
+    ml_event_filter: dict[str, Any] = Field(default_factory=dict)
+    target_ue: PrivateCollectionTargetSettings
+    dnns: tuple[str, ...] = ()
+    snssais: tuple[PrivateCollectionSnssaiSettings, ...] = ()
+    sampling_interval_seconds: int = Field(gt=0, le=86400)
+    minimum_observation_count: int = Field(gt=0, le=1000000)
+
+    @field_validator("profile_id")
+    @classmethod
+    def validate_profile_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("private collection profile_id must not be blank")
+        return normalized
+
+    @field_validator("ml_event_filter")
+    @classmethod
+    def reject_area_filters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if _contains_area_filter(value):
+            raise ValueError("private collection profile must not contain area or TAI filters")
+        return value
+
+    @field_validator("dnns")
+    @classmethod
+    def validate_dnns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip().lower() for value in values)
+        label = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+        if any(
+            not value
+            or len(value) > 253
+            or any(not label.fullmatch(part) for part in value.split("."))
+            for value in normalized
+        ):
+            raise ValueError("private collection DNN values must be valid domain names")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("private collection DNN values must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_unique_snssais(self) -> "PrivateCollectionProfileSettings":
+        identities = tuple((item.sst, item.sd) for item in self.snssais)
+        if len(identities) != len(set(identities)):
+            raise ValueError("private collection S-NSSAI values must be unique")
+        return self
+
+
+class PrivateAPITrainingDataSettings(FrozenSettings):
+    collection_trigger: Literal["private_api"]
+    callback_base_uri: str
+    state_directory: Path
+    request_timeout_seconds: float = Field(default=30, gt=0, le=3600)
+    retry_initial_backoff_seconds: float = Field(default=1, ge=0, le=600)
+    retry_max_backoff_seconds: float = Field(default=30, gt=0, le=3600)
+    worker_count: int = Field(default=2, gt=0, le=32)
+    queue_capacity: int = Field(default=256, gt=0, le=100000)
+    descriptor_retention_seconds: int = Field(default=3600, gt=0, le=604800)
+    consent: PrivateCollectionConsentSettings
+    collection_profiles: tuple[PrivateCollectionProfileSettings, ...] = Field(min_length=1)
+
+    @field_validator("callback_base_uri")
+    @classmethod
+    def validate_callback_base_uri(cls, value: str) -> str:
+        return _validate_http_base_url(
+            value,
+            "federated_learning.client.training_data.callback_base_uri",
+        )
+
+    @field_validator("state_directory", mode="before")
+    @classmethod
+    def validate_state_directory(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("private collection state_directory must not be blank")
+        path = Path(value)  # type: ignore[arg-type]
+        if not path.is_absolute():
+            raise ValueError("private collection state_directory must be resolved from config")
+        return path
+
+    @model_validator(mode="after")
+    def validate_private_collection(self) -> "PrivateAPITrainingDataSettings":
+        if self.retry_initial_backoff_seconds > self.retry_max_backoff_seconds:
+            raise ValueError("private collection initial retry must not exceed maximum")
+        profile_ids = tuple(profile.profile_id for profile in self.collection_profiles)
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("private collection profile IDs must be unique")
+        return self
+
+
+FLTrainingDataSettings = Annotated[
+    ConsumerSubscriptionTrainingDataSettings | PrivateAPITrainingDataSettings,
+    Field(discriminator="collection_trigger"),
+]
 
 
 class FLClientSettings(FrozenSettings):
@@ -661,6 +802,17 @@ def load_settings(path: str | Path) -> Settings:
                         topology["config_file"] = str(
                             (config_path.parent / candidate).resolve()
                         )
+            client = federated_learning.get("client")
+            if isinstance(client, dict):
+                training_data = client.get("training_data")
+                if isinstance(training_data, dict):
+                    state_directory = training_data.get("state_directory")
+                    if isinstance(state_directory, str) and state_directory.strip():
+                        candidate = Path(state_directory)
+                        if not candidate.is_absolute():
+                            training_data["state_directory"] = str(
+                                (config_path.parent / candidate).resolve()
+                            )
     return Settings.model_validate(raw)
 
 
