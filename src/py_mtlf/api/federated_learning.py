@@ -2,48 +2,48 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, Response
 
 from py_mtlf.api.problems import problem_response
-from py_mtlf.core.fl_root import (
-    RootCoordinatorUnavailableError,
-    RootModelFamilyNotFoundError,
-    RootRequestConflictError,
-    RootRequestSnapshot,
+from py_mtlf.core.fl_orchestration import (
+    TopLevelCoordinatorUnavailableError,
+    TopLevelModelFamilyNotFoundError,
+    TopLevelRequestConflictError,
+    TopLevelRequestSnapshot,
 )
-from py_mtlf.wire.hierarchical_fl import (
-    HierarchicalTrainingRequest,
-    HierarchicalTrainingStatus,
+from py_mtlf.wire.federated_learning import (
+    FederatedTrainingRequest,
+    FederatedTrainingStatus,
 )
 
 router = APIRouter(
-    prefix="/internal/v1/hierarchical-fl",
-    tags=["hierarchical-fl"],
+    prefix="/internal/v1/federated-learning",
+    tags=["federated-learning"],
 )
 
 
 @router.post("/training-requests", status_code=status.HTTP_202_ACCEPTED)
-def create_hierarchical_training_request(
-    payload: HierarchicalTrainingRequest,
+def create_federated_training_request(
+    payload: FederatedTrainingRequest,
     request: Request,
 ) -> Response:
     try:
-        snapshot = request.app.state.fl_root.submit_manual(
+        snapshot = request.app.state.fl_coordinator.submit_manual(
             request_id=payload.request_id,
             model_family_id=payload.model_family_id,
         )
-    except RootRequestConflictError as error:
+    except TopLevelRequestConflictError as error:
         return problem_response(
             status.HTTP_409_CONFLICT,
             "Conflict",
             str(error),
             cause="CONFLICTING_REQUEST",
         )
-    except RootModelFamilyNotFoundError as error:
+    except TopLevelModelFamilyNotFoundError as error:
         return problem_response(
             status.HTTP_404_NOT_FOUND,
             "Not Found",
             str(error),
             cause="RESOURCE_NOT_FOUND",
         )
-    except RootCoordinatorUnavailableError as error:
+    except TopLevelCoordinatorUnavailableError as error:
         return problem_response(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Service Unavailable",
@@ -52,7 +52,7 @@ def create_hierarchical_training_request(
         )
     location = str(
         request.url_for(
-            "get_hierarchical_training_request",
+            "get_federated_training_request",
             request_id=snapshot.request_id,
         )
     )
@@ -60,29 +60,31 @@ def create_hierarchical_training_request(
 
 
 @router.get("/training-requests/{request_id}")
-def get_hierarchical_training_request(request_id: str, request: Request) -> Response:
-    snapshot = request.app.state.fl_root.get(request_id)
+def get_federated_training_request(request_id: str, request: Request) -> Response:
+    snapshot = request.app.state.fl_coordinator.get(request_id)
     if snapshot is None:
         return problem_response(
             status.HTTP_404_NOT_FOUND,
             "Not Found",
-            f"hierarchical training request {request_id} was not found",
+            f"federated training request {request_id} was not found",
             cause="RESOURCE_NOT_FOUND",
         )
     return _status_response(snapshot, status.HTTP_200_OK)
 
 
 def _status_response(
-    snapshot: RootRequestSnapshot,
+    snapshot: TopLevelRequestSnapshot,
     status_code: int,
     *,
     location: str = "",
 ) -> JSONResponse:
-    value = HierarchicalTrainingStatus(
+    value = FederatedTrainingStatus(
         requestId=snapshot.request_id,
-        planId=snapshot.plan_id,
         modelFamilyId=snapshot.model_family_id,
-        state=snapshot.state,
+        mode=snapshot.mode,
+        participantSource=snapshot.participant_source,
+        triggerSource=snapshot.trigger_source,
+        state=str(snapshot.state),
         currentRound=snapshot.current_round,
         completedRounds=snapshot.completed_rounds or None,
         candidateDigest=snapshot.candidate_digest or None,

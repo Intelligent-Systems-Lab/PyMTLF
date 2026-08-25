@@ -47,6 +47,8 @@ federated_learning:
     client_training:
       epochs: 18
   client:
+    training_data:
+      collection_trigger: "consumer_subscription"
     callback_deadline_margin_seconds: 5
     callback_queue_size: 256
     max_concurrent_jobs: 2

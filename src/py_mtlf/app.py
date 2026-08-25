@@ -14,8 +14,8 @@ from fastapi.responses import JSONResponse
 from py_mtlf.api import (
     adrf,
     artifacts,
+    federated_learning,
     health,
-    hierarchical_fl,
     ml_model_monitor,
     ml_model_provision,
     ml_model_training,
@@ -29,11 +29,12 @@ from py_mtlf.core.dataset import DatasetCoordinator
 from py_mtlf.core.fl_branch import FLBranchPreparationCoordinator
 from py_mtlf.core.fl_client import FLClientEngine
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
+from py_mtlf.core.fl_flat import FlatFLCoordinator
 from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
 from py_mtlf.core.fl_hierarchy_discovery import HierarchyNodeResolver
 from py_mtlf.core.fl_root import FLRootCoordinator
 from py_mtlf.core.fl_server import FLClientResolver, FLServerEngine
-from py_mtlf.core.fl_topology import StaticTopologyPlanner
+from py_mtlf.core.fl_topology import StaticFlatTopologyPlanner, StaticTopologyPlanner
 from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.model_records import (
     CompletedRevision,
@@ -232,7 +233,12 @@ def create_app(
     if fl_server is not None:
         fl_server_holder["server"] = fl_server
     fl_branch = None
-    if fl_client_settings is not None and fl_server is not None:
+    orchestration_settings = settings.federated_learning.orchestration
+    if (
+        fl_client_settings is not None
+        and fl_server is not None
+        and orchestration_settings is None
+    ):
         fl_branch = FLBranchPreparationCoordinator(
             resolver=HierarchyNodeResolver(
                 settings.federated_learning,
@@ -261,37 +267,59 @@ def create_app(
     )
     topology_settings = settings.federated_learning.topology
     strategy_settings = settings.federated_learning.strategy
+    fl_coordinator = None
     fl_root = None
-    if topology_settings is not None:
-        if fl_server is None or strategy_settings is None:
-            raise RuntimeError("validated hierarchy configuration is incomplete")
-        topology_planner = StaticTopologyPlanner.load(topology_settings.config_file)
-        hierarchy_resolver = HierarchyNodeResolver(
-            settings.federated_learning,
-            nwdaf_context,
-        )
-        fl_root = FLRootCoordinator(
-            strategy=strategy_settings,
-            server_settings=fl_server_settings,
-            planner=topology_planner,
-            resolver=hierarchy_resolver,
-            nwdaf_context=nwdaf_context,
-            catalog=seed_catalog,
-            artifact_service=HierarchyArtifactService(fl_workspace),
-            workspace=fl_workspace,
-            server=fl_server,
-            policy=accuracy_policy,
-            experiments=fl_experiments,
-            terminal_status_ttl_seconds=(
-                settings.federated_learning.lifecycle.terminal_status_ttl_seconds
-            ),
-        )
+    if orchestration_settings is not None:
+        if fl_server is None or fl_server_settings is None:
+            raise RuntimeError("validated orchestration configuration is incomplete")
+        if orchestration_settings.mode == "hierarchical":
+            if topology_settings is None or strategy_settings is None:
+                raise RuntimeError("validated hierarchy configuration is incomplete")
+            topology_planner = StaticTopologyPlanner.load(topology_settings.config_file)
+            hierarchy_resolver = HierarchyNodeResolver(
+                settings.federated_learning,
+                nwdaf_context,
+            )
+            fl_root = FLRootCoordinator(
+                strategy=strategy_settings,
+                server_settings=fl_server_settings,
+                planner=topology_planner,
+                resolver=hierarchy_resolver,
+                nwdaf_context=nwdaf_context,
+                catalog=seed_catalog,
+                artifact_service=HierarchyArtifactService(fl_workspace),
+                workspace=fl_workspace,
+                server=fl_server,
+                policy=accuracy_policy,
+                experiments=fl_experiments,
+                terminal_status_ttl_seconds=(
+                    settings.federated_learning.lifecycle.terminal_status_ttl_seconds
+                ),
+            )
+            fl_coordinator = fl_root
+        else:
+            flat_planner = (
+                StaticFlatTopologyPlanner.load(topology_settings.config_file)
+                if topology_settings is not None
+                else None
+            )
+            fl_coordinator = FlatFLCoordinator(
+                orchestration=orchestration_settings,
+                server=fl_server,
+                policy=accuracy_policy,
+                catalog=seed_catalog,
+                nwdaf_context=nwdaf_context,
+                planner=flat_planner,
+                terminal_status_ttl_seconds=(
+                    settings.federated_learning.lifecycle.terminal_status_ttl_seconds
+                ),
+            )
 
     def reset_containing_nwdaf_generation(reason: str) -> None:
         logger.warning("Discarding FL state after containing NWDAF reset: %s", reason)
         publication.abort_generation()
         errors: list[Exception] = []
-        for owner in (fl_root, fl_client, fl_server):
+        for owner in (fl_coordinator, fl_client, fl_server):
             if owner is None:
                 continue
             try:
@@ -341,8 +369,8 @@ def create_app(
             runtime.accepting_requests = False
             generation_monitor.stop()
             publication.stop()
-            if fl_root is not None:
-                fl_root.close()
+            if fl_coordinator is not None:
+                fl_coordinator.close()
             if fl_branch is not None:
                 fl_branch.close()
             fl_experiments.shutdown()
@@ -394,6 +422,10 @@ def create_app(
     app.state.fl_server = fl_server
     app.state.fl_branch = fl_branch
     app.state.fl_root = fl_root
+    app.state.fl_coordinator = fl_coordinator
+    app.state.federated_degradation_enabled = (
+        settings.federated_learning.training_trigger.degradation.enabled
+    )
     app.state.fl_experiments = fl_experiments
     app.state.publication = publication
     app.state.state_lock = state_lock
@@ -407,10 +439,10 @@ def create_app(
     if fl_client is not None or fl_server is not None:
         app.include_router(ml_model_training.router)
     if (
-        fl_root is not None
+        fl_coordinator is not None
         and settings.federated_learning.training_trigger.private_api.enabled
     ):
-        app.include_router(hierarchical_fl.router)
+        app.include_router(federated_learning.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -420,7 +452,7 @@ def create_app(
             (
                 "/internal/v1/ml-model-",
                 "/internal/v1/adrf-data-management/",
-                "/internal/v1/hierarchical-fl/",
+                "/internal/v1/federated-learning/",
             )
         ):
             from py_mtlf.api.problems import problem_response

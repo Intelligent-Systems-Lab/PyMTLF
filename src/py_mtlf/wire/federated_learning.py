@@ -2,14 +2,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from py_mtlf.core.fl_root import RootRequestState
 
-
-class HierarchyPrivateModel(BaseModel):
+class FederatedLearningPrivateModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
-class HierarchicalTrainingRequest(HierarchyPrivateModel):
+class FederatedTrainingRequest(FederatedLearningPrivateModel):
     request_id: str = Field(alias="requestId")
     model_family_id: str = Field(min_length=1, alias="modelFamilyId")
 
@@ -32,11 +30,13 @@ class HierarchicalTrainingRequest(HierarchyPrivateModel):
         return value
 
 
-class HierarchicalTrainingStatus(HierarchyPrivateModel):
+class FederatedTrainingStatus(FederatedLearningPrivateModel):
     request_id: str = Field(alias="requestId")
-    plan_id: str = Field(alias="planId")
     model_family_id: str = Field(alias="modelFamilyId")
-    state: RootRequestState
+    mode: str
+    participant_source: str = Field(alias="participantSource")
+    trigger_source: str = Field(alias="triggerSource")
+    state: str
     current_round: int | None = Field(default=None, ge=0, alias="currentRound")
     completed_rounds: int | None = Field(default=None, ge=0, alias="completedRounds")
     candidate_digest: str | None = Field(

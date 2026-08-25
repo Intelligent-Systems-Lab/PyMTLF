@@ -14,7 +14,10 @@ def test_training_requirements_failure_identifies_invalid_parameters(
     payload["federated_learning"] = FederatedLearningSettings(
         workspace_root=tmp_path / "fl-client",
         public_base_url=settings.artifact.public_base_url,
-        client=FLClientSettings(model_interoperability_ids=("001122",)),
+        client=FLClientSettings(
+            training_data={"collection_trigger": "consumer_subscription"},
+            model_interoperability_ids=("001122",),
+        ),
     )
     configured = Settings.model_validate(payload)
     with TestClient(create_app(configured)) as client:
@@ -62,7 +65,10 @@ def test_training_admission_is_unavailable_without_containing_go_generation(
     payload["federated_learning"] = FederatedLearningSettings(
         workspace_root=tmp_path / "fl-client",
         public_base_url=settings.artifact.public_base_url,
-        client=FLClientSettings(model_interoperability_ids=("001122",)),
+        client=FLClientSettings(
+            training_data={"collection_trigger": "consumer_subscription"},
+            model_interoperability_ids=("001122",),
+        ),
     )
     configured = Settings.model_validate(payload)
     with TestClient(create_app(configured)) as client:

@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import threading
@@ -23,12 +24,21 @@ from py_mtlf.core.fl_artifacts import (
     WapeComponents,
 )
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
+from py_mtlf.core.fl_orchestration import (
+    FlatExecutionRequest,
+    FlatParticipantScope,
+    MonitorParticipantSelection,
+    StaticParticipantSelection,
+    TriggerSource,
+)
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
     FLClientResolver,
     FLParticipant,
     FLProcess,
+    FLServerAdmissionClosedError,
     FLServerEngine,
+    FLServerProcessConflictError,
     FLServerState,
     HierarchyPreparationTarget,
     HierarchyValidationCollection,
@@ -56,6 +66,36 @@ def candidate(nf_id: str, tac: str) -> FLClientCandidate:
     )
 
 
+def discovery_profile(target_id: str) -> dict:
+    return {
+        "nfInstanceId": target_id,
+        "nfStatus": "REGISTERED",
+        "nwdafInfo": {
+            "mlAnalyticsList": [
+                {
+                    "mlAnalyticsIds": ["UE_COMMUNICATION"],
+                    "trackingAreaList": [
+                        {
+                            "plmnId": {"mcc": "466", "mnc": "92"},
+                            "tac": "000001",
+                        }
+                    ],
+                    "mlModelInterInfo": {"vendorList": ["001122"]},
+                    "flCapabilityType": "FL_CLIENT",
+                }
+            ]
+        },
+        "nfServices": [
+            {
+                "serviceInstanceId": "training-a",
+                "serviceName": "nnwdaf-mlmodeltraining",
+                "nfServiceStatus": "REGISTERED",
+                "apiPrefix": "http://nwdaf-a.example",
+            }
+        ],
+    }
+
+
 def scope(name: str, tac: str, owner_id: str) -> ScopeReference:
     return ScopeReference(
         scope_key=name,
@@ -73,6 +113,23 @@ def scope(name: str, tac: str, owner_id: str) -> ScopeReference:
             }
         },
         target_ue={"intGroupIds": ["group-G"]},
+    )
+
+
+def flat_execution(
+    family_key: str,
+    scopes: tuple[ScopeReference, ...] = (),
+) -> FlatExecutionRequest:
+    return FlatExecutionRequest(
+        model_family_id=family_key,
+        trigger_source=TriggerSource.DEGRADATION,
+        participant_selection=MonitorParticipantSelection(
+            participants=tuple(
+                FlatParticipantScope.from_monitor_scope(item) for item in scopes
+            )
+        ),
+        required_cutover_scope_keys=tuple(item.scope_key for item in scopes),
+        triggering_scope_key=scopes[0].scope_key if scopes else None,
     )
 
 
@@ -127,7 +184,7 @@ def test_assignment_does_not_substitute_another_eligible_same_tai_client():
     owner_id = "11111111-1111-4111-8111-111111111111"
     decoy_id = "00000000-0000-4000-8000-000000000000"
 
-    with pytest.raises(RuntimeError, match=f"monitor owner {owner_id}"):
+    with pytest.raises(RuntimeError, match=f"configured participant {owner_id}"):
         _assign(
             (scope("scope-a", "000001", owner_id),),
             (candidate(decoy_id, "000001"),),
@@ -215,11 +272,224 @@ def test_fl_client_discovery_requests_training_capability_for_scope_tai():
     client.close()
 
 
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "identity",
+        "nf_status",
+        "service_name",
+        "service_status",
+        "capability",
+        "event",
+        "interoperability",
+        "tracking_area",
+    ],
+)
+def test_fl_client_discovery_rejects_exact_profile_mismatch(mismatch):
+    target_id = "11111111-1111-4111-8111-111111111111"
+    profile = discovery_profile(target_id)
+    analytics = profile["nwdafInfo"]["mlAnalyticsList"][0]
+    service = profile["nfServices"][0]
+    if mismatch == "identity":
+        profile["nfInstanceId"] = "22222222-2222-4222-8222-222222222222"
+    elif mismatch == "nf_status":
+        profile["nfStatus"] = "SUSPENDED"
+    elif mismatch == "service_name":
+        service["serviceName"] = "nnwdaf-analyticsinfo"
+    elif mismatch == "service_status":
+        service["nfServiceStatus"] = "SUSPENDED"
+    elif mismatch == "capability":
+        analytics["flCapabilityType"] = "FL_SERVER"
+    elif mismatch == "event":
+        analytics["mlAnalyticsIds"] = ["DN_PERFORMANCE"]
+    elif mismatch == "interoperability":
+        analytics["mlModelInterInfo"] = {"vendorList": ["different"]}
+    else:
+        analytics["trackingAreaList"][0]["tac"] = "000999"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"nfInstances": [profile]},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    resolver = FLClientResolver(
+        FederatedLearningSettings(),
+        context_client(
+            nf_instance_id="33333333-3333-4333-8333-333333333333",
+            internal_api_root="http://go-internal.example",
+        ),
+        client,
+    )
+    try:
+        participant_scope = FlatParticipantScope.from_monitor_scope(
+            scope("scope-a", "000001", target_id)
+        )
+        assert resolver.discover(participant_scope, "001122") == ()
+    finally:
+        client.close()
+
+
+def test_assignment_rejects_duplicate_exact_training_service_candidates():
+    target_id = "11111111-1111-4111-8111-111111111111"
+    first = candidate(target_id, "000001")
+    second = copy.deepcopy(first)
+    second = FLClientCandidate(
+        target=second.target.model_copy(
+            update={"nf_service_instance_id": "training-duplicate"}
+        ),
+        tracking_areas=second.tracking_areas,
+    )
+
+    with pytest.raises(RuntimeError, match="eligible unique FL Client"):
+        _assign((scope("scope-a", "000001", target_id),), (first, second))
+
+
+def test_flat_discovery_validates_every_participant_before_preparation_dispatch(tmp_path):
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    scopes = (
+        scope("scope-a", "000001", first_id),
+        scope("scope-b", "000002", second_id),
+    )
+    catalog = Mock()
+    catalog.current.return_value = SimpleNamespace(
+        artifact=Mock(key="a" * 64, url="http://root.example/base.tar.gz"),
+        descriptor=Mock(model_interoperability="001122"),
+    )
+    resolver = Mock()
+    resolver.discover.side_effect = ((candidate(first_id, "000001"),), ())
+    policy = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        policy,
+        catalog,
+        Mock(),
+        resolver,
+        client=Mock(),
+    )
+    orchestrator._create_preparation = Mock()
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", scopes),
+    )
+    try:
+        orchestrator._run(process)
+
+        assert process.state is FLServerState.FAILED
+        orchestrator._create_preparation.assert_not_called()
+        policy.complete_retrain.assert_called_once_with("ue-communication-default")
+    finally:
+        orchestrator.close()
+
+
+def test_flat_discovery_rejects_identical_duplicate_candidates_before_dispatch(tmp_path):
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    scopes = (
+        scope("scope-a", "000001", first_id),
+        scope("scope-b", "000002", second_id),
+    )
+    catalog = Mock()
+    catalog.current.return_value = SimpleNamespace(
+        artifact=Mock(key="a" * 64, url="http://root.example/base.tar.gz"),
+        descriptor=Mock(model_interoperability="001122"),
+    )
+    resolver = Mock()
+    duplicate = candidate(first_id, "000001")
+    resolver.discover.side_effect = (
+        (duplicate, duplicate),
+        (candidate(second_id, "000002"),),
+    )
+    policy = Mock()
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(preparation_timeout_seconds=1),
+        Mock(),
+        policy,
+        catalog,
+        Mock(),
+        resolver,
+        client=Mock(),
+    )
+    orchestrator._create_preparation = Mock()
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", scopes),
+    )
+    try:
+        orchestrator._run(process)
+
+        assert process.state is FLServerState.FAILED
+        assert "eligible unique FL Client" in process.failure
+        orchestrator._create_preparation.assert_not_called()
+        policy.complete_retrain.assert_called_once_with("ue-communication-default")
+    finally:
+        orchestrator.close()
+
+
+def test_flat_partial_preparation_dispatch_cleans_created_resource(tmp_path):
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    scopes = (
+        scope("scope-a", "000001", first_id),
+        scope("scope-b", "000002", second_id),
+    )
+    catalog = Mock()
+    catalog.current.return_value = SimpleNamespace(
+        artifact=Mock(key="a" * 64, url="http://root.example/base.tar.gz"),
+        descriptor=Mock(model_interoperability="001122"),
+    )
+    resolver = Mock()
+    resolver.discover.side_effect = (
+        (candidate(first_id, "000001"),),
+        (candidate(second_id, "000002"),),
+    )
+    policy = Mock()
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        policy,
+        catalog,
+        Mock(),
+        resolver,
+        client=client,
+    )
+
+    def dispatch(_process, participant, _interoperability, _base_url):
+        if participant.candidate.target.nf_instance_id == second_id:
+            raise RuntimeError("second preparation dispatch failed")
+        participant.resource_location = "http://go.example/subscriptions/first"
+
+    orchestrator._create_preparation = Mock(side_effect=dispatch)
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", scopes),
+    )
+    try:
+        orchestrator._run(process)
+
+        assert process.state is FLServerState.FAILED
+        client.delete.assert_called_once_with("http://go.example/subscriptions/first")
+        policy.complete_retrain.assert_called_once_with("ue-communication-default")
+    finally:
+        orchestrator.close()
+
+
 def test_server_process_reserves_shared_slot_until_cleanup_finishes(tmp_path):
     registry = FLExperimentRegistry()
     policy = Mock()
-    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
-    policy.take_intents.return_value = (intent,)
+    family_key = "ue-communication-default"
     catalog = Mock()
     catalog_entered = threading.Event()
     catalog_release = threading.Event()
@@ -243,7 +513,7 @@ def test_server_process_reserves_shared_slot_until_cleanup_finishes(tmp_path):
     )
 
     try:
-        orchestrator.accept_policy_intents()
+        orchestrator.start_flat(flat_execution(family_key))
         assert catalog_entered.wait(timeout=2)
         process = orchestrator.processes()[0]
         active = registry.active()
@@ -255,7 +525,7 @@ def test_server_process_reserves_shared_slot_until_cleanup_finishes(tmp_path):
 
         assert process.state is FLServerState.FAILED
         assert registry.active() is None
-        policy.complete_retrain.assert_called_once_with(intent.family_key)
+        policy.complete_retrain.assert_called_once_with(family_key)
     finally:
         catalog_release.set()
         if not orchestrator._closing.is_set():
@@ -266,8 +536,7 @@ def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
     registry = FLExperimentRegistry()
     registry.reserve_client("subscription-a", "correlation-a")
     policy = Mock()
-    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
-    policy.take_intents.return_value = (intent,)
+    family_key = "ue-communication-default"
     orchestrator = FLServerEngine(
         FederatedLearningSettings(workspace_root=tmp_path),
         FLServerSettings(),
@@ -281,15 +550,42 @@ def test_server_process_rejects_conflict_with_active_client_group(tmp_path):
     )
 
     try:
-        orchestrator.accept_policy_intents()
+        with pytest.raises(FLServerProcessConflictError, match="top-level experiment"):
+            orchestrator.start_flat(flat_execution(family_key))
 
-        process = orchestrator.processes()[0]
-        assert process.state is FLServerState.FAILED
-        assert "top-level experiment" in process.failure
+        assert orchestrator.processes() == ()
         assert registry.active().upper_client_subscription_ids == frozenset(
             {"subscription-a"}
         )
-        policy.complete_retrain.assert_called_once_with(intent.family_key)
+        policy.complete_retrain.assert_not_called()
+    finally:
+        orchestrator.close()
+
+
+def test_flat_executor_admission_failure_is_bounded_and_discards_process(tmp_path):
+    registry = FLExperimentRegistry()
+    policy = Mock()
+    family_key = "ue-communication-default"
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        policy,
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+        experiments=registry,
+    )
+    orchestrator._executor.submit = Mock(side_effect=RuntimeError("executor details"))
+
+    try:
+        with pytest.raises(FLServerAdmissionClosedError, match="executor is unavailable"):
+            orchestrator.start_flat(flat_execution(family_key))
+
+        assert orchestrator.processes() == ()
+        assert registry.active() is None
+        policy.complete_retrain.assert_not_called()
     finally:
         orchestrator.close()
 
@@ -301,11 +597,7 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
         scope("scope-a", "000001", owner_id),
         scope("scope-b", "000002", second_owner_id),
     )
-    intent = SimpleNamespace(
-        family_key="ue-communication-default",
-        active_scope_keys=tuple(item.scope_key for item in active_scopes),
-        active_scopes=active_scopes,
-    )
+    execution = flat_execution("ue-communication-default", active_scopes)
     current = SimpleNamespace(
         artifact=SimpleNamespace(
             key="a" * 64,
@@ -316,9 +608,9 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
     catalog = Mock()
     catalog.current.return_value = current
     resolver = Mock()
-    resolver.discover.return_value = (
-        candidate(owner_id, "000001"),
-        candidate(second_owner_id, "000002"),
+    resolver.discover.side_effect = (
+        (candidate(owner_id, "000001"),),
+        (candidate(second_owner_id, "000002"),),
     )
     context = Mock()
     context.get.return_value.nf_instance_id = (
@@ -387,7 +679,7 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
     orchestrator._aggregate_round = Mock(side_effect=aggregates)
     orchestrator._patch_validation = Mock(side_effect=patch_validation)
     orchestrator._evaluate_final_validation = Mock(side_effect=evaluate_validation)
-    process = FLProcess(process_id="process-1", intent=intent)
+    process = FLProcess(process_id="process-1", intent=None, execution=execution)
     try:
         orchestrator._run(process)
 
@@ -535,9 +827,25 @@ def test_final_validation_rejects_owned_candidate_url_mismatch_without_download(
         orchestrator.close()
 
 
-def test_final_validation_uses_owned_candidate_and_downloads_only_peer_result(
+@pytest.mark.parametrize(
+    ("trigger_source", "triggering_scope_key", "candidate_error", "expected_reasons"),
+    [
+        (TriggerSource.PRIVATE_API, None, 5, ()),
+        (
+            TriggerSource.DEGRADATION,
+            "scope-a",
+            10,
+            ("triggering_scope_not_improved", "aggregate_not_improved"),
+        ),
+    ],
+)
+def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
     tmp_path,
     monkeypatch,
+    trigger_source,
+    triggering_scope_key,
+    candidate_error,
+    expected_reasons,
 ):
     participant_id = "11111111-1111-4111-8111-111111111111"
     base_digest = "b" * 64
@@ -578,7 +886,7 @@ def test_final_validation_uses_owned_candidate_and_downloads_only_peer_result(
                         "absolute_actual_sum": 100,
                     },
                     "candidate": {
-                        "absolute_error_sum": 5,
+                        "absolute_error_sum": candidate_error,
                         "absolute_actual_sum": 100,
                     },
                 },
@@ -615,7 +923,22 @@ def test_final_validation_uses_owned_candidate_and_downloads_only_peer_result(
     peer_artifact = Mock()
     process = FLProcess(
         process_id="process-1",
-        intent=SimpleNamespace(triggering_scope_key="scope-a"),
+        intent=None,
+        execution=FlatExecutionRequest(
+            model_family_id="ue-communication-default",
+            trigger_source=trigger_source,
+            participant_selection=StaticParticipantSelection(
+                participants=(
+                    FlatParticipantScope.from_monitor_scope(participant.scope),
+                ),
+                topology_digest="f" * 64,
+            ),
+            required_cutover_scope_keys=(
+                (triggering_scope_key,) if triggering_scope_key is not None else ()
+            ),
+            triggering_scope_key=triggering_scope_key,
+            request_id="00000000-0000-4000-8000-000000000701",
+        ),
         participants=[participant],
         candidate_url=candidate_artifact.url,
     )
@@ -672,7 +995,10 @@ def test_final_validation_uses_owned_candidate_and_downloads_only_peer_result(
         )
         assert orchestrator._loader.load.call_args_list[2] == call(peer_artifact)
         assert process.candidate_artifact is candidate_artifact
-        assert process.gate_would_accept is True
+        assert process.gate_would_accept is (not expected_reasons)
+        assert process.gate_rejection_reasons == expected_reasons
+        assert len(process.validation_summaries) == 1
+        assert process.validation_summaries[0].participant_nf_instance_id == participant_id
     finally:
         orchestrator.close()
 
@@ -856,8 +1182,12 @@ def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_pat
     policy = Mock()
     publication = Mock()
     publication.mark_scope_adopted.return_value = True
-    intent = Mock(family_key=("UE_COMMUNICATION", "001122"))
-    process = FLProcess(process_id="process-1", intent=intent)
+    family_key = ("UE_COMMUNICATION", "001122")
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution(family_key),
+    )
     process.state = FLServerState.CUTOVER_PENDING
     process.published_model_id = 7
     reservation = registry.reserve_server(process.process_id)
@@ -878,10 +1208,10 @@ def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_pat
 
     try:
         assert registry.active() is not None
-        assert orchestrator.mark_scope_adopted(intent.family_key, 7, "scope-a") is True
+        assert orchestrator.mark_scope_adopted(family_key, 7, "scope-a") is True
         assert process.state is FLServerState.COMPLETE
         assert registry.active() is None
-        policy.complete_retrain.assert_called_once_with(intent.family_key)
+        policy.complete_retrain.assert_called_once_with(family_key)
     finally:
         orchestrator.close()
 
@@ -894,7 +1224,11 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
         notification_correlation_id="delay-client-a",
         resource_location="http://go.example/subscriptions/resource-a",
     )
-    process = FLProcess(process_id="process-1", intent=Mock())
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", (participant.scope,)),
+    )
     process.state = FLServerState.PREPARATION_WAITING
     process.participants = [participant]
     orchestrator = FLServerEngine(
@@ -1043,7 +1377,11 @@ def test_flat_preparation_termination_still_fails_the_process(tmp_path):
         notification_correlation_id="preparation-client-a",
         resource_location="http://go.example/subscriptions/resource-a",
     )
-    process = FLProcess(process_id="process-1", intent=Mock())
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", (participant.scope,)),
+    )
     process.state = FLServerState.PREPARATION_WAITING
     process.participants = [participant]
     orchestrator = FLServerEngine(
@@ -2362,10 +2700,11 @@ def test_go_generation_reset_discards_server_process_and_callbacks(tmp_path):
         notification_correlation_id="old-callback",
         resource_location="http://go.example/subscriptions/old-resource",
     )
-    intent = SimpleNamespace(family_key=("UE_COMMUNICATION", "001122"))
+    family_key = ("UE_COMMUNICATION", "001122")
     process = FLProcess(
         process_id="process-1",
-        intent=intent,
+        intent=None,
+        execution=flat_execution(family_key, (participant.scope,)),
         experiment_reservation_id=reservation.reservation_id,
         participants=[participant],
     )
@@ -2395,7 +2734,7 @@ def test_go_generation_reset_discards_server_process_and_callbacks(tmp_path):
                 NwdafMLModelTrainNotif(notifCorreId="old-callback", termTrainReq="STOP")
             )
         client.delete.assert_called_once_with(old_location)
-        policy.complete_retrain.assert_called_once_with(intent.family_key)
+        policy.complete_retrain.assert_called_once_with(family_key)
     finally:
         registry.reset_generation()
         orchestrator.close()

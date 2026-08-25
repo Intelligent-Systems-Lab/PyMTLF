@@ -35,16 +35,32 @@ def with_engines(
         "public_base_url": settings.artifact.public_base_url,
         "server": FLServerSettings() if server else None,
         "client": (
-            FLClientSettings(model_interoperability_ids=("001122",))
+            FLClientSettings(
+                training_data={"collection_trigger": "consumer_subscription"},
+                model_interoperability_ids=("001122",),
+            )
             if client
             else None
         ),
     }
+    if server and not client:
+        payload["federated_learning"]["orchestration"] = {
+            "mode": "flat",
+            "participant_source": "monitor_scopes",
+        }
+        payload["federated_learning"]["training_trigger"] = {
+            "degradation": {"enabled": True},
+            "private_api": {"enabled": False},
+        }
     return settings.__class__.model_validate(payload)
 
 
 def with_hierarchy(settings, workspace: Path, topology_path: Path, *, private_api: bool):
     payload = with_engines(settings, workspace, server=True).model_dump(mode="python")
+    payload["federated_learning"]["orchestration"] = {
+        "mode": "hierarchical",
+        "participant_source": "static",
+    }
     payload["federated_learning"]["strategy"] = {
         "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
         "participant_selection": "all",
@@ -56,7 +72,25 @@ def with_hierarchy(settings, workspace: Path, topology_path: Path, *, private_ap
         "config_file": topology_path,
     }
     payload["federated_learning"]["training_trigger"] = {
+        "degradation": {"enabled": True},
         "private_api": {"enabled": private_api}
+    }
+    return settings.__class__.model_validate(payload)
+
+
+def with_static_flat(settings, workspace: Path, topology_path: Path):
+    payload = with_engines(settings, workspace, server=True).model_dump(mode="python")
+    payload["federated_learning"]["orchestration"] = {
+        "mode": "flat",
+        "participant_source": "static",
+    }
+    payload["federated_learning"]["topology"] = {
+        "strategy": "static",
+        "config_file": topology_path,
+    }
+    payload["federated_learning"]["training_trigger"] = {
+        "degradation": {"enabled": False},
+        "private_api": {"enabled": True},
     }
     return settings.__class__.model_validate(payload)
 
@@ -77,6 +111,27 @@ branches:
     )
 
 
+def write_flat_topology(path: Path) -> None:
+    path.write_text(
+        """
+version: 1
+clients:
+  - nf_instance_id: 00000000-0000-4000-8000-000000000101
+    scope:
+      tracking_areas:
+        - plmn_id: {mcc: "466", mnc: "92"}
+          tac: "001101"
+  - nf_instance_id: 00000000-0000-4000-8000-000000000102
+    scope:
+      tracking_areas:
+        - plmn_id: {mcc: "466", mnc: "92"}
+          tac: "001102"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
     app = create_app(
         with_engines(settings, tmp_path / "local"),
@@ -87,6 +142,7 @@ def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
         assert client.get("/health/ready").json()["runtimeMode"] == "local"
         assert app.state.fl_server is None
         assert app.state.fl_client is None
+        assert app.state.fl_coordinator is None
         assert app.state.training_coordinator is not None
         assert app.state.training_coordinator._workers
         assert "/internal/v1/ml-model-provision/subscriptions" in app.openapi()["paths"]
@@ -104,6 +160,8 @@ def test_fl_server_owns_model_services_without_local_training(settings, tmp_path
         assert app.state.fl_server is not None
         assert app.state.fl_client is None
         assert app.state.fl_branch is None
+        assert app.state.fl_coordinator is not None
+        assert app.state.fl_root is None
         assert app.state.training_coordinator is None
         paths = app.openapi()["paths"]
         assert "/internal/v1/ml-model-provision/subscriptions" in paths
@@ -128,6 +186,7 @@ def test_fl_client_starts_foundation_without_server_coordinators(settings, tmp_p
         assert app.state.fl_server is None
         assert app.state.fl_client is not None
         assert app.state.fl_branch is None
+        assert app.state.fl_coordinator is None
         assert app.state.training_coordinator is None
         paths = app.openapi()["paths"]
         assert "/internal/v1/artifacts/{artifact_key}" in paths
@@ -154,6 +213,7 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
         assert app.state.fl_server is not None
         assert app.state.fl_client is not None
         assert app.state.fl_branch is not None
+        assert app.state.fl_coordinator is None
         assert app.state.fl_client._branch_coordinator is app.state.fl_branch
         assert app.state.fl_client._experiments is app.state.fl_experiments
         assert app.state.fl_server._experiments is app.state.fl_experiments
@@ -178,7 +238,7 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
     assert app.state.fl_branch._closing is True
 
 
-def test_hierarchy_private_api_is_mounted_only_when_enabled(settings, tmp_path):
+def test_generic_training_api_is_mounted_only_when_enabled(settings, tmp_path):
     topology_path = tmp_path / "topology.yaml"
     write_topology(topology_path)
     disabled = create_app(
@@ -194,6 +254,76 @@ def test_hierarchy_private_api_is_mounted_only_when_enabled(settings, tmp_path):
 
     with TestClient(disabled) as client:
         assert disabled.state.fl_root is not None
+        assert disabled.state.fl_coordinator is disabled.state.fl_root
+        assert (
+            client.post(
+                "/internal/v1/federated-learning/training-requests",
+                json={},
+            ).status_code
+            == 404
+        )
+    with TestClient(enabled) as client:
+        malformed = client.post(
+            "/internal/v1/federated-learning/training-requests",
+            json={},
+        )
+        missing_family = client.post(
+            "/internal/v1/federated-learning/training-requests",
+            json={
+                "requestId": "00000000-0000-4000-8000-000000000701",
+                "modelFamilyId": "missing-family",
+            },
+        )
+        deployment_overrides = [
+            {"mode": "flat"},
+            {"participants": []},
+            {"topology": {"clients": []}},
+            {"strategy": {"algorithm": "fedavg"}},
+            {"collectionTrigger": "consumer_subscription"},
+            {"profile": "controlled"},
+            {"timeWindow": {"startTime": "2026-08-01T00:00:00Z"}},
+            {"callbackUri": "http://override.example"},
+            {"artifactUrl": "http://override.example/model.tar.gz"},
+        ]
+        override_responses = [
+            client.post(
+                "/internal/v1/federated-learning/training-requests",
+                json={
+                    "requestId": "00000000-0000-4000-8000-000000000702",
+                    "modelFamilyId": "ue-communication-default",
+                    **override,
+                },
+            )
+            for override in deployment_overrides
+        ]
+        assert malformed.status_code == 400
+        assert malformed.headers["content-type"].startswith("application/problem+json")
+        assert missing_family.status_code == 404
+        assert all(response.status_code == 400 for response in override_responses)
+        assert all(
+            response.headers["content-type"].startswith("application/problem+json")
+            for response in override_responses
+        )
+
+
+def test_static_flat_constructs_the_only_top_level_owner_and_generic_route(
+    settings, tmp_path
+):
+    topology_path = tmp_path / "flat-topology.yaml"
+    write_flat_topology(topology_path)
+    app = create_app(
+        with_static_flat(settings, tmp_path / "static-flat", topology_path),
+        capability_checker=verified_capability_checker(server=True),
+        nwdaf_context_client=context_client(),
+    )
+
+    with TestClient(app) as client:
+        assert type(app.state.fl_coordinator).__name__ == "FlatFLCoordinator"
+        assert app.state.fl_root is None
+        assert app.state.fl_branch is None
+        paths = app.openapi()["paths"]
+        assert "/internal/v1/federated-learning/training-requests" in paths
+        assert "/internal/v1/hierarchical-fl/training-requests" not in paths
         assert (
             client.post(
                 "/internal/v1/hierarchical-fl/training-requests",
@@ -201,21 +331,18 @@ def test_hierarchy_private_api_is_mounted_only_when_enabled(settings, tmp_path):
             ).status_code
             == 404
         )
-    with TestClient(enabled) as client:
-        malformed = client.post(
-            "/internal/v1/hierarchical-fl/training-requests",
-            json={},
-        )
-        missing_family = client.post(
-            "/internal/v1/hierarchical-fl/training-requests",
+        app.state.fl_coordinator.close()
+        unavailable = client.post(
+            "/internal/v1/federated-learning/training-requests",
             json={
                 "requestId": "00000000-0000-4000-8000-000000000701",
-                "modelFamilyId": "missing-family",
+                "modelFamilyId": "ue-communication-default",
             },
         )
-        assert malformed.status_code == 400
-        assert malformed.headers["content-type"].startswith("application/problem+json")
-        assert missing_family.status_code == 404
+        assert unavailable.status_code == 503
+        assert unavailable.headers["content-type"].startswith(
+            "application/problem+json"
+        )
 
 
 def test_hierarchy_app_construction_rejects_invalid_topology(settings, tmp_path):
@@ -371,11 +498,11 @@ class MutableContextClient:
         )
 
 
-def test_only_local_mode_dispatches_current_dataset_training_path():
+def test_local_and_federated_modes_dispatch_to_selected_owners():
     triggered = [PolicyDecision(evaluated=True, triggered=True)]
     local_dataset = Mock()
     server_dataset = Mock()
-    fl_server = Mock()
+    fl_coordinator = Mock()
 
     _dispatch_retrain_intents(
         SimpleNamespace(
@@ -389,17 +516,18 @@ def test_only_local_mode_dispatches_current_dataset_training_path():
         SimpleNamespace(
             runtime=SimpleNamespace(mode="federated"),
             dataset_coordinator=server_dataset,
-            fl_server=fl_server,
+            fl_coordinator=fl_coordinator,
+            federated_degradation_enabled=True,
         ),
         triggered,
     )
 
     local_dataset.accept_policy_intents.assert_called_once_with()
     server_dataset.accept_policy_intents.assert_not_called()
-    fl_server.accept_policy_intents.assert_called_once_with()
+    fl_coordinator.accept_policy_intents.assert_called_once_with()
 
 
-def test_hierarchy_enabled_server_dispatches_degradation_to_root():
+def test_hierarchy_dispatches_degradation_through_common_coordinator():
     triggered = [PolicyDecision(evaluated=True, triggered=True)]
     fl_root = Mock()
     fl_server = Mock()
@@ -408,14 +536,31 @@ def test_hierarchy_enabled_server_dispatches_degradation_to_root():
         SimpleNamespace(
             runtime=SimpleNamespace(mode="federated"),
             dataset_coordinator=Mock(),
-            fl_root=fl_root,
-            fl_server=fl_server,
+            fl_coordinator=fl_root,
+            federated_degradation_enabled=True,
         ),
         triggered,
     )
 
     fl_root.accept_policy_intents.assert_called_once_with()
     fl_server.accept_policy_intents.assert_not_called()
+
+
+def test_non_owner_or_disabled_federated_profile_atomically_discards_intents():
+    policy = Mock()
+
+    _dispatch_retrain_intents(
+        SimpleNamespace(
+            runtime=SimpleNamespace(mode="federated"),
+            dataset_coordinator=Mock(),
+            fl_coordinator=None,
+            federated_degradation_enabled=False,
+            accuracy_policy=policy,
+        ),
+        [PolicyDecision(evaluated=True, triggered=True)],
+    )
+
+    policy.discard_intents.assert_called_once_with()
 
 
 def _training_subscription_body():

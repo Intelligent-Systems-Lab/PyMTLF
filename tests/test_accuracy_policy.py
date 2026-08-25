@@ -163,6 +163,23 @@ def test_simultaneous_same_model_reports_claim_one_in_flight_intent():
     assert len(policy.intents()) == 1
 
 
+def test_discard_intents_atomically_releases_each_family_in_flight_marker():
+    catalog = CatalogStub()
+    policy = AccuracyPolicy(settings(required_hits=1), catalog)
+    sub = subscription("corr-a", "group-a")
+    reg = registration("group-a")
+    seed(policy, sub, reg)
+    policy.observe(sub, notification("corr-a", 0.5), reg)
+
+    assert policy.snapshot()["in_flight"] == (catalog.family_key,)
+
+    discarded = policy.discard_intents()
+
+    assert tuple(intent.family_key for intent in discarded) == (catalog.family_key,)
+    assert policy.intents() == ()
+    assert policy.snapshot()["in_flight"] == ()
+
+
 def test_scope_ttl_uses_injected_clock():
     clock = Clock()
     policy = AccuracyPolicy(

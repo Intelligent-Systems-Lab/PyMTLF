@@ -194,7 +194,12 @@ class FallbackDeadlineSettings(FrozenSettings):
     round_timeout_seconds: int = Field(default=300, gt=0, le=86400)
 
 
+class FLTrainingDataSettings(FrozenSettings):
+    collection_trigger: Literal["consumer_subscription"]
+
+
 class FLClientSettings(FrozenSettings):
+    training_data: FLTrainingDataSettings
     callback_deadline_margin_seconds: int = Field(default=5, ge=1, le=300)
     callback_queue_size: int = Field(default=256, gt=0, le=100000)
     max_concurrent_jobs: int = Field(default=2, gt=0, le=32)
@@ -301,11 +306,27 @@ class TopologySettings(FrozenSettings):
         return path
 
 
+class OrchestrationSettings(FrozenSettings):
+    mode: Literal["flat", "hierarchical"]
+    participant_source: Literal["monitor_scopes", "static"]
+
+    @model_validator(mode="after")
+    def validate_mode_and_participant_source(self) -> "OrchestrationSettings":
+        if self.mode == "hierarchical" and self.participant_source != "static":
+            raise ValueError("hierarchical orchestration requires static participants")
+        return self
+
+
+class DegradationTrainingTriggerSettings(FrozenSettings):
+    enabled: bool = False
+
+
 class PrivateTrainingTriggerSettings(FrozenSettings):
     enabled: bool = False
 
 
 class TrainingTriggerSettings(FrozenSettings):
+    degradation: DegradationTrainingTriggerSettings = DegradationTrainingTriggerSettings()
     private_api: PrivateTrainingTriggerSettings = PrivateTrainingTriggerSettings()
 
 
@@ -322,6 +343,7 @@ class FederatedLearningSettings(FrozenSettings):
     artifact_download: ArtifactDownloadSettings = ArtifactDownloadSettings()
     server: FLServerSettings | None = None
     client: FLClientSettings | None = None
+    orchestration: OrchestrationSettings | None = None
     strategy: FederatedStrategySettings | None = None
     topology: TopologySettings | None = None
     training_trigger: TrainingTriggerSettings = TrainingTriggerSettings()
@@ -340,15 +362,47 @@ class FederatedLearningSettings(FrozenSettings):
         return _validate_http_base_url(value, "federated_learning.public_base_url")
 
     @model_validator(mode="after")
-    def validate_hierarchy_configuration(self) -> "FederatedLearningSettings":
-        if self.topology is not None and self.server is None:
-            raise ValueError("federated_learning.topology requires federated_learning.server")
-        if self.topology is not None and self.strategy is None:
-            raise ValueError("federated_learning.topology requires federated_learning.strategy")
-        if self.strategy is not None and self.topology is None:
-            raise ValueError("federated_learning.strategy requires federated_learning.topology")
-        if self.training_trigger.private_api.enabled and self.topology is None:
-            raise ValueError("private API requires federated_learning.topology")
+    def validate_orchestration_configuration(self) -> "FederatedLearningSettings":
+        orchestration = self.orchestration
+        degradation_enabled = self.training_trigger.degradation.enabled
+        private_api_enabled = self.training_trigger.private_api.enabled
+        if orchestration is None:
+            if self.server is not None and self.client is None:
+                raise ValueError(
+                    "server-only federated profile requires autonomous orchestration"
+                )
+            if self.topology is not None or self.strategy is not None:
+                raise ValueError(
+                    "topology and strategy require federated_learning.orchestration"
+                )
+            if degradation_enabled or private_api_enabled:
+                raise ValueError(
+                    "training triggers require federated_learning.orchestration"
+                )
+            return self
+        if self.server is None:
+            raise ValueError("federated_learning.orchestration requires server engine")
+        if not degradation_enabled and not private_api_enabled:
+            raise ValueError("autonomous orchestration requires at least one training trigger")
+        if orchestration.mode == "flat":
+            if self.strategy is not None:
+                raise ValueError("flat orchestration must not configure hierarchy strategy")
+            if orchestration.participant_source == "monitor_scopes":
+                if self.topology is not None:
+                    raise ValueError("flat monitor_scopes must not configure topology")
+                if not degradation_enabled or private_api_enabled:
+                    raise ValueError(
+                        "flat monitor_scopes requires degradation and forbids private API"
+                    )
+            elif self.topology is None:
+                raise ValueError("flat static orchestration requires topology")
+            elif not private_api_enabled:
+                raise ValueError("flat static orchestration requires private API trigger")
+        else:
+            if self.topology is None:
+                raise ValueError("hierarchical orchestration requires topology")
+            if self.strategy is None:
+                raise ValueError("hierarchical orchestration requires strategy")
         return self
 
 

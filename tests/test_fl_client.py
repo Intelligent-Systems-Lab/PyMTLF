@@ -1,6 +1,6 @@
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import httpx
@@ -9,12 +9,13 @@ import pytest
 import torch
 
 from py_mtlf.config import (
+    DatasetSettings,
     FederatedLearningSettings,
     FLClientSettings,
     NotificationSettings,
 )
 from py_mtlf.core.artifacts import ArtifactMetadata
-from py_mtlf.core.dataset import DatasetJobState
+from py_mtlf.core.dataset import DatasetCoordinator, DatasetJobState
 from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact
 from py_mtlf.core.fl_branch import (
     BranchPreparationExecution,
@@ -43,7 +44,10 @@ from py_mtlf.core.nwdaf_context import (
     NwdafContext,
 )
 from py_mtlf.core.trainer import LocalTrainer
+from py_mtlf.core.training_data import FEATURE_ORDER
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
+from py_mtlf.models import TrainingDataDescriptor
+from py_mtlf.wire.adrf import DataNotification, DataSubscription, NadrfDataStoreRecord
 from py_mtlf.wire.ml_model_training import (
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
@@ -106,7 +110,10 @@ def fl_settings(tmp_path) -> FederatedLearningSettings:
 
 
 def client_settings() -> FLClientSettings:
-    return FLClientSettings(model_interoperability_ids=("001122",))
+    return FLClientSettings(
+        training_data={"collection_trigger": "consumer_subscription"},
+        model_interoperability_ids=("001122",),
+    )
 
 
 def round_input_bundle(*, epochs: int = 7):
@@ -297,6 +304,7 @@ def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, mo
     service = FLClientEngine(
         fl_settings(tmp_path),
         FLClientSettings(
+            training_data={"collection_trigger": "consumer_subscription"},
             model_interoperability_ids=("001122",),
             max_concurrent_jobs=3,
         ),
@@ -733,6 +741,180 @@ def test_preparation_success_returns_validated_input_model_url(tmp_path):
         assert str(address.model_url) == "http://server.example/base.tar.gz"
     finally:
         service.close()
+
+
+@pytest.mark.parametrize(
+    ("descriptor_present", "expected_state"),
+    [(True, FLClientState.PREPARED), (False, FLClientState.FAILED)],
+    ids=("consumer-collected", "missing-collected-precondition"),
+)
+def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
+    tmp_path,
+    descriptor_present,
+    expected_state,
+):
+    request = NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+    policy = Mock()
+    resolver = Mock()
+    resolver.resolve.return_value = "http://adrf.example"
+    datasets = DatasetCoordinator(
+        DatasetSettings(),
+        Mock(get=Mock(return_value=Mock())),
+        policy,
+        resolver,
+    )
+    if descriptor_present:
+        descriptor = TrainingDataDescriptor.model_validate(
+            {
+                "correlationId": "descriptor-static-flat",
+                "state": "ACTIVE",
+                "storedDataSpec": {
+                    "dataSpec": {
+                        "smfDataSub": {
+                            "supi": "imsi-static-flat",
+                            "notifId": "smf-static-flat",
+                            "notifUri": "http://anlf.example/callback",
+                            "eventSubs": [{"event": "UPF_EVENT"}],
+                        }
+                    },
+                    "timePeriod": {
+                        "startTime": "2026-07-01T00:00:00Z",
+                        "stopTime": "2026-07-27T00:00:00Z",
+                    },
+                },
+                "mlEventSubscription": {
+                    "mLEvent": "UE_COMMUNICATION",
+                    "mLEventFilter": request.ml_event_subscriptions[0].ml_event_filter,
+                    "tgtUe": {"intGroupIds": ["group-G"]},
+                },
+                "sourceNfInstanceId": "11111111-1111-4111-8111-111111111111",
+                "adrfInstanceId": "22222222-2222-4222-8222-222222222222",
+                "retainUntil": "2099-08-04T10:30:00Z",
+            }
+        )
+        datasets.put_training_data_descriptor(descriptor.correlation_id, descriptor)
+
+    observation_start = datetime(2026, 7, 20, tzinfo=UTC)
+    notification_items = [
+        {
+            "eventType": "USER_DATA_USAGE_MEASURES",
+            "ueIpv4Addr": "10.0.0.1",
+            "timeStamp": (observation_start + timedelta(seconds=index)).isoformat(),
+            "userDataUsageMeasurements": [
+                {
+                    "volumeMeasurement": {
+                        "totalVolume": 1,
+                        "ulVolume": 2,
+                        "dlVolume": 3,
+                        "totalNbOfPackets": 4,
+                        "ulNbOfPackets": 5,
+                        "dlNbOfPackets": 6,
+                    },
+                    "throughputMeasurement": {
+                        "ulThroughput": "1 Mbps",
+                        "dlThroughput": "2 Mbps",
+                        "ulPacketThroughput": "3 kpps",
+                        "dlPacketThroughput": "4 kpps",
+                    },
+                }
+            ],
+        }
+        for index in range(100)
+    ]
+
+    def retrieve_collected(job, _context):
+        for resource in job.resources:
+            datasets._append_record(
+                job,
+                resource,
+                NadrfDataStoreRecord(
+                    dataSub=[DataSubscription(smfDataSub=resource.smf_data_sub)],
+                    dataNotif=DataNotification(
+                        upfEventNotifs=[
+                            {
+                                "correlationId": "upf-static-flat",
+                                "notificationItems": notification_items,
+                            }
+                        ]
+                    ),
+                ),
+                "adrf",
+                None,
+                "collected-record-1",
+            )
+
+    datasets._retrieve_adrf = Mock(side_effect=retrieve_collected)
+    workspace = Mock()
+    artifact_path = tmp_path / "base.tar.gz"
+    artifact_path.write_bytes(b"base")
+    workspace.download.return_value = ArtifactMetadata(
+        key="a" * 64,
+        size_bytes=artifact_path.stat().st_size,
+        path=artifact_path,
+        url="http://server.example/base.tar.gz",
+    )
+    workspace.inspect_artifact.return_value = None
+    base_manifest = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 10, "output_size": 2},
+        "inference": {
+            "seq_length": 30,
+            "out_seq_len": 1,
+            "feature_order": list(FEATURE_ORDER),
+            "output_fields": ["ul_vol", "dl_vol"],
+            "preprocessing": "log1p_standard_scaler",
+        },
+        "file_digests": {
+            "model.py": "1" * 64,
+            "model.npy": "2" * 64,
+            "scaler.pkl": "3" * 64,
+        },
+    }
+    service = FLClientEngine(
+        fl_settings(tmp_path / "workspaces"),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        datasets,
+        workspace,
+    )
+    service._loader = Mock()
+    service._loader.load.return_value = Mock(manifest=base_manifest)
+    terminal = threading.Event()
+
+    def record_delivery(resource, _notification, final_state):
+        resource.state = final_state
+        terminal.set()
+
+    service._enqueue_delivery = Mock(side_effect=record_delivery)
+    try:
+        created = service.create(request)
+        assert terminal.wait(timeout=2)
+        resource = service.get(created.subscription_id)
+
+        assert resource.state is expected_state
+        if descriptor_present:
+            assert resource.dataset_snapshot is not None
+            assert resource.dataset_snapshot.source == "adrf"
+            assert resource.dataset_snapshot.time_window.start_time == datetime(
+                2026, 7, 1, tzinfo=UTC
+            )
+            assert resource.dataset_snapshot.time_window.stop_time == datetime(
+                2026, 7, 27, tzinfo=UTC
+            )
+            assert tuple(record.identity for record in resource.dataset_snapshot.records) == (
+                "collected-record-1",
+            )
+        else:
+            assert resource.dataset_snapshot is None
+            assert "no usable training-data descriptor" in resource.last_error
+            resolver.resolve.assert_not_called()
+            datasets._retrieve_adrf.assert_not_called()
+    finally:
+        service.close()
+        datasets.shutdown()
 
 
 @pytest.mark.parametrize("scope_available", [True, False], ids=("ready", "missing"))
@@ -1314,6 +1496,125 @@ def test_final_validation_uses_configured_training_device(
         assert notification.ml_correlation_id == value.ml_correlation_id
         assert workspace.publish.call_args.kwargs["model"] is candidate.model
         service._trainer.train.assert_not_called()
+    finally:
+        service.close()
+
+
+def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    payload = preparation_payload()
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 2,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://server.example/round-input.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    round_value = NwdafMLModelTrainSubsc.model_validate(payload)
+    base = round_input_bundle(epochs=1)
+    candidate = round_global_bundle()
+    candidate.manifest["fl_metadata"]["round_ind"] = 2
+    workspace = Mock()
+    workspace.download.side_effect = (Mock(name="round-input"), Mock(name="candidate"))
+    workspace.publish.side_effect = (
+        Mock(url="http://client.example/local.tar.gz"),
+        Mock(url="http://client.example/validation.tar.gz"),
+    )
+    nwdaf_context = Mock()
+    nwdaf_context.get.return_value.nf_instance_id = "participant-a"
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        nwdaf_context,
+        Mock(),
+        workspace,
+    )
+    service._loader = Mock()
+    service._loader.load.side_effect = (base, base, candidate)
+    training_scope = Mock(
+        training_sample_count=10,
+        validation_sample_count=2,
+        validation_targets=np.asarray([2.0, 4.0]),
+    )
+    dataset = Mock(
+        training_scopes=(training_scope,),
+        evaluation_scopes=(training_scope,),
+    )
+    service._dataset_builder = Mock(return_value=dataset)
+    service._dataset_builder.build.return_value = dataset
+    result_model = torch.nn.Linear(2, 1)
+    service._trainer = Mock()
+    service._trainer.train.return_value = Mock(
+        model=result_model,
+        training_sample_count=10,
+    )
+    service._enqueue_delivery = Mock()
+    predict = Mock(
+        side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
+    )
+    monkeypatch.setattr(LocalTrainer, "_predict", predict)
+    snapshot = Mock()
+    snapshot.time_window.start_time = datetime(2026, 7, 1, tzinfo=UTC)
+    snapshot.time_window.stop_time = datetime(2026, 7, 2, tzinfo=UTC)
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=round_value,
+        state=FLClientState.ROUND_RUNNING,
+        scope=TrainingScopeDescriptor.from_training_request(round_value, 0),
+        dataset_snapshot=snapshot,
+        prepared_training_sample_count=10,
+        expected_model_contract_digest=model_contract_digest(base.manifest),
+        expected_preprocessing_contract_digest=preprocessing_contract_digest(
+            base.manifest
+        ),
+        preparation_base_artifact=Mock(name="preparation-base"),
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_round(resource.subscription_id, resource.revision)
+
+        validation_payload = preparation_payload()
+        validation_payload.update(
+            {
+                "mLPreFlag": False,
+                "mLAccChkFlg": True,
+                "skipFlInd": True,
+                "roundInd": 3,
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {
+                            "mLModelUrl": "http://server.example/candidate.tar.gz"
+                        },
+                    }
+                ],
+            }
+        )
+        resource.representation = NwdafMLModelTrainSubsc.model_validate(
+            validation_payload
+        )
+        resource.state = FLClientState.VALIDATION_RUNNING
+        resource.work_slot_owned = True
+        assert service._capacity.acquire(blocking=False)
+        service._run_validation(resource.subscription_id, resource.revision)
+
+        assert [
+            item.args[0] for item in service._dataset_builder.build.call_args_list
+        ] == [snapshot, snapshot]
+        assert resource.dataset_snapshot is snapshot
+        assert service._trainer.train.call_count == 1
+        assert predict.call_count == 2
     finally:
         service.close()
 

@@ -313,6 +313,7 @@ class DatasetCoordinator:
             job.resources = self._resolve(job.intent, descriptors)
             if not job.resources:
                 raise RuntimeError("no accepted SMF collection resource matches the retrain scopes")
+            self._ensure_window_coverage(job)
             job.source = self._select_source(job.resources)
             job.state = DatasetJobState.RETRIEVING
             if job.source == "adrf":
@@ -485,6 +486,20 @@ class DatasetCoordinator:
             logger.warning("ADRF is unavailable; using MongoDB fallback: %s", error)
         return "mongodb"
 
+    @staticmethod
+    def _ensure_window_coverage(job: DatasetJob) -> None:
+        for resource in job.resources:
+            if (
+                resource.available_start is None
+                or resource.available_stop is None
+                or resource.available_start > job.time_window.start_time
+                or resource.available_stop < job.time_window.stop_time
+            ):
+                raise RuntimeError(
+                    f"training-data descriptor {resource.identity} does not cover "
+                    "the requested dataset window"
+                )
+
     def _retrieve_adrf(self, job: DatasetJob, context: NwdafContext) -> None:
         adrf_ids = {
             resource.adrf_instance_id
@@ -499,20 +514,8 @@ class DatasetCoordinator:
         callback = context.api_root + "/collector/retrieval-notify"
         go_base = context.internal_api_root
         create_url = go_base + "/internal/v1/adrf-data-management/data-retrieval-subscriptions"
+        self._ensure_window_coverage(job)
         for resource in job.resources:
-            start_time = max(
-                job.time_window.start_time,
-                resource.available_start or job.time_window.start_time,
-            )
-            stop_time = min(
-                job.time_window.stop_time,
-                resource.available_stop or job.time_window.stop_time,
-            )
-            if start_time > stop_time:
-                raise RuntimeError(
-                    f"training-data descriptor {resource.identity} does not overlap "
-                    "the requested dataset window"
-                )
             correlation = str(uuid4())
             route = AdrfRoute(correlation, resource)
             with self._lock:
@@ -521,7 +524,7 @@ class DatasetCoordinator:
             payload = NadrfDataRetrievalSubscription(
                 notifCorrId=correlation,
                 notificationURI=callback,
-                timePeriod=TimeWindow(startTime=start_time, stopTime=stop_time),
+                timePeriod=job.time_window,
                 dataSub=DataSubscription(smfDataSub=resource.smf_data_sub),
                 consTrigNotif=True,
             )

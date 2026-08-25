@@ -326,6 +326,14 @@ class AccuracyPolicy:
             self._intents.clear()
             return intents
 
+    def discard_intents(self) -> tuple[RetrainIntent, ...]:
+        with self._lock:
+            intents = tuple(self._intents)
+            self._intents.clear()
+            for intent in intents:
+                self._in_flight.discard(intent.family_key)
+            return intents
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {

@@ -57,6 +57,14 @@ federated_learning:
       - "http://127.0.0.1:9093"
       - "http://127.0.0.1:9094"
     timeout_seconds: 300
+  orchestration:
+    mode: "flat"
+    participant_source: "monitor_scopes"
+  training_trigger:
+    degradation:
+      enabled: true
+    private_api:
+      enabled: false
   server:
     # Standard-shaped Model Training notification callback routed to this backend.
     callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"

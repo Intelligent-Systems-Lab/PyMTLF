@@ -207,11 +207,35 @@ def test_federated_learning_settings_fail_fast(payload):
     [
         ("local", None, None, {}, True),
         ("local", FLServerSettings(), None, None, False),
-        ("local", None, FLClientSettings(), None, False),
+        (
+            "local",
+            None,
+            FLClientSettings(
+                training_data={"collection_trigger": "consumer_subscription"}
+            ),
+            None,
+            False,
+        ),
         ("federated", None, None, None, False),
-        ("federated", FLServerSettings(), None, None, True),
-        ("federated", None, FLClientSettings(), None, True),
-        ("federated", FLServerSettings(), FLClientSettings(), None, True),
+        ("federated", FLServerSettings(), None, None, False),
+        (
+            "federated",
+            None,
+            FLClientSettings(
+                training_data={"collection_trigger": "consumer_subscription"}
+            ),
+            None,
+            True,
+        ),
+        (
+            "federated",
+            FLServerSettings(),
+            FLClientSettings(
+                training_data={"collection_trigger": "consumer_subscription"}
+            ),
+            None,
+            True,
+        ),
         ("federated", FLServerSettings(), None, {}, False),
     ],
 )
@@ -236,12 +260,86 @@ def test_runtime_engine_configuration_matrix(
             Settings.model_validate(payload)
 
 
+def test_fl_client_requires_explicit_consumer_subscription_training_data_marker():
+    with pytest.raises(ValidationError, match="training_data"):
+        FLClientSettings()
+
+    client = FLClientSettings.model_validate(
+        {
+            "training_data": {"collection_trigger": "consumer_subscription"},
+        }
+    )
+
+    assert client.training_data.collection_trigger == "consumer_subscription"
+    for collection_trigger in ("private_api", "local_file"):
+        with pytest.raises(ValidationError):
+            FLClientSettings.model_validate(
+                {"training_data": {"collection_trigger": collection_trigger}}
+            )
+
+
+def test_flat_monitor_owner_requires_explicit_orchestration_and_degradation_trigger():
+    federated = FederatedLearningSettings.model_validate(
+        {
+            "server": {},
+            "orchestration": {
+                "mode": "flat",
+                "participant_source": "monitor_scopes",
+            },
+            "training_trigger": {
+                "degradation": {"enabled": True},
+                "private_api": {"enabled": False},
+            },
+        }
+    )
+
+    assert federated.orchestration.mode == "flat"
+    assert federated.orchestration.participant_source == "monitor_scopes"
+    assert federated.training_trigger.degradation.enabled is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "server": {},
+            "orchestration": {
+                "mode": "flat",
+                "participant_source": "monitor_scopes",
+            },
+        },
+        {
+            "server": {},
+            "training_trigger": {"degradation": {"enabled": True}},
+        },
+        {
+            "client": {
+                "training_data": {"collection_trigger": "consumer_subscription"}
+            },
+            "orchestration": {
+                "mode": "flat",
+                "participant_source": "monitor_scopes",
+            },
+            "training_trigger": {"degradation": {"enabled": True}},
+        },
+    ],
+)
+def test_invalid_autonomous_owner_combinations_fail_fast(payload):
+    with pytest.raises(ValidationError):
+        FederatedLearningSettings.model_validate(payload)
+
+
 def test_federated_server_requires_single_active_process():
     with pytest.raises(ValidationError, match="max_active_processes"):
         Settings(
             runtime=RuntimeSettings(mode="federated"),
             federated_learning=FederatedLearningSettings(
                 server=FLServerSettings(max_active_processes=2),
+                orchestration={
+                    "mode": "flat",
+                    "participant_source": "monitor_scopes",
+                },
+                training_trigger={"degradation": {"enabled": True}},
             ),
         )
 
@@ -297,6 +395,12 @@ runtime:
   mode: federated
 federated_learning:
   server: {}
+  orchestration:
+    mode: hierarchical
+    participant_source: static
+  training_trigger:
+    degradation:
+      enabled: true
   strategy:
     algorithm:
       name: fedprox
@@ -331,13 +435,30 @@ def test_hierarchy_configuration_requires_server_strategy_and_topology_together(
         }
     )
 
-    with pytest.raises(ValidationError, match="requires federated_learning.server"):
-        FederatedLearningSettings(topology=topology, strategy=strategy)
-    with pytest.raises(ValidationError, match="requires federated_learning.strategy"):
-        FederatedLearningSettings(server=FLServerSettings(), topology=topology)
-    with pytest.raises(ValidationError, match="requires federated_learning.topology"):
-        FederatedLearningSettings(server=FLServerSettings(), strategy=strategy)
-    with pytest.raises(ValidationError, match="private API requires"):
+    orchestration = {"mode": "hierarchical", "participant_source": "static"}
+    trigger = {"degradation": {"enabled": True}}
+    with pytest.raises(ValidationError, match="requires server engine"):
+        FederatedLearningSettings(
+            orchestration=orchestration,
+            topology=topology,
+            strategy=strategy,
+            training_trigger=trigger,
+        )
+    with pytest.raises(ValidationError, match="requires strategy"):
+        FederatedLearningSettings(
+            server=FLServerSettings(),
+            orchestration=orchestration,
+            topology=topology,
+            training_trigger=trigger,
+        )
+    with pytest.raises(ValidationError, match="requires topology"):
+        FederatedLearningSettings(
+            server=FLServerSettings(),
+            orchestration=orchestration,
+            strategy=strategy,
+            training_trigger=trigger,
+        )
+    with pytest.raises(ValidationError):
         FederatedLearningSettings.model_validate(
             {
                 "server": {},

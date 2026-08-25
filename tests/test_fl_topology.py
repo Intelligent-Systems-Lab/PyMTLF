@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from py_mtlf.core.fl_topology import StaticTopologyPlanner, TopologyConfigurationError
+from py_mtlf.core.fl_topology import (
+    StaticFlatTopologyPlanner,
+    StaticTopologyPlanner,
+    TopologyConfigurationError,
+)
 
 ROOT_ID = "00000000-0000-4000-8000-000000000001"
 BRANCH_A_ID = "00000000-0000-4000-8000-000000000010"
@@ -11,6 +15,8 @@ BRANCH_B_ID = "00000000-0000-4000-8000-000000000020"
 LEAF_A_ID = "00000000-0000-4000-8000-000000000101"
 LEAF_B_ID = "00000000-0000-4000-8000-000000000102"
 LEAF_C_ID = "00000000-0000-4000-8000-000000000201"
+CLIENT_A_ID = "00000000-0000-4000-8000-000000000301"
+CLIENT_B_ID = "00000000-0000-4000-8000-000000000302"
 
 
 def write_topology(path: Path, body: str) -> None:
@@ -162,3 +168,151 @@ def test_static_topology_reports_missing_and_non_mapping_files(tmp_path):
     write_topology(path, "- version: 1")
     with pytest.raises(TopologyConfigurationError, match="YAML mapping"):
         StaticTopologyPlanner.load(path)
+
+
+def test_static_flat_topology_canonicalizes_clients_tais_and_digest(tmp_path):
+    path = tmp_path / "flat.yaml"
+    write_topology(
+        path,
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_B_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001102"
+  - nf_instance_id: {CLIENT_A_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001101"
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001100"
+""",
+    )
+    planner = StaticFlatTopologyPlanner.load(path)
+
+    assignment = planner.build(server_nf_instance_id=ROOT_ID)
+
+    assert tuple(client.nf_instance_id for client in assignment.clients) == (
+        CLIENT_A_ID,
+        CLIENT_B_ID,
+    )
+    assert tuple(tai.tac for tai in assignment.clients[0].tracking_areas) == (
+        "001100",
+        "001101",
+    )
+    assert len(assignment.topology_digest) == 64
+
+    reordered = tmp_path / "flat-reordered.yaml"
+    write_topology(
+        reordered,
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_A_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001100"
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001101"
+  - nf_instance_id: {CLIENT_B_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001102"
+""",
+    )
+    assert (
+        StaticFlatTopologyPlanner.load(reordered)
+        .build(server_nf_instance_id=ROOT_ID)
+        .topology_digest
+        == assignment.topology_digest
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_A_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001101"
+""",
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_A_ID}
+    scope: &scope
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001101"
+  - nf_instance_id: {CLIENT_A_ID}
+    scope: *scope
+""",
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_A_ID}
+    scope:
+      tracking_areas:
+        - &tai {{plmn_id: {{mcc: "466", mnc: "92"}}, tac: "001101"}}
+        - *tai
+  - nf_instance_id: {CLIENT_B_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001102"
+""",
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {CLIENT_A_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "46", mnc: "92"}}
+          tac: "001101"
+  - nf_instance_id: {CLIENT_B_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "xyz"
+""",
+    ],
+)
+def test_static_flat_topology_rejects_invalid_contract(tmp_path, body):
+    path = tmp_path / "flat.yaml"
+    write_topology(path, body)
+
+    with pytest.raises((ValidationError, TopologyConfigurationError)):
+        StaticFlatTopologyPlanner.load(path)
+
+
+def test_static_flat_topology_rejects_containing_server_collision(tmp_path):
+    path = tmp_path / "flat.yaml"
+    write_topology(
+        path,
+        f"""
+version: 1
+clients:
+  - nf_instance_id: {ROOT_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001101"
+  - nf_instance_id: {CLIENT_B_ID}
+    scope:
+      tracking_areas:
+        - plmn_id: {{mcc: "466", mnc: "92"}}
+          tac: "001102"
+""",
+    )
+
+    with pytest.raises(TopologyConfigurationError, match="containing Server"):
+        StaticFlatTopologyPlanner.load(path).build(server_nf_instance_id=ROOT_ID)

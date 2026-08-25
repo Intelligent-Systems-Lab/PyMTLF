@@ -35,6 +35,12 @@ from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyNodeResolver,
     HierarchyNodeRole,
 )
+from py_mtlf.core.fl_orchestration import (
+    TopLevelCoordinatorError,
+    TopLevelCoordinatorUnavailableError,
+    TopLevelModelFamilyNotFoundError,
+    TopLevelRequestConflictError,
+)
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
     FLProcess,
@@ -88,19 +94,19 @@ class RootFailureCause(StrEnum):
     SHUTDOWN = "SHUTDOWN"
 
 
-class RootCoordinatorError(RuntimeError):
+class RootCoordinatorError(TopLevelCoordinatorError):
     pass
 
 
-class RootRequestConflictError(RootCoordinatorError):
+class RootRequestConflictError(TopLevelRequestConflictError, RootCoordinatorError):
     pass
 
 
-class RootModelFamilyNotFoundError(RootCoordinatorError):
+class RootModelFamilyNotFoundError(TopLevelModelFamilyNotFoundError, RootCoordinatorError):
     pass
 
 
-class RootCoordinatorUnavailableError(RootCoordinatorError):
+class RootCoordinatorUnavailableError(TopLevelCoordinatorUnavailableError, RootCoordinatorError):
     pass
 
 
@@ -130,6 +136,9 @@ class RootRequestSnapshot:
     plan_id: str
     model_family_id: FamilyKey
     state: RootRequestState
+    mode: str = "hierarchical"
+    participant_source: str = "static"
+    trigger_source: str = ""
     failure_cause: str = ""
     failure_detail: str = ""
     admission: RootAdmissionSnapshot | None = None
@@ -1007,6 +1016,7 @@ class FLRootCoordinator:
             plan_id=record.initiation.plan_id,
             model_family_id=record.initiation.model_family_id,
             state=record.state,
+            trigger_source=record.initiation.source.lower(),
             failure_cause=record.failure_cause,
             failure_detail=record.failure_detail,
             admission=record.admission,

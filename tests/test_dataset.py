@@ -344,6 +344,67 @@ def test_descriptor_without_adrf_identity_selects_mongodb_without_discovery():
     coordinator.shutdown()
 
 
+def test_adrf_descriptor_must_cover_the_complete_requested_absolute_window():
+    policy, intent = retrain_intent()
+    resolver = Mock()
+    resolver.resolve.return_value = "http://adrf.example"
+    client = Mock()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
+        policy,
+        resolver,
+        client=client,
+    )
+    job = DatasetJob(
+        "job-1",
+        intent,
+        TimeWindow(
+            startTime=datetime(2026, 8, 4, 8, tzinfo=UTC),
+            stopTime=datetime(2026, 8, 4, 10, tzinfo=UTC),
+        ),
+        "adrf",
+    )
+    job.resources = coordinator._resolve(intent, descriptor_snapshot())
+
+    with pytest.raises(RuntimeError, match="does not cover the requested dataset window"):
+        coordinator._retrieve_adrf(job, context_client().get())
+
+    client.post.assert_not_called()
+    coordinator.shutdown()
+
+
+def test_mongodb_fallback_also_rejects_partial_descriptor_window():
+    policy, intent = retrain_intent()
+    resolver = Mock()
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
+        policy,
+        resolver,
+    )
+    for descriptor in descriptor_snapshot():
+        descriptor = descriptor.model_copy(update={"adrf_instance_id": None})
+        coordinator.put_training_data_descriptor(descriptor.correlation_id, descriptor)
+    job = DatasetJob(
+        "job-1",
+        intent,
+        TimeWindow(
+            startTime=datetime(2026, 8, 4, 8, tzinfo=UTC),
+            stopTime=datetime(2026, 8, 4, 10, tzinfo=UTC),
+        ),
+        "unavailable",
+        policy_owned=False,
+    )
+
+    coordinator._run_job(job)
+
+    assert job.state is DatasetJobState.FAILED
+    assert "does not cover the requested dataset window" in job.failure
+    resolver.resolve.assert_not_called()
+    coordinator.shutdown()
+
+
 def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():
     policy, intent = retrain_intent()
     projection = descriptor_snapshot()

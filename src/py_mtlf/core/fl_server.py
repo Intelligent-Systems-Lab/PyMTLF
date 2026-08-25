@@ -35,6 +35,12 @@ from py_mtlf.core.fl_experiment import (
     ExperimentRegistryError,
     FLExperimentRegistry,
 )
+from py_mtlf.core.fl_orchestration import (
+    FlatExecutionRequest,
+    FlatParticipantScope,
+    MonitorParticipantSelection,
+    TriggerSource,
+)
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     FLWorkspaceArtifact,
@@ -90,6 +96,14 @@ class FLServerState(StrEnum):
     FAILED = "FAILED"
 
 
+class FLServerAdmissionClosedError(RuntimeError):
+    pass
+
+
+class FLServerProcessConflictError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class FLClientCandidate:
     target: SelectedTarget
@@ -105,7 +119,7 @@ class HierarchyPreparationTarget:
 
 @dataclass
 class FLParticipant:
-    scope: ScopeReference
+    scope: FlatParticipantScope | ScopeReference
     candidate: FLClientCandidate
     notification_correlation_id: str
     resource_location: str = ""
@@ -139,8 +153,11 @@ class FLParticipant:
 class FLProcess:
     process_id: str
     intent: RetrainIntent | None
+    execution: FlatExecutionRequest | None = None
     generation: int = 0
     state: FLServerState = FLServerState.CREATED
+    current_round: int | None = None
+    completed_rounds: int = 0
     participants: list[FLParticipant] = field(default_factory=list)
     current_global_url: str = ""
     current_global_artifact: ArtifactMetadata | None = None
@@ -229,13 +246,13 @@ class FLClientResolver:
 
     def discover(
         self,
-        scope: ScopeReference,
+        scope: FlatParticipantScope,
         model_interoperability: str,
     ) -> tuple[FLClientCandidate, ...]:
         context = self._nwdaf_context.get()
-        owner_id = scope.consumer_id.strip()
+        owner_id = _participant_nf_instance_id(scope)
         if not owner_id:
-            raise RuntimeError(f"FL scope {scope.scope_key} has no monitor owner consumerId")
+            raise RuntimeError(f"FL scope {scope.scope_key} has no participant NF instance ID")
         tracking_areas = _scope_tracking_area_values(scope)
         if not tracking_areas:
             raise RuntimeError(f"FL scope {scope.scope_key} has no tracking area")
@@ -269,12 +286,9 @@ class FLClientResolver:
         if not isinstance(profiles, list):
             raise RuntimeError("NRF discovery returned malformed nfInstances")
         candidates = []
+        required_areas = _scope_tais(scope)
         for profile in profiles:
-            if not isinstance(profile, dict) or profile.get("nfStatus") not in {
-                None,
-                "",
-                "REGISTERED",
-            }:
+            if not isinstance(profile, dict) or profile.get("nfStatus") != "REGISTERED":
                 continue
             nf_id = str(profile.get("nfInstanceId", ""))
             areas = _fl_client_tracking_areas(profile, scope.ml_event, model_interoperability)
@@ -283,6 +297,7 @@ class FLClientResolver:
                 or nf_id != owner_id
                 or nf_id == context.nf_instance_id
                 or areas is None
+                or not required_areas.issubset(areas)
             ):
                 continue
             for service_id, service in _services(profile):
@@ -399,79 +414,71 @@ class FLServerEngine:
                                 f"{process.cleanup_failure}; {failure}".strip("; ")
                             )
                         participant.resource_location = ""
-                if process.intent is not None:
-                    self._policy.complete_retrain(process.intent.family_key)
+                family_key = _flat_family_key(process)
+                if family_key is not None:
+                    self._policy.complete_retrain(family_key)
         with self._lock:
             self._processes.clear()
             self._correlations.clear()
 
-    def accept_policy_intents(self) -> None:
+    def start_flat(self, execution: FlatExecutionRequest) -> FLProcess:
         if self._closing.is_set():
-            return
+            raise FLServerAdmissionClosedError("FL Server is closing")
         with self._lock:
             generation = self._generation
-        for intent in self._policy.take_intents():
+        process = FLProcess(
+            process_id=str(uuid4()),
+            intent=None,
+            execution=execution,
+            generation=generation,
+        )
+        try:
+            reservation = self._experiments.reserve_server(process.process_id)
+            process.experiment_reservation_id = reservation.reservation_id
+        except ExperimentAdmissionClosedError as error:
+            raise FLServerAdmissionClosedError(str(error)) from error
+        except ExperimentRegistryError as error:
+            raise FLServerProcessConflictError(str(error)) from error
+        with self._lock:
+            stale_generation = process.generation != self._generation
+            if not stale_generation:
+                self._processes[process.process_id] = process
+                active = sum(
+                    item.state
+                    not in {
+                        FLServerState.CANDIDATE_READY,
+                        FLServerState.VALIDATION_REJECTED,
+                        FLServerState.CUTOVER_PENDING,
+                        FLServerState.COMPLETE,
+                        FLServerState.FAILED,
+                    }
+                    for item in self._processes.values()
+                )
+        if stale_generation:
+            process.state = FLServerState.FAILED
+            process.failure = "containing NWDAF process generation changed"
+            self._finish_experiment(process)
+            raise FLServerAdmissionClosedError(process.failure)
+        if active > self._server_settings.max_active_processes:
+            process.state = FLServerState.FAILED
+            process.failure = "FL Server process capacity is exhausted"
+            self._finish_experiment(process)
             with self._lock:
-                stale_generation = generation != self._generation
-            if stale_generation:
-                self._policy.complete_retrain(intent.family_key)
-                continue
-            process = FLProcess(
-                process_id=str(uuid4()),
-                intent=intent,
-                generation=generation,
-            )
-            try:
-                reservation = self._experiments.reserve_server(process.process_id)
-                process.experiment_reservation_id = reservation.reservation_id
-            except ExperimentAdmissionClosedError:
-                self._policy.complete_retrain(intent.family_key)
-                continue
-            except ExperimentRegistryError as error:
-                process.state = FLServerState.FAILED
-                process.failure = str(error)
-                with self._lock:
-                    self._processes[process.process_id] = process
-                self._policy.complete_retrain(intent.family_key)
-                continue
+                self._processes.pop(process.process_id, None)
+            raise FLServerProcessConflictError(process.failure)
+        try:
+            future = self._executor.submit(self._run, process)
+        except Exception as error:
+            process.state = FLServerState.FAILED
+            process.failure = "FL Server request executor is unavailable"
+            self._finish_experiment(process)
             with self._lock:
-                stale_generation = process.generation != self._generation
-                if not stale_generation:
-                    self._processes[process.process_id] = process
-                    active = sum(
-                        item.state
-                        not in {
-                            FLServerState.CANDIDATE_READY,
-                            FLServerState.VALIDATION_REJECTED,
-                            FLServerState.CUTOVER_PENDING,
-                            FLServerState.COMPLETE,
-                            FLServerState.FAILED,
-                        }
-                        for item in self._processes.values()
-                    )
-            if stale_generation:
-                process.state = FLServerState.FAILED
-                process.failure = "containing NWDAF process generation changed"
-                self._finish_experiment(process)
-                self._policy.complete_retrain(intent.family_key)
-                continue
-            if active > self._server_settings.max_active_processes:
-                process.state = FLServerState.FAILED
-                process.failure = "FL Server process capacity is exhausted"
-                self._finish_experiment(process)
-                self._policy.complete_retrain(intent.family_key)
-                continue
-            try:
-                future = self._executor.submit(self._run, process)
-            except Exception as error:
-                process.state = FLServerState.FAILED
-                process.failure = str(error)
-                self._finish_experiment(process)
-                self._policy.complete_retrain(intent.family_key)
-                raise
-            with self._lock:
-                self._futures.add(future)
-            future.add_done_callback(self._future_done)
+                self._processes.pop(process.process_id, None)
+            raise FLServerAdmissionClosedError(process.failure) from error
+        with self._lock:
+            self._futures.add(future)
+        future.add_done_callback(self._future_done)
+        return process
 
     def start_hierarchy_preparation(
         self,
@@ -1317,10 +1324,7 @@ class FLServerEngine:
                     for item in self._processes.values()
                     if item.published_model_id == model_id
                     and (
-                        (
-                            item.intent is not None
-                            and item.intent.family_key == family_key
-                        )
+                        _flat_family_key(item) == family_key
                         or item.hierarchy_family_key == family_key
                     )
                 ),
@@ -1350,33 +1354,37 @@ class FLServerEngine:
         return True
 
     def _run(self, process: FLProcess) -> None:
-        if process.intent is None:
-            raise RuntimeError("flat FL process requires a retraining intent")
+        execution = _flat_execution(process)
+        scopes = execution.participant_selection.participants
         try:
             logger.info(
                 "Federated process started process_id=%s scopes=%s",
                 process.process_id,
-                process.intent.active_scope_keys,
+                [scope.scope_key for scope in scopes],
             )
             process.state = FLServerState.DISCOVERING
-            current = self._catalog.current(process.intent.family_key)
+            current = self._catalog.current(execution.model_family_id)
             if current is None:
                 raise RuntimeError("FL base model is no longer current")
             model_interoperability = current.descriptor.model_interoperability
             if not model_interoperability:
                 raise RuntimeError("FL base model has no model interoperability identifier")
             process.base_artifact_key = current.artifact.key
-            discovered: dict[tuple[str, str, str], FLClientCandidate] = {}
-            for scope in sorted(process.intent.active_scopes, key=lambda item: item.scope_key):
+            discovered: list[FLClientCandidate] = []
+            for scope in sorted(scopes, key=lambda item: item.scope_key):
                 for candidate in self._resolver.discover(scope, model_interoperability):
-                    key = (
-                        candidate.target.nf_instance_id,
-                        candidate.target.nf_service_instance_id,
-                        candidate.target.api_root,
-                    )
-                    discovered[key] = candidate
-            candidates = tuple(discovered[key] for key in sorted(discovered))
-            assignments = _assign(process.intent.active_scopes, candidates)
+                    discovered.append(candidate)
+            candidates = tuple(
+                sorted(
+                    discovered,
+                    key=lambda item: (
+                        item.target.nf_instance_id,
+                        item.target.nf_service_instance_id,
+                        item.target.api_root,
+                    ),
+                )
+            )
+            assignments = _assign(scopes, candidates)
             process.participants = [
                 FLParticipant(
                     scope=scope,
@@ -1408,12 +1416,13 @@ class FLServerEngine:
                 [item.candidate.target.nf_instance_id for item in process.participants],
             )
             process.state = FLServerState.READY
-            current = self._catalog.current(process.intent.family_key)
+            current = self._catalog.current(execution.model_family_id)
             if current is None or current.artifact.key != process.base_artifact_key:
                 raise RuntimeError("FL base model changed while participants were preparing")
             process.current_global_artifact = current.artifact
             process.current_global_url = current.artifact.url
             for round_indicator in range(self._server_settings.round_count):
+                process.current_round = round_indicator
                 source_artifact = process.current_global_artifact
                 if source_artifact is None:
                     raise RuntimeError("FL Server has no current global artifact")
@@ -1458,6 +1467,7 @@ class FLServerEngine:
                 )
                 process.current_global_artifact = _workspace_artifact_metadata(aggregate)
                 process.current_global_url = process.current_global_artifact.url
+                process.completed_rounds = round_indicator + 1
                 self._raise_if_failed(process)
                 logger.info(
                     "Federated round aggregated process_id=%s round=%s artifact=%s",
@@ -1476,6 +1486,7 @@ class FLServerEngine:
                 process.candidate_url = candidate_artifact.url
             process.state = FLServerState.FINAL_VALIDATION_DISPATCH
             validation_round = self._server_settings.round_count
+            process.current_round = validation_round
             for participant in process.participants:
                 participant.expected_round = validation_round
                 participant.notification = None
@@ -1522,7 +1533,7 @@ class FLServerEngine:
                     current_model = self._publication.publish(
                         ValidatedCandidate(
                             process_id=process.process_id,
-                            family_key=process.intent.family_key,
+                            family_key=execution.model_family_id,
                             base_artifact=current.artifact,
                             candidate_artifact=process.candidate_artifact,
                             participants=tuple(
@@ -1538,23 +1549,25 @@ class FLServerEngine:
                                 )
                             ),
                             validation_summaries=process.validation_summaries,
-                            required_scope_keys=process.intent.active_scope_keys,
+                            required_scope_keys=execution.required_cutover_scope_keys,
                             gate_would_accept=bool(process.gate_would_accept),
                             gate_rejection_reasons=process.gate_rejection_reasons,
                         )
                     )
                     process.published_model_id = current_model.model_id
                     self._policy.begin_generation(
-                        process.intent.family_key,
+                        execution.model_family_id,
                         self._catalog.version_key_for_id(current.model_id),
                         current_model.version_key,
-                        process.intent.active_scope_keys,
+                        execution.required_cutover_scope_keys,
                     )
                     if self._provision_notifications is not None:
-                        self._provision_notifications.reconcile_family(process.intent.family_key)
+                        self._provision_notifications.reconcile_family(
+                            execution.model_family_id
+                        )
                     process.state = (
                         FLServerState.CUTOVER_PENDING
-                        if process.intent.active_scope_keys
+                        if execution.required_cutover_scope_keys
                         else FLServerState.COMPLETE
                     )
             logger.info(
@@ -1584,7 +1597,7 @@ class FLServerEngine:
                 for participant in process.participants:
                     self._correlations.pop(participant.notification_correlation_id, None)
             if process.state is not FLServerState.CUTOVER_PENDING:
-                self._policy.complete_retrain(process.intent.family_key)
+                self._policy.complete_retrain(execution.model_family_id)
             if release_experiment:
                 self._release_experiment(process)
 
@@ -2113,22 +2126,24 @@ class FLServerEngine:
         aggregate_base = base_error / base_actual
         aggregate_candidate = candidate_error / candidate_actual
         reasons: list[str] = []
-        triggering = next(
-            (
-                summary
-                for participant, summary in summaries
-                if participant.scope.scope_key == process.intent.triggering_scope_key
-            ),
-            None,
-        )
-        if triggering is None:
-            raise RuntimeError("triggering scope has no final validation evidence")
-        if wape(triggering.candidate) >= wape(triggering.base):
-            reasons.append("triggering_scope_not_improved")
+        triggering_scope_key = _triggering_scope_key(process)
+        if triggering_scope_key is not None:
+            triggering = next(
+                (
+                    summary
+                    for participant, summary in summaries
+                    if participant.scope.scope_key == triggering_scope_key
+                ),
+                None,
+            )
+            if triggering is None:
+                raise RuntimeError("triggering scope has no final validation evidence")
+            if wape(triggering.candidate) >= wape(triggering.base):
+                reasons.append("triggering_scope_not_improved")
         if aggregate_candidate >= aggregate_base:
             reasons.append("aggregate_not_improved")
         for participant, summary in summaries:
-            if participant.scope.scope_key == process.intent.triggering_scope_key:
+            if participant.scope.scope_key == triggering_scope_key:
                 continue
             regression = (wape(summary.candidate) or 0.0) - (wape(summary.base) or 0.0)
             if regression > self._server_settings.final_validation.max_scope_wape_regression:
@@ -2352,30 +2367,63 @@ class FLServerEngine:
         with self._lock:
             self._futures.discard(future)
 
+def _flat_execution(process: FLProcess) -> FlatExecutionRequest:
+    if process.execution is not None:
+        return process.execution
+    if process.intent is None:
+        raise RuntimeError("flat FL process requires an explicit execution request")
+    return FlatExecutionRequest(
+        model_family_id=process.intent.family_key,
+        trigger_source=TriggerSource.DEGRADATION,
+        participant_selection=MonitorParticipantSelection(
+            participants=tuple(
+                FlatParticipantScope.from_monitor_scope(scope)
+                for scope in process.intent.active_scopes
+            )
+        ),
+        required_cutover_scope_keys=process.intent.active_scope_keys,
+        triggering_scope_key=getattr(process.intent, "triggering_scope_key", None),
+    )
+
+
+def _flat_family_key(process: FLProcess) -> FamilyKey | None:
+    if process.execution is not None:
+        return process.execution.model_family_id
+    if process.intent is not None:
+        return process.intent.family_key
+    return None
+
+
+def _triggering_scope_key(process: FLProcess) -> str | None:
+    if process.execution is not None:
+        return process.execution.triggering_scope_key
+    if process.intent is not None:
+        return getattr(process.intent, "triggering_scope_key", None)
+    return None
+
+
 def _assign(
-    scopes: tuple[ScopeReference, ...],
+    scopes: tuple[FlatParticipantScope | ScopeReference, ...],
     candidates: tuple[FLClientCandidate, ...],
-) -> tuple[tuple[ScopeReference, FLClientCandidate], ...]:
+) -> tuple[tuple[FlatParticipantScope | ScopeReference, FLClientCandidate], ...]:
     assignments = []
     used = set()
     for scope in sorted(scopes, key=lambda item: item.scope_key):
-        owner_id = scope.consumer_id.strip()
+        owner_id = _participant_nf_instance_id(scope)
         required = _scope_tais(scope)
-        candidate = next(
-            (
-                item
-                for item in candidates
-                if item.target.nf_instance_id == owner_id
-                and item.target.nf_instance_id not in used
-                and (not required or required.intersection(item.tracking_areas))
-            ),
-            None,
+        eligible = tuple(
+            item
+            for item in candidates
+            if item.target.nf_instance_id == owner_id
+            and item.target.nf_instance_id not in used
+            and (not required or required.intersection(item.tracking_areas))
         )
-        if candidate is None:
+        if len(eligible) != 1:
             raise RuntimeError(
-                f"monitor owner {owner_id or '<missing>'} is not an eligible "
-                f"FL Client for scope {scope.scope_key}"
+                f"configured participant {owner_id or '<missing>'} is not an eligible "
+                f"unique FL Client for scope {scope.scope_key}"
             )
+        candidate = eligible[0]
         assignments.append((scope, candidate))
         used.add(candidate.target.nf_instance_id)
     if len(assignments) < 2:
@@ -2383,14 +2431,23 @@ def _assign(
     return tuple(assignments)
 
 
-def _scope_tais(scope: ScopeReference) -> set[str]:
+def _scope_tais(scope: FlatParticipantScope | ScopeReference) -> set[str]:
     return {_tai_key(item) for item in _scope_tracking_area_values(scope) if _tai_key(item)}
 
 
-def _scope_tracking_area_values(scope: ScopeReference) -> list[dict]:
+def _scope_tracking_area_values(
+    scope: FlatParticipantScope | ScopeReference,
+) -> list[dict]:
     area = scope.ml_event_filter.get("networkArea") or scope.ml_event_filter.get("aoi") or {}
     tais = area.get("tais") if isinstance(area, dict) else []
     return [dict(item) for item in tais or [] if isinstance(item, dict) and _tai_key(item)]
+
+
+def _participant_nf_instance_id(scope: FlatParticipantScope | ScopeReference) -> str:
+    value = getattr(scope, "participant_nf_instance_id", None)
+    if value is None:
+        value = getattr(scope, "consumer_id", "")
+    return str(value).strip()
 
 
 def _fl_client_tracking_areas(

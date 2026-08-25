@@ -34,6 +34,9 @@ federated_learning:
       - "http://127.0.0.1:9093"
       - "http://127.0.0.1:9094"
     timeout_seconds: 300
+  orchestration:
+    mode: "hierarchical"
+    participant_source: "static"
   server:
     callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-training/notifications"
     preparation_timeout_seconds: 300
@@ -55,6 +58,8 @@ federated_learning:
     strategy: "static"
     config_file: "./topology/hierarchical-topology.yaml"
   training_trigger:
+    degradation:
+      enabled: true
     private_api:
       enabled: false
 
