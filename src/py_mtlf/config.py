@@ -230,6 +230,65 @@ class PrivateCollectionSnssaiSettings(FrozenSettings):
         return normalized
 
 
+class PrivateCollectionPlmnIdSettings(FrozenSettings):
+    mcc: str
+    mnc: str
+
+    @field_validator("mcc")
+    @classmethod
+    def validate_mcc(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[0-9]{3}", normalized):
+            raise ValueError("private collection MCC must be three digits")
+        return normalized
+
+    @field_validator("mnc")
+    @classmethod
+    def validate_mnc(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[0-9]{2,3}", normalized):
+            raise ValueError("private collection MNC must be two or three digits")
+        return normalized
+
+
+class PrivateCollectionTaiSettings(FrozenSettings):
+    plmn_id: PrivateCollectionPlmnIdSettings
+    tac: str
+
+    @field_validator("tac")
+    @classmethod
+    def validate_tac(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[0-9A-F]{6}", normalized):
+            raise ValueError("private collection TAC must be six hexadecimal digits")
+        return normalized
+
+    def wire_value(self) -> dict[str, object]:
+        return {
+            "plmnId": {
+                "mcc": self.plmn_id.mcc,
+                "mnc": self.plmn_id.mnc,
+            },
+            "tac": self.tac,
+        }
+
+
+class PrivateCollectionNetworkAreaSettings(FrozenSettings):
+    tais: tuple[PrivateCollectionTaiSettings, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_tais(self) -> "PrivateCollectionNetworkAreaSettings":
+        identities = tuple(
+            (item.plmn_id.mcc, item.plmn_id.mnc, item.tac) for item in self.tais
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("private collection TAIs must be unique")
+        return self
+
+    def wire_value(self) -> dict[str, object]:
+        return {"tais": [item.wire_value() for item in self.tais]}
+
+
 def _contains_area_filter(value: object) -> bool:
     forbidden = {"area", "networkarea", "tai", "tais", "trackingarealist"}
     if isinstance(value, dict):
@@ -248,10 +307,10 @@ class PrivateCollectionProfileSettings(FrozenSettings):
     ml_event: Literal["UE_COMMUNICATION"]
     ml_event_filter: dict[str, Any] = Field(default_factory=dict)
     target_ue: PrivateCollectionTargetSettings
+    network_area: PrivateCollectionNetworkAreaSettings
     dnns: tuple[str, ...] = ()
     snssais: tuple[PrivateCollectionSnssaiSettings, ...] = ()
     sampling_interval_seconds: int = Field(gt=0, le=86400)
-    minimum_observation_count: int = Field(gt=0, le=1000000)
 
     @field_validator("profile_id")
     @classmethod

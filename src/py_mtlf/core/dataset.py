@@ -473,8 +473,11 @@ class DatasetCoordinator:
                         or self._targets_match(scope.target_ue, event.target_ue)
                     )
                     and (
-                        not scope.ml_event_filter
-                        or scope.ml_event_filter == (event.ml_event_filter or {})
+                        self._event_filters_match(
+                            scope.ml_event_filter,
+                            event.ml_event_filter or {},
+                            entry.key.origin,
+                        )
                     )
                 )
             )
@@ -531,6 +534,24 @@ class DatasetCoordinator:
                 )
                 raise RuntimeError(f"scope {scope} has no usable training-data descriptor")
         return tuple(sorted(resolved, key=lambda item: item.identity))
+
+    @staticmethod
+    def _event_filters_match(
+        expected: dict,
+        actual: dict,
+        origin: DescriptorOrigin,
+    ) -> bool:
+        if not expected:
+            return True
+        comparable = actual
+        if (
+            origin is DescriptorOrigin.PRIVATE_API
+            and "networkArea" not in expected
+            and "aoi" not in expected
+        ):
+            comparable = dict(actual)
+            comparable.pop("networkArea", None)
+        return expected == comparable
 
     @staticmethod
     def _matches_scope(scope: ScopeReference, subscription: dict) -> bool:
@@ -602,11 +623,11 @@ class DatasetCoordinator:
             if (
                 resource.available_start is None
                 or resource.available_stop is None
-                or resource.available_start > job.time_window.start_time
-                or resource.available_stop < job.time_window.stop_time
+                or resource.available_stop < job.time_window.start_time
+                or resource.available_start > job.time_window.stop_time
             ):
                 raise RuntimeError(
-                    f"training-data descriptor {resource.identity} does not cover "
+                    f"training-data descriptor {resource.identity} does not overlap "
                     "the requested dataset window"
                 )
 

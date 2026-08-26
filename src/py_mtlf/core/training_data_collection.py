@@ -3,6 +3,7 @@ import json
 import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -61,6 +62,7 @@ class CollectionRequestRecord:
     record_count: int = 0
     observation_count: int = 0
     adrf_instance_id: str = ""
+    observed_correlations: set[str] = field(default_factory=set)
     descriptor_state: DescriptorState = DescriptorState.NONE
     failure_cause: str = ""
     failure_detail: str = ""
@@ -73,13 +75,12 @@ class CollectionRequestRecord:
 
 
 class TrainingDataCollectionManager:
-    _LEDGER_VERSION = 1
+    _LEDGER_VERSION = 2
     _ACTIVE_STATES = {
         CollectionRequestState.PENDING,
         CollectionRequestState.RESOLVING,
         CollectionRequestState.SUBSCRIBING,
         CollectionRequestState.COLLECTING,
-        CollectionRequestState.READY,
         CollectionRequestState.STOPPING,
         CollectionRequestState.RECOVERING,
     }
@@ -234,10 +235,7 @@ class TrainingDataCollectionManager:
                 for request_id in request_ids
                 if self._requests.get(request_id) is not None
                 and self._requests[request_id].state
-                in {
-                    CollectionRequestState.COLLECTING,
-                    CollectionRequestState.READY,
-                }
+                is CollectionRequestState.COLLECTING
             )
             if not active_request_ids:
                 raise CollectionManagerError(
@@ -417,6 +415,7 @@ class TrainingDataCollectionManager:
                     )
                     current.record_count += 1
                     current.observation_count += len(notification.notification_items)
+                    current.observed_correlations.add(correlation_id)
                     current.retry_attempt = 0
                     current.updated_at = self._clock().astimezone(UTC)
                     self._publish_descriptor_locked(
@@ -424,8 +423,6 @@ class TrainingDataCollectionManager:
                         subscription,
                         receipt.adrf_instance_id,
                     )
-                    if current.observation_count >= current.profile.minimum_observation_count:
-                        current.state = CollectionRequestState.READY
                 self._stored_inbox_digests.add(inbox_path.stem)
                 self._persist_locked()
             inbox_path.unlink(missing_ok=True)
@@ -481,6 +478,8 @@ class TrainingDataCollectionManager:
             retain_until = self._clock().astimezone(UTC) + timedelta(
                 seconds=self._settings.descriptor_retention_seconds
             )
+        event_filter = deepcopy(record.profile.ml_event_filter)
+        event_filter["networkArea"] = record.profile.network_area.wire_value()
         descriptor = TrainingDataDescriptor.model_validate(
             {
                 "correlationId": subscription.correlation_id,
@@ -502,7 +501,7 @@ class TrainingDataCollectionManager:
                 },
                 "mlEventSubscription": {
                     "mLEvent": record.profile.ml_event,
-                    "mLEventFilter": record.profile.ml_event_filter,
+                    "mLEventFilter": event_filter,
                     "tgtUe": {
                         "intGroupIds": list(record.profile.target_ue.int_group_ids)
                     },
@@ -534,7 +533,9 @@ class TrainingDataCollectionManager:
                     raise RuntimeError(
                         "retained collection ledger is missing descriptor state"
                     )
-                for resource in record.resources.values():
+                for correlation_id, resource in record.resources.items():
+                    if correlation_id not in record.observed_correlations:
+                        continue
                     self._publish_descriptor_locked(
                         record,
                         resource.subscription,
@@ -614,6 +615,11 @@ class TrainingDataCollectionManager:
                 record.state = CollectionRequestState.RETAINED
                 record.descriptor_state = DescriptorState.RETAINED
                 for resource in resources:
+                    if (
+                        resource.subscription.correlation_id
+                        not in record.observed_correlations
+                    ):
+                        continue
                     if record.stored_start is not None and record.stored_stop is not None:
                         self._publish_descriptor_locked(
                             record,
@@ -747,6 +753,7 @@ class TrainingDataCollectionManager:
                 "THROUGHPUT_MEASUREMENT",
             ],
             "mlEventFilter": profile.ml_event_filter,
+            "networkArea": profile.network_area.wire_value(),
         }
         return hashlib.sha256(
             json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -783,7 +790,6 @@ class TrainingDataCollectionManager:
             stopTime=record.stored_stop,
             recordCount=record.record_count,
             observationCount=record.observation_count,
-            minimumObservationCount=record.profile.minimum_observation_count,
             descriptorState=record.descriptor_state,
             failureCause=record.failure_cause,
             failureDetail=record.failure_detail,
@@ -808,6 +814,7 @@ class TrainingDataCollectionManager:
             "eventSubs": [
                 {
                     "event": "UPF_EVENT",
+                    "networkArea": record.profile.network_area.wire_value(),
                     "upfEvents": [
                         {
                             "type": "USER_DATA_USAGE_MEASURES",
@@ -954,6 +961,7 @@ class TrainingDataCollectionManager:
             "recordCount": record.record_count,
             "observationCount": record.observation_count,
             "adrfInstanceId": record.adrf_instance_id,
+            "observedCorrelations": sorted(record.observed_correlations),
             "descriptorState": record.descriptor_state,
             "failureCause": record.failure_cause,
             "failureDetail": record.failure_detail,
@@ -987,6 +995,11 @@ class TrainingDataCollectionManager:
         if retry_attempt < 0 or retry_attempt > 3:
             raise ValueError("collection ledger retry attempt is invalid")
         state = CollectionRequestState(value["state"])
+        observed_correlations = value.get("observedCorrelations", [])
+        if not isinstance(observed_correlations, list) or any(
+            not isinstance(item, str) or not item for item in observed_correlations
+        ):
+            raise ValueError("collection ledger observed correlations are malformed")
         resources = {}
         for item in value.get("resources", []):
             target = ServingSmfTarget(**item["target"])
@@ -1013,6 +1026,12 @@ class TrainingDataCollectionManager:
             if referenced:
                 resource.references.add(request.request_id)
             resources[subscription.correlation_id] = resource
+        if not set(observed_correlations).issubset(resources):
+            raise ValueError(
+                "collection ledger observed correlations do not identify resources"
+            )
+        if int(value.get("recordCount", 0)) and not observed_correlations:
+            raise ValueError("collection ledger stored records have no observed resource")
         return CollectionRequestRecord(
             request=request,
             profile=profile,
@@ -1034,6 +1053,7 @@ class TrainingDataCollectionManager:
             record_count=int(value.get("recordCount", 0)),
             observation_count=int(value.get("observationCount", 0)),
             adrf_instance_id=str(value.get("adrfInstanceId", "")),
+            observed_correlations=set(observed_correlations),
             descriptor_state=DescriptorState(value.get("descriptorState", "NONE")),
             failure_cause=str(value.get("failureCause", "")),
             failure_detail=str(value.get("failureDetail", "")),

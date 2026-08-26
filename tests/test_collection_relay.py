@@ -49,10 +49,17 @@ def collection_profile() -> PrivateCollectionProfileSettings:
             "ml_event": "UE_COMMUNICATION",
             "ml_event_filter": {},
             "target_ue": {"intGroupIds": ["group-a.example"]},
+            "network_area": {
+                "tais": [
+                    {
+                        "plmn_id": {"mcc": "466", "mnc": "92"},
+                        "tac": "001101",
+                    }
+                ]
+            },
             "dnns": ["internet"],
             "snssais": [{"sst": 1, "sd": "010203"}],
             "sampling_interval_seconds": 2,
-            "minimum_observation_count": 1,
         }
     )
 
@@ -173,6 +180,21 @@ def test_profile_resolution_rejects_wrong_group_without_tai_query():
         {"subId": "different-subscription"},
         {"notifUri": "http://wrong-callback.example/upf"},
         {"eventSubs": [{"event": "UPF_EVENT", "upfEvents": []}]},
+        {
+            "eventSubs": [
+                {
+                    "event": "UPF_EVENT",
+                    "networkArea": {
+                        "tais": [
+                            {
+                                "plmnId": {"mcc": "466", "mnc": "92"},
+                                "tac": "001102",
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
     ],
 )
 def test_invalid_accepted_subscription_preserves_provisional_cleanup_identity(
@@ -182,7 +204,19 @@ def test_invalid_accepted_subscription_preserves_provisional_cleanup_identity(
     requested = {
         "notifId": correlation,
         "notifUri": "http://py-mtlf.example/callbacks/upf-event-exposure",
-        "eventSubs": [{"event": "UPF_EVENT"}],
+        "eventSubs": [
+            {
+                "event": "UPF_EVENT",
+                "networkArea": {
+                    "tais": [
+                        {
+                            "plmnId": {"mcc": "466", "mnc": "92"},
+                            "tac": "001101",
+                        }
+                    ]
+                },
+            }
+        ],
     }
     representation = {
         **requested,

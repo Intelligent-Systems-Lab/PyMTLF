@@ -124,10 +124,25 @@ class BlockingResolutionRelay(RelayStub):
         return super().resolve_profile(profile)
 
 
+class MultiTargetRelay(RelayStub):
+    def resolve_profile(self, profile):
+        first = super().resolve_profile(profile)[0]
+        return (
+            first,
+            ServingSmfTarget(
+                supi="imsi-466920000000002",
+                smf_nf_instance_id=first.smf_nf_instance_id,
+                api_root=first.api_root,
+                pdu_session_id=11,
+                dnn=first.dnn,
+                snssai=first.snssai,
+            ),
+        )
+
+
 def private_settings(
     path: Path,
     *,
-    minimum: int = 1,
     worker_count: int = 1,
 ) -> PrivateAPITrainingDataSettings:
     return PrivateAPITrainingDataSettings.model_validate(
@@ -151,10 +166,17 @@ def private_settings(
                     "ml_event": "UE_COMMUNICATION",
                     "ml_event_filter": {},
                     "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": {
+                        "tais": [
+                            {
+                                "plmn_id": {"mcc": "466", "mnc": "92"},
+                                "tac": "001101",
+                            }
+                        ]
+                    },
                     "dnns": ["internet"],
                     "snssais": [{"sst": 1, "sd": "010203"}],
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": minimum,
                 }
             ],
         }
@@ -247,6 +269,16 @@ def wait_for_state(owner, request_id, expected):
     raise AssertionError(f"collection request did not reach {expected}")
 
 
+def wait_for_record_count(owner, request_id, expected):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        snapshot = owner.get(request_id)
+        if snapshot.record_count == expected:
+            return snapshot
+        time.sleep(0.005)
+    raise AssertionError(f"collection request did not store {expected} records")
+
+
 def test_create_is_idempotent_and_request_id_conflict_is_rejected(tmp_path):
     owner, relay, _ = manager(tmp_path, context_client())
     value = request()
@@ -287,7 +319,14 @@ def test_subscription_payload_uses_exact_profile_and_fixed_measurements(tmp_path
         "VOLUME_MEASUREMENT",
         "THROUGHPUT_MEASUREMENT",
     ]
-    assert "tai" not in str(payload).lower()
+    assert event["networkArea"] == {
+        "tais": [
+            {
+                "plmnId": {"mcc": "466", "mnc": "92"},
+                "tac": "001101",
+            }
+        ]
+    }
     owner.shutdown()
 
 
@@ -305,17 +344,31 @@ def test_callback_is_durable_before_ack_and_storage_publishes_private_descriptor
     assert relay.store_entered.wait(timeout=2)
     assert list((tmp_path / "collection-state" / "inbox").glob("*.json"))
     relay.allow_store.set()
-    ready = wait_for_state(owner, value.request_id, CollectionRequestState.READY)
+    collecting = wait_for_record_count(owner, value.request_id, 1)
 
-    assert ready.storage_transport == "adrf"
-    assert ready.record_count == 1
-    assert ready.observation_count == 1
+    assert collecting.storage_transport == "adrf"
+    assert collecting.record_count == 1
+    assert collecting.observation_count == 1
+    assert "minimumObservationCount" not in collecting.model_dump(
+        by_alias=True,
+        mode="json",
+    )
     datasets.put_private_training_data_descriptor.assert_called()
     descriptor = datasets.put_private_training_data_descriptor.call_args.args[2]
     assert descriptor.state == "ACTIVE"
     assert descriptor.source_nf_instance_id == "11111111-1111-4111-8111-111111111111"
     assert descriptor.ml_event_subscription.target_ue == {
         "intGroupIds": ["group-a.example"]
+    }
+    assert descriptor.ml_event_subscription.ml_event_filter == {
+        "networkArea": {
+            "tais": [
+                {
+                    "plmnId": {"mcc": "466", "mnc": "92"},
+                    "tac": "001101",
+                }
+            ]
+        }
     }
     assert descriptor.stored_data_spec.time_period.start_time.isoformat() == (
         "2026-08-26T10:00:00+00:00"
@@ -338,7 +391,7 @@ def test_delete_retires_correlation_and_retains_stored_descriptor(
     owner.accept_callback(notification(correlation_id))
     assert relay.store_entered.wait(timeout=2)
     relay.allow_store.set()
-    wait_for_state(owner, value.request_id, CollectionRequestState.READY)
+    wait_for_record_count(owner, value.request_id, 1)
 
     owner.delete(value.request_id)
     retained = wait_for_state(owner, value.request_id, CollectionRequestState.RETAINED)
@@ -350,6 +403,41 @@ def test_delete_retires_correlation_and_retains_stored_descriptor(
     with pytest.raises(CollectionManagerError) as late:
         owner.accept_callback(notification(correlation_id))
     assert late.value.status_code == 404
+    owner.shutdown()
+
+
+def test_delete_retains_descriptors_only_for_resources_that_stored_data(tmp_path):
+    relay = MultiTargetRelay()
+    datasets = Mock()
+    owner = TrainingDataCollectionManager(
+        private_settings(tmp_path / "collection-state"),
+        context_client(),
+        datasets,
+        relay,
+    )
+    owner.open()
+    value = request()
+    owner.create(value)
+    wait_for_state(owner, value.request_id, CollectionRequestState.COLLECTING)
+    resources = owner._requests[value.request_id].resources
+    observed_correlation = next(
+        correlation
+        for correlation, resource in resources.items()
+        if resource.subscription.target.supi == "imsi-466920000000001"
+    )
+
+    owner.accept_callback(notification(observed_correlation))
+    assert relay.store_entered.wait(timeout=2)
+    relay.allow_store.set()
+    wait_for_record_count(owner, value.request_id, 1)
+    datasets.reset_mock()
+
+    owner.delete(value.request_id)
+    wait_for_state(owner, value.request_id, CollectionRequestState.RETAINED)
+
+    datasets.put_private_training_data_descriptor.assert_called_once()
+    retained = datasets.put_private_training_data_descriptor.call_args.args[2]
+    assert retained.correlation_id == observed_correlation
     owner.shutdown()
 
 
@@ -403,7 +491,6 @@ def test_pending_cleanup_blocks_different_profile_with_same_collection_key(tmp_p
     second_profile = settings.collection_profiles[0].model_copy(
         update={
             "profile_id": "profile-b",
-            "minimum_observation_count": 2,
         }
     )
     settings = settings.model_copy(
@@ -463,9 +550,9 @@ def test_transient_storage_failure_retries_from_durable_inbox(tmp_path):
     correlation_id = next(iter(owner._requests[value.request_id].resources))
 
     owner.accept_callback(notification(correlation_id))
-    ready = wait_for_state(owner, value.request_id, CollectionRequestState.READY)
+    collecting = wait_for_record_count(owner, value.request_id, 1)
 
-    assert ready.record_count == 1
+    assert collecting.record_count == 1
     assert relay.store_calls == 2
     assert not list((tmp_path / "collection-state" / "inbox").glob("*.json"))
     owner.shutdown()
@@ -480,7 +567,7 @@ def test_recovery_does_not_restore_inbox_already_committed_in_ledger(tmp_path):
     correlation_id = next(iter(owner._requests[value.request_id].resources))
     accepted = notification(correlation_id)
     owner.accept_callback(accepted)
-    wait_for_state(owner, value.request_id, CollectionRequestState.READY)
+    wait_for_record_count(owner, value.request_id, 1)
     digest = next(iter(owner._stored_inbox_digests))
     inbox = tmp_path / "collection-state" / "inbox" / f"{digest}.json"
     owner._atomic_json_write(
@@ -569,6 +656,51 @@ def test_matching_requests_share_peer_resource_until_last_reference(tmp_path):
     owner.delete(second.request_id)
     wait_for_state(owner, second.request_id, CollectionRequestState.TERMINATED)
     assert relay.deleted == ["subscription-1"]
+    owner.shutdown()
+
+
+def test_collection_profiles_with_different_network_areas_do_not_share_resource(
+    tmp_path,
+):
+    settings = private_settings(tmp_path / "collection-state")
+    first_profile = settings.collection_profiles[0]
+    second_tai = first_profile.network_area.tais[0].model_copy(
+        update={"tac": "001102"}
+    )
+    second_profile = first_profile.model_copy(
+        update={
+            "profile_id": "profile-b",
+            "network_area": first_profile.network_area.model_copy(
+                update={"tais": (second_tai,)}
+            ),
+        }
+    )
+    relay = RelayStub()
+    owner = TrainingDataCollectionManager(
+        settings.model_copy(
+            update={"collection_profiles": (first_profile, second_profile)}
+        ),
+        context_client(),
+        Mock(),
+        relay,
+    )
+    owner.open()
+    first = request()
+    second = TrainingDataCollectionRequest(
+        requestId=str(uuid4()),
+        collectionProfileId="profile-b",
+    )
+
+    owner.create(first)
+    wait_for_state(owner, first.request_id, CollectionRequestState.COLLECTING)
+    owner.create(second)
+    wait_for_state(owner, second.request_id, CollectionRequestState.COLLECTING)
+
+    assert relay.create_calls == 2
+    assert {
+        payload["eventSubs"][0]["networkArea"]["tais"][0]["tac"]
+        for payload in relay.created_payloads
+    } == {"001101", "001102"}
     owner.shutdown()
 
 
@@ -703,7 +835,7 @@ def test_restart_restores_retained_descriptor_without_extending_ttl(tmp_path):
     original.accept_callback(notification(correlation_id))
     assert original_relay.store_entered.wait(timeout=2)
     original_relay.allow_store.set()
-    wait_for_state(original, value.request_id, CollectionRequestState.READY)
+    wait_for_record_count(original, value.request_id, 1)
     original.delete(value.request_id)
     retained = wait_for_state(
         original,
@@ -845,7 +977,7 @@ def test_ledger_persists_and_verifies_request_profile_digests_and_retry_attempt(
     owner.shutdown()
 
     payload = json.loads(ledger.read_text(encoding="utf-8"))
-    payload["requests"][0]["profile"]["minimum_observation_count"] = 999
+    payload["requests"][0]["profile"]["network_area"]["tais"][0]["tac"] = "001102"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
     recovered = TrainingDataCollectionManager(
         private_settings(tmp_path / "collection-state"),

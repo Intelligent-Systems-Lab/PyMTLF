@@ -43,6 +43,18 @@ def common_metadata() -> dict[str, object]:
     }
 
 
+def dataset_evidence(training_sample_count: int = 120) -> dict[str, object]:
+    return {
+        "contract_digest": DIGEST_A,
+        "observation_digest": DIGEST_B,
+        "training_tensor_digest": DIGEST_C,
+        "validation_tensor_digest": DIGEST_A,
+        "observation_count": 400,
+        "training_sample_count": training_sample_count,
+        "validation_sample_count": 34,
+    }
+
+
 def hierarchy_strategy() -> dict[str, object]:
     return {
         "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
@@ -152,6 +164,19 @@ def test_hierarchy_aggregate_requires_canonical_subordinates_and_exact_sum() -> 
     assert isinstance(artifact, RoundLocalArtifact)
     assert artifact.fl_metadata.training_sample_count == 200
 
+    metadata_with_local_evidence = dict(metadata)
+    metadata_with_local_evidence["dataset_evidence"] = dataset_evidence(200)
+    with pytest.raises(ValidationError):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "HIERARCHY_AGGREGATE",
+                "fl_metadata": metadata_with_local_evidence,
+                "file_digests": FILE_DIGESTS,
+            }
+        )
+
     metadata["training_sample_count"] = 199
     with pytest.raises(ValidationError, match="subordinate sample counts"):
         validate_fl_artifact(
@@ -186,6 +211,7 @@ def test_round_local_contract_has_no_formal_model_identity() -> None:
             "participant_nf_instance_id": CLIENT_A,
             "scope_digest": DIGEST_B,
             "training_sample_count": 120,
+            "dataset_evidence": dataset_evidence(),
             "input_global_weights_digest": DIGEST_A,
         }
     )
@@ -200,6 +226,40 @@ def test_round_local_contract_has_no_formal_model_identity() -> None:
     )
     assert artifact.fl_metadata.training_sample_count == 120
     assert "model_identity" not in artifact.model_dump()
+
+    missing = common_metadata()
+    missing.update(
+        {
+            "round_ind": 0,
+            "participant_nf_instance_id": CLIENT_A,
+            "scope_digest": DIGEST_B,
+            "training_sample_count": 120,
+            "input_global_weights_digest": DIGEST_A,
+        }
+    )
+    with pytest.raises(ValidationError):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "TRAINING",
+                "fl_metadata": missing,
+                "file_digests": FILE_DIGESTS,
+            }
+        )
+
+    mismatched = dict(metadata)
+    mismatched["dataset_evidence"] = dataset_evidence(119)
+    with pytest.raises(ValidationError, match="dataset evidence sample count"):
+        validate_fl_artifact(
+            {
+                "bundle_schema_version": "1.0",
+                "artifact_role": "ROUND_LOCAL",
+                "result_type": "TRAINING",
+                "fl_metadata": mismatched,
+                "file_digests": FILE_DIGESTS,
+            }
+        )
 
 
 def test_round_global_requires_canonical_participants_and_exact_sample_sum() -> None:

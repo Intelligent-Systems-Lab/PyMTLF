@@ -3539,6 +3539,15 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
             "scope_digest": scope_digest,
             "input_global_weights_digest": base_weights_digest,
             "training_sample_count": 10,
+            "dataset_evidence": {
+                "contract_digest": "a" * 64,
+                "observation_digest": "b" * 64,
+                "training_tensor_digest": "c" * 64,
+                "validation_tensor_digest": "d" * 64,
+                "observation_count": 12,
+                "training_sample_count": 10,
+                "validation_sample_count": 1,
+            },
         },
     }
     base = Mock(manifest=base_manifest)

@@ -1,5 +1,6 @@
 import math
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -34,6 +35,11 @@ def training_dataset() -> TrainingDataset:
         scope_key="scope-a",
         scope_digest="a" * 64,
         observation_count=80,
+        observation_timestamps=tuple(
+            datetime(2026, 8, 26, tzinfo=UTC) + timedelta(seconds=index)
+            for index in range(80)
+        ),
+        observations=observations,
         training_inputs=inputs,
         training_targets=targets,
         validation_inputs=validation_inputs,

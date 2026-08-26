@@ -52,7 +52,7 @@ from py_mtlf.core.trainer import (
     resolve_device,
     wape,
 )
-from py_mtlf.core.training_data import TrainingDatasetBuilder
+from py_mtlf.core.training_data import TrainingDatasetBuilder, dataset_evidence
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
 from py_mtlf.wire.ml_model import MLEventNotification, MLModelAddress
@@ -992,6 +992,9 @@ class FLClientEngine:
                 epochs=round_input.fl_metadata.client_training.epochs,
                 proximal_mu=proximal_mu,
             )
+            evidence = dataset_evidence(dataset)
+            if evidence.training_sample_count != result.training_sample_count:
+                raise RuntimeError("local training sample count does not match dataset evidence")
             with self._lock:
                 current = self._resources.get(subscription_id)
                 if current is not resource or current.revision != revision:
@@ -1014,6 +1017,7 @@ class FLClientEngine:
                     "scope_digest": resource.scope.scope_digest,
                     "input_global_weights_digest": base_digest,
                     "training_sample_count": result.training_sample_count,
+                    "dataset_evidence": evidence.as_dict(),
                 },
             }
             published = self._workspace.publish(

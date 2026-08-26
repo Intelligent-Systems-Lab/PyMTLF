@@ -15,6 +15,8 @@ from py_mtlf.core.dataset import (
     DatasetCoordinator,
     DatasetJob,
     DatasetJobState,
+    DescriptorEntry,
+    DescriptorKey,
     DescriptorOrigin,
 )
 from py_mtlf.models import TrainingDataDescriptor
@@ -345,7 +347,7 @@ def test_descriptor_without_adrf_identity_selects_mongodb_without_discovery():
     coordinator.shutdown()
 
 
-def test_adrf_descriptor_must_cover_the_complete_requested_absolute_window():
+def test_descriptor_partial_overlap_is_admitted_without_reanchoring():
     policy, intent = retrain_intent()
     resolver = Mock()
     resolver.resolve.return_value = "http://adrf.example"
@@ -368,14 +370,15 @@ def test_adrf_descriptor_must_cover_the_complete_requested_absolute_window():
     )
     job.resources = coordinator._resolve(intent, descriptor_snapshot())
 
-    with pytest.raises(RuntimeError, match="does not cover the requested dataset window"):
-        coordinator._retrieve_adrf(job, context_client().get())
+    coordinator._ensure_window_coverage(job)
 
     client.post.assert_not_called()
+    assert job.time_window.start_time == datetime(2026, 8, 4, 8, tzinfo=UTC)
+    assert job.time_window.stop_time == datetime(2026, 8, 4, 10, tzinfo=UTC)
     coordinator.shutdown()
 
 
-def test_mongodb_fallback_also_rejects_partial_descriptor_window():
+def test_descriptor_without_requested_window_overlap_is_rejected():
     policy, intent = retrain_intent()
     resolver = Mock()
     coordinator = DatasetCoordinator(
@@ -391,8 +394,8 @@ def test_mongodb_fallback_also_rejects_partial_descriptor_window():
         "job-1",
         intent,
         TimeWindow(
-            startTime=datetime(2026, 8, 4, 8, tzinfo=UTC),
-            stopTime=datetime(2026, 8, 4, 10, tzinfo=UTC),
+            startTime=datetime(2026, 8, 4, 10, tzinfo=UTC),
+            stopTime=datetime(2026, 8, 4, 11, tzinfo=UTC),
         ),
         "unavailable",
         policy_owned=False,
@@ -401,9 +404,86 @@ def test_mongodb_fallback_also_rejects_partial_descriptor_window():
     coordinator._run_job(job)
 
     assert job.state is DatasetJobState.FAILED
-    assert "does not cover the requested dataset window" in job.failure
+    assert "does not overlap the requested dataset window" in job.failure
     resolver.resolve.assert_not_called()
     coordinator.shutdown()
+
+
+def test_private_descriptor_area_is_provenance_when_scope_has_no_area():
+    policy, intent = retrain_intent()
+    descriptors = tuple(
+        descriptor.model_copy(
+            update={
+                "ml_event_subscription": descriptor.ml_event_subscription.model_copy(
+                    update={
+                        "ml_event_filter": {
+                            "networkArea": {
+                                "tais": [
+                                    {
+                                        "plmnId": {"mcc": "466", "mnc": "92"},
+                                        "tac": "001101",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                )
+            }
+        )
+        for descriptor in descriptor_snapshot()
+    )
+    entries = tuple(
+        DescriptorEntry(
+            DescriptorKey(DescriptorOrigin.PRIVATE_API, descriptor.correlation_id, "run-1"),
+            descriptor,
+        )
+        for descriptor in descriptors
+    )
+    coordinator = DatasetCoordinator(
+        DatasetSettings(),
+        context_client(),
+        policy,
+        Mock(close=Mock()),
+    )
+
+    resources = coordinator._resolve_entries(intent, entries, DescriptorOrigin.PRIVATE_API)
+
+    assert len(resources) == 2
+    coordinator.shutdown()
+
+
+def test_private_descriptor_explicit_area_constraint_still_matches_exactly():
+    expected = {
+        "networkArea": {
+            "tais": [
+                {
+                    "plmnId": {"mcc": "466", "mnc": "92"},
+                    "tac": "001101",
+                }
+            ]
+        }
+    }
+    different = {
+        "networkArea": {
+            "tais": [
+                {
+                    "plmnId": {"mcc": "466", "mnc": "92"},
+                    "tac": "001102",
+                }
+            ]
+        }
+    }
+
+    assert DatasetCoordinator._event_filters_match(
+        expected,
+        expected,
+        DescriptorOrigin.PRIVATE_API,
+    )
+    assert not DatasetCoordinator._event_filters_match(
+        expected,
+        different,
+        DescriptorOrigin.PRIVATE_API,
+    )
 
 
 def test_adrf_fetch_uses_standard_resource_and_bounded_same_origin_redirect():

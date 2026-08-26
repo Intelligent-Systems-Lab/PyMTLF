@@ -12,7 +12,6 @@ class CollectionRequestState(StrEnum):
     RESOLVING = "RESOLVING"
     SUBSCRIBING = "SUBSCRIBING"
     COLLECTING = "COLLECTING"
-    READY = "READY"
     STOPPING = "STOPPING"
     RECOVERING = "RECOVERING"
     RETAINED = "RETAINED"
@@ -81,7 +80,6 @@ class TrainingDataCollectionStatus(DomainModel):
     stop_time: datetime | None = Field(default=None, alias="stopTime")
     record_count: int = Field(default=0, ge=0, alias="recordCount")
     observation_count: int = Field(default=0, ge=0, alias="observationCount")
-    minimum_observation_count: int = Field(ge=1, alias="minimumObservationCount")
     descriptor_state: DescriptorState = Field(default=DescriptorState.NONE, alias="descriptorState")
     failure_cause: str = Field(default="", alias="failureCause")
     failure_detail: str = Field(default="", alias="failureDetail")

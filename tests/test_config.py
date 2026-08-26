@@ -22,6 +22,17 @@ from py_mtlf.config import (
 from py_mtlf.core.fl_topology import StaticTopologyPlanner
 
 
+def private_network_area(tac: str = "001101") -> dict:
+    return {
+        "tais": [
+            {
+                "plmn_id": {"mcc": "466", "mnc": "92"},
+                "tac": tac,
+            }
+        ]
+    }
+
+
 def test_defaults_use_confirmed_phase_one_values():
     settings = Settings()
 
@@ -288,10 +299,10 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                         "ml_event": "UE_COMMUNICATION",
                         "ml_event_filter": {},
                         "target_ue": {"intGroupIds": ["group-a.example"]},
+                        "network_area": private_network_area(),
                         "dnns": ["internet"],
                         "snssais": [{"sst": 1, "sd": "010203"}],
                         "sampling_interval_seconds": 2,
-                        "minimum_observation_count": 32,
                     }
                 ],
             }
@@ -324,8 +335,8 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "ml_event": "UE_COMMUNICATION",
                     "ml_event_filter": {"networkArea": {"tais": []}},
                     "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area(),
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -335,8 +346,8 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "profile_id": "ue-communication-default",
                     "ml_event": "UE_COMMUNICATION",
                     "target_ue": {"supis": ["imsi-001"]},
+                    "network_area": private_network_area(),
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -348,8 +359,8 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "target_ue": {
                         "intGroupIds": ["group-a.example", "group-a.example"]
                     },
+                    "network_area": private_network_area(),
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -359,9 +370,9 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "profile_id": "ue-communication-default",
                     "ml_event": "UE_COMMUNICATION",
                     "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area(),
                     "dnns": ["invalid_dnn"],
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -371,12 +382,12 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "profile_id": "ue-communication-default",
                     "ml_event": "UE_COMMUNICATION",
                     "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area(),
                     "snssais": [
                         {"sst": 1, "sd": "010203"},
                         {"sst": 1, "sd": "010203"},
                     ],
                     "sampling_interval_seconds": 2,
-                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -386,8 +397,42 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
                     "profile_id": "ue-communication-default",
                     "ml_event": "UE_COMMUNICATION",
                     "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area(),
                     "sampling_interval_seconds": 0,
-                    "minimum_observation_count": 0,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": {"tais": []},
+                    "sampling_interval_seconds": 2,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area("not-a-tac"),
+                    "sampling_interval_seconds": 2,
+                }
+            ]
+        },
+        {
+            "collection_profiles": [
+                {
+                    "profile_id": "ue-communication-default",
+                    "ml_event": "UE_COMMUNICATION",
+                    "target_ue": {"intGroupIds": ["group-a.example"]},
+                    "network_area": private_network_area(),
+                    "sampling_interval_seconds": 2,
+                    "minimum_observation_count": 1,
                 }
             ]
         },
@@ -407,8 +452,8 @@ def test_private_collection_settings_fail_closed(tmp_path, override):
                 "profile_id": "ue-communication-default",
                 "ml_event": "UE_COMMUNICATION",
                 "target_ue": {"intGroupIds": ["group-a.example"]},
+                "network_area": private_network_area(),
                 "sampling_interval_seconds": 2,
-                "minimum_observation_count": 1,
             }
         ],
     }
@@ -450,8 +495,13 @@ federated_learning:
           ml_event: UE_COMMUNICATION
           target_ue:
             intGroupIds: [group-a.example]
+          network_area:
+            tais:
+              - plmn_id:
+                  mcc: "466"
+                  mnc: "92"
+                tac: "001101"
           sampling_interval_seconds: 2
-          minimum_observation_count: 1
 """.strip(),
         encoding="utf-8",
     )

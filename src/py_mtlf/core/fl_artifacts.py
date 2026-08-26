@@ -128,11 +128,31 @@ class RoundLocalCommonMetadata(CommonFLMetadata):
         return self
 
 
+class DatasetEvidence(ArtifactContractModel):
+    contract_digest: Sha256
+    observation_digest: Sha256
+    training_tensor_digest: Sha256
+    validation_tensor_digest: Sha256
+    observation_count: int = Field(gt=0)
+    training_sample_count: int = Field(gt=0)
+    validation_sample_count: int = Field(gt=0)
+
+
 class RoundLocalTrainingMetadata(RoundLocalCommonMetadata):
     training_sample_count: int = Field(gt=0)
+    dataset_evidence: DatasetEvidence
+
+    @model_validator(mode="after")
+    def validate_dataset_evidence(self) -> RoundLocalTrainingMetadata:
+        if self.dataset_evidence.training_sample_count != self.training_sample_count:
+            raise ValueError(
+                "dataset evidence sample count must match training sample count"
+            )
+        return self
 
 
-class RoundLocalHierarchyAggregateMetadata(RoundLocalTrainingMetadata):
+class RoundLocalHierarchyAggregateMetadata(RoundLocalCommonMetadata):
+    training_sample_count: int = Field(gt=0)
     lower_round_ind: int = Field(ge=0)
     lower_global_artifact_digest: Sha256
     subordinate_participants: tuple[RoundParticipant, ...] = Field(min_length=1)

@@ -1,3 +1,5 @@
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -5,7 +7,12 @@ import pytest
 
 from py_mtlf.config import FittingSettings
 from py_mtlf.core.dataset import DatasetRecord, DatasetSnapshot
-from py_mtlf.core.training_data import FEATURE_ORDER, TrainingDataError, TrainingDatasetBuilder
+from py_mtlf.core.training_data import (
+    FEATURE_ORDER,
+    TrainingDataError,
+    TrainingDatasetBuilder,
+    dataset_evidence,
+)
 from py_mtlf.wire.adrf import TimeWindow
 
 
@@ -168,6 +175,10 @@ def test_window_first_split_keeps_validation_and_training_observations_disjoint(
         out_seq_len=1,
         output_indices=(1, 2),
         purge=30,
+        observation_timestamps=tuple(
+            datetime(2026, 7, 25, tzinfo=UTC) + timedelta(seconds=index)
+            for index in range(len(observations))
+        ),
     )
 
     assert scope.validation_sample_count == 1
@@ -184,6 +195,26 @@ def test_window_first_split_keeps_validation_and_training_observations_disjoint(
     assert scope.training_observations[0, 0] == 31
 
 
+def test_builder_uses_only_observations_inside_requested_interval():
+    value = snapshot()
+    bounded = replace(
+        value,
+        time_window=TimeWindow(
+            startTime=value.time_window.start_time + timedelta(seconds=100),
+            stopTime=value.time_window.start_time + timedelta(seconds=199),
+        ),
+    )
+
+    dataset = TrainingDatasetBuilder(FittingSettings()).build(bounded, manifest())
+
+    assert {scope.observation_count for scope in dataset.scopes} == {100}
+    assert all(
+        bounded.time_window.start_time <= timestamp <= bounded.time_window.stop_time
+        for scope in dataset.scopes
+        for timestamp in scope.observation_timestamps
+    )
+
+
 def test_triggering_scope_requires_training_and_reference_validation():
     value = snapshot()
     insufficient = DatasetSnapshot(
@@ -197,3 +228,105 @@ def test_triggering_scope_requires_training_and_reference_validation():
 
     with pytest.raises(TrainingDataError, match="triggering scope"):
         TrainingDatasetBuilder(FittingSettings()).build(insufficient, manifest())
+
+
+def test_dataset_evidence_is_canonical_across_scope_order_and_endianness():
+    dataset = TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
+    reordered = replace(dataset, scopes=tuple(reversed(dataset.scopes)))
+    big_endian = replace(
+        dataset,
+        scopes=tuple(
+            replace(
+                scope,
+                observations=scope.observations.astype(">f8"),
+                training_inputs=(
+                    None
+                    if scope.training_inputs is None
+                    else scope.training_inputs.astype(">f8")
+                ),
+                training_targets=(
+                    None
+                    if scope.training_targets is None
+                    else scope.training_targets.astype(">f8")
+                ),
+                validation_inputs=(
+                    None
+                    if scope.validation_inputs is None
+                    else scope.validation_inputs.astype(">f8")
+                ),
+                validation_targets=(
+                    None
+                    if scope.validation_targets is None
+                    else scope.validation_targets.astype(">f8")
+                ),
+            )
+            for scope in dataset.scopes
+        ),
+    )
+
+    expected = dataset_evidence(dataset)
+
+    assert dataset_evidence(reordered) == expected
+    assert dataset_evidence(big_endian) == expected
+
+
+def test_dataset_evidence_tracks_timestamps_tensor_values_and_split():
+    dataset = TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
+    expected = dataset_evidence(dataset)
+    first = dataset.scopes[0]
+    shifted_times = replace(
+        dataset,
+        scopes=(
+            replace(
+                first,
+                observation_timestamps=(
+                    first.observation_timestamps[0] + timedelta(microseconds=1),
+                    *first.observation_timestamps[1:],
+                ),
+            ),
+            *dataset.scopes[1:],
+        ),
+    )
+    changed_inputs = first.training_inputs.copy()
+    changed_inputs[0, 0, 0] += 1
+    changed_tensor = replace(
+        dataset,
+        scopes=(replace(first, training_inputs=changed_inputs), *dataset.scopes[1:]),
+    )
+    changed_split = TrainingDatasetBuilder(
+        FittingSettings(validation_ratio=0.2)
+    ).build(snapshot(), manifest())
+
+    assert dataset_evidence(shifted_times).observation_digest != expected.observation_digest
+    assert (
+        dataset_evidence(shifted_times).training_tensor_digest
+        == expected.training_tensor_digest
+    )
+    assert (
+        dataset_evidence(changed_tensor).training_tensor_digest
+        != expected.training_tensor_digest
+    )
+    assert (
+        dataset_evidence(changed_split).validation_tensor_digest
+        != expected.validation_tensor_digest
+    )
+
+
+def test_dataset_evidence_contains_only_digests_and_counts():
+    evidence = dataset_evidence(
+        TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
+    )
+    payload = evidence.as_dict()
+
+    assert set(payload) == {
+        "contract_digest",
+        "observation_digest",
+        "training_tensor_digest",
+        "validation_tensor_digest",
+        "observation_count",
+        "training_sample_count",
+        "validation_sample_count",
+    }
+    encoded = json.dumps(payload)
+    assert "imsi-" not in encoded
+    assert "corr-" not in encoded

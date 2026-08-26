@@ -45,13 +45,18 @@ federated_learning:
           target_ue:
             intGroupIds:
               - "group-a.example"
+          network_area:
+            tais:
+              - plmn_id:
+                  mcc: "466"
+                  mnc: "92"
+                tac: "001101"
           dnns:
             - "internet"
           snssais:
             - sst: 1
               sd: "010203"
           sampling_interval_seconds: 2
-          minimum_observation_count: 32
     model_interoperability_ids:
       - "001122"
     training:

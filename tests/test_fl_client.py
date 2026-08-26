@@ -44,7 +44,7 @@ from py_mtlf.core.nwdaf_context import (
     NwdafContext,
 )
 from py_mtlf.core.trainer import LocalTrainer
-from py_mtlf.core.training_data import FEATURE_ORDER
+from py_mtlf.core.training_data import FEATURE_ORDER, ScopeTrainingData, TrainingDataset
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import DataNotification, DataSubscription, NadrfDataStoreRecord
@@ -103,6 +103,41 @@ def preparation_payload() -> dict:
         ],
         "mLTrainRepInfo": {"maxResTime": 300},
     }
+
+
+def round_training_dataset(sample_count: int = 10) -> TrainingDataset:
+    observation_count = sample_count + 2
+    observations = np.arange(observation_count * len(FEATURE_ORDER), dtype=float).reshape(
+        observation_count,
+        len(FEATURE_ORDER),
+    )
+    scope = ScopeTrainingData(
+        scope_key="scope-a",
+        scope_digest="a" * 64,
+        observation_count=observation_count,
+        observation_timestamps=tuple(
+            datetime(2026, 8, 26, tzinfo=UTC) + timedelta(seconds=index)
+            for index in range(observation_count)
+        ),
+        observations=observations,
+        training_inputs=np.zeros((sample_count, 1, len(FEATURE_ORDER))),
+        training_targets=np.zeros((sample_count, 2)),
+        validation_inputs=np.zeros((1, 1, len(FEATURE_ORDER))),
+        validation_targets=np.zeros((1, 2)),
+        training_observations=observations,
+        training_eligible=True,
+        evaluation_eligible=True,
+        exclusion_reason="",
+    )
+    return TrainingDataset(
+        feature_order=FEATURE_ORDER,
+        output_fields=("ul_vol", "dl_vol"),
+        output_indices=(1, 2),
+        seq_length=1,
+        out_seq_len=1,
+        triggering_scope_key="scope-a",
+        scopes=(scope,),
+    )
 
 
 def fl_settings(tmp_path) -> FederatedLearningSettings:
@@ -2127,8 +2162,7 @@ def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
     )
     service._loader = Mock()
     service._loader.load.return_value = base
-    training_scope = Mock(training_sample_count=10)
-    dataset = Mock(training_scopes=(training_scope,))
+    dataset = round_training_dataset()
     service._dataset_builder = Mock()
     service._dataset_builder.build.return_value = dataset
     result_model = torch.nn.Linear(2, 1)
@@ -2219,9 +2253,7 @@ def test_go_generation_reset_drops_leaf_result_published_during_abort(tmp_path):
     )
     service._loader = Mock()
     service._loader.load.return_value = base
-    service._dataset_builder = Mock(
-        build=Mock(return_value=Mock(training_scopes=(Mock(training_sample_count=10),)))
-    )
+    service._dataset_builder = Mock(build=Mock(return_value=round_training_dataset()))
     service._trainer = Mock(
         train=Mock(
             return_value=Mock(
@@ -2305,8 +2337,7 @@ def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_pat
     )
     service._loader = Mock()
     service._loader.load.return_value = base
-    training_scope = Mock(training_sample_count=10)
-    dataset = Mock(training_scopes=(training_scope,))
+    dataset = round_training_dataset()
     service._dataset_builder = Mock()
     service._dataset_builder.build.return_value = dataset
     result_model = torch.nn.Linear(2, 1)
