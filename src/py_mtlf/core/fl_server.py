@@ -1689,6 +1689,12 @@ class FLServerEngine:
                 f"{response.status_code}: {response.text}"
             )
         participant.resource_location = response.headers["Location"]
+        logger.info(
+            "FL participant resource created process_id=%s nf=%s location=%s",
+            process.process_id,
+            participant.candidate.target.nf_instance_id,
+            participant.resource_location,
+        )
         participant.expected_scope_digest = TrainingScopeDescriptor.from_training_request(
             value, 0
         ).scope_digest
@@ -1866,6 +1872,13 @@ class FLServerEngine:
             try:
                 response = self._client.delete(participant.resource_location)
                 if response.status_code in {204, 404}:
+                    logger.info(
+                        "FL participant resource deleted process_id=%s nf=%s location=%s status=%s",
+                        process.process_id,
+                        participant.candidate.target.nf_instance_id,
+                        participant.resource_location,
+                        response.status_code,
+                    )
                     return ""
                 last_error = f"cleanup returned {response.status_code}"
             except httpx.TransportError as error:

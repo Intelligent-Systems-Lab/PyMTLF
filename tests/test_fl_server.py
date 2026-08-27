@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -3241,7 +3242,8 @@ def test_hierarchy_cancellation_wakes_collection_and_late_callback_is_rejected(t
         orchestrator.close()
 
 
-def test_preparation_uses_configured_historical_data_window(tmp_path):
+def test_preparation_uses_configured_historical_data_window(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="py_mtlf.core.fl_server")
     owner_id = "11111111-1111-4111-8111-111111111111"
     projection = context_client(
         nf_instance_id="33333333-3333-4333-8333-333333333333",
@@ -3282,6 +3284,42 @@ def test_preparation_uses_configured_historical_data_window(tmp_path):
         start = datetime.fromisoformat(window["startTime"].replace("Z", "+00:00"))
         stop = datetime.fromisoformat(window["stopTime"].replace("Z", "+00:00"))
         assert (stop - start).total_seconds() == 3600
+        assert (
+            "FL participant resource created process_id=process-1 "
+            f"nf={owner_id} location=http://go.example/subscriptions/preparation-a"
+        ) in caplog.text
+    finally:
+        orchestrator.close()
+
+
+def test_participant_cleanup_logs_exact_deleted_resource(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="py_mtlf.core.fl_server")
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="cleanup-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(process_id="process-1", intent=Mock())
+    client = Mock()
+    client.delete.return_value = Mock(status_code=204)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    try:
+        assert orchestrator._cleanup_participant(process, participant) == ""
+        assert (
+            "FL participant resource deleted process_id=process-1 "
+            f"nf={owner_id} location={participant.resource_location} status=204"
+        ) in caplog.text
     finally:
         orchestrator.close()
 
