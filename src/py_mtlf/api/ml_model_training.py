@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, Response
 from py_mtlf.api.problems import problem_response
 from py_mtlf.core.fl_client import FLClientCapacityError, FLClientResource
 from py_mtlf.wire.ml_model_training import (
+    InvalidMessageError,
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
     NwdafMLModelTrainSubscPatch,
@@ -38,6 +39,8 @@ def create_training_subscription(
         return _role_unavailable("FL Client")
     try:
         resource = request.app.state.fl_client.create(payload)
+    except InvalidMessageError as error:
+        return _invalid_message(error)
     except RequirementsError as error:
         return _requirements_not_met(error)
     except ValueError as error:
@@ -82,6 +85,8 @@ def replace_training_subscription(
         resource = request.app.state.fl_client.replace(subscription_id, payload)
     except KeyError:
         return _not_found(subscription_id)
+    except InvalidMessageError as error:
+        return _invalid_message(error)
     except RequirementsError as error:
         return _requirements_not_met(error)
     except FLClientCapacityError as error:
@@ -113,6 +118,8 @@ def patch_training_subscription(
         resource = request.app.state.fl_client.patch(subscription_id, payload)
     except KeyError:
         return _not_found(subscription_id)
+    except InvalidMessageError as error:
+        return _invalid_message(error)
     except RequirementsError as error:
         return _requirements_not_met(error)
     except FLClientCapacityError as error:
@@ -169,6 +176,8 @@ def receive_training_notification(
             "ML Model Training callback route was not found",
             cause="RESOURCE_NOT_FOUND",
         )
+    except InvalidMessageError as error:
+        return _invalid_message(error)
     except (RequirementsError, ValueError) as error:
         return problem_response(
             status.HTTP_400_BAD_REQUEST,
@@ -203,6 +212,19 @@ def _requirements_not_met(error: RequirementsError) -> Response:
         "Forbidden",
         "federated learning requirements are not met",
         cause="ML_MODEL_TRAINING_REQS_NOT_MET",
+        invalid_params=[
+            {"param": violation.parameter, "reason": violation.reason}
+            for violation in error.violations
+        ],
+    )
+
+
+def _invalid_message(error: InvalidMessageError) -> Response:
+    return problem_response(
+        status.HTTP_400_BAD_REQUEST,
+        "Bad Request",
+        str(error),
+        cause="INVALID_MSG_FORMAT",
         invalid_params=[
             {"param": violation.parameter, "reason": violation.reason}
             for violation in error.violations

@@ -494,13 +494,17 @@ def create_app(
                 "/callbacks/upf-event-exposure",
             )
         ):
-            from py_mtlf.api.problems import problem_response
+            from py_mtlf.api.problems import (
+                problem_response,
+                validation_error_invalid_params,
+            )
 
             return problem_response(
                 status.HTTP_400_BAD_REQUEST,
                 "Bad Request",
                 "request validation failed",
                 cause="INVALID_MSG_FORMAT",
+                invalid_params=validation_error_invalid_params(exc.errors()),
             )
         del exc
         payload = PrivateError(

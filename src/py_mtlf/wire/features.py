@@ -1,4 +1,5 @@
 MODEL_PROVISION_EXT_FEATURE = 4
+HIERARCHICAL_FL_ORCHESTRATION_FEATURE = 3
 
 
 def feature_mask(*feature_numbers: int) -> str:

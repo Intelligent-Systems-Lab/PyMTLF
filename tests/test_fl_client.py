@@ -49,6 +49,7 @@ from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import DataNotification, DataSubscription, NadrfDataStoreRecord
 from py_mtlf.wire.ml_model_training import (
+    InvalidMessageError,
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
     NwdafMLModelTrainSubscPatch,
@@ -103,6 +104,29 @@ def preparation_payload() -> dict:
         ],
         "mLTrainRepInfo": {"maxResTime": 300},
     }
+
+
+def candidate_preparation_payload() -> dict:
+    payload = preparation_payload()
+    payload.pop("mLModelInfos")
+    payload["suppFeats"] = "4"
+    payload["x-retainedResultReq"] = True
+    payload["x-flTopology"] = {
+        "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "children": [
+            {
+                "nfInstanceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "priority": 100,
+                "retainedResultReq": True,
+            }
+        ],
+        "policy": {
+            "selectionMethod": "priority",
+            "minAvailableNodes": 1,
+            "minTrainNodes": 1,
+        },
+    }
+    return payload
 
 
 def round_training_dataset(sample_count: int = 10) -> TrainingDataset:
@@ -304,6 +328,234 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
             time.sleep(0.01)
         assert resource.dataset_job_id == "dataset-job-1"
         datasets.submit_external.assert_called_once()
+    finally:
+        service.close()
+
+
+def test_candidate_create_is_retained_without_starting_legacy_execution(
+    tmp_path,
+    monkeypatch,
+):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+    )
+    start_operation = Mock()
+    monkeypatch.setattr(service, "_start_operation", start_operation)
+
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+        )
+
+        assert resource.state is FLClientState.READY
+        assert resource.representation.supported_features == ""
+        assert resource.representation.fl_topology is not None
+        assert resource.representation.retained_result_request is None
+        assert (
+            resource.representation.fl_topology.children[0].retained_result_request
+            is None
+        )
+        start_operation.assert_not_called()
+        assert service._capacity.acquire(blocking=False)
+        assert service._outbox_capacity.acquire(blocking=False)
+        service._capacity.release()
+        service._outbox_capacity.release()
+    finally:
+        service.close()
+
+
+def test_candidate_create_validates_containing_nwdaf_identity(tmp_path):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+    )
+    try:
+        with pytest.raises(InvalidMessageError) as captured:
+            service.create(
+                NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+            )
+        assert captured.value.violations[0].parameter == "x-flTopology.nfInstanceId"
+    finally:
+        service.close()
+
+
+def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutation(
+    tmp_path,
+):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id=(
+            "11111111-1111-4111-8111-111111111111"
+        ),
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+    )
+    try:
+        created = service.create(
+            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+        )
+        updated = service.patch(
+            created.subscription_id,
+            NwdafMLModelTrainSubscPatch.model_validate(
+                {
+                    "eventReq": {
+                        "notifMethod": "ON_EVENT_DETECTION",
+                        "maxReportNbr": 1,
+                    }
+                }
+            ),
+        )
+        assert updated.state is FLClientState.READY
+        assert updated.revision == created.revision + 1
+        assert updated.representation.fl_topology is not None
+        assert updated.representation.event_request.maximum_report_count == 1
+
+        before_rejected_patch = service.get(created.subscription_id)
+        with pytest.raises(RequirementsError) as captured:
+            service.patch(
+                created.subscription_id,
+                NwdafMLModelTrainSubscPatch.model_validate(
+                    {"x-flTopology": {"policy": {"minTrainNodes": 1}}}
+                ),
+            )
+        assert captured.value.violations[0].parameter == "suppFeats"
+        after_rejected_patch = service.get(created.subscription_id)
+        assert after_rejected_patch.revision == before_rejected_patch.revision
+        assert (
+            after_rejected_patch.representation
+            == before_rejected_patch.representation
+        )
+
+        replacement_payload = candidate_preparation_payload()
+        replacement_payload["x-flTopology"]["children"][0]["priority"] = 80
+        with pytest.raises(RequirementsError):
+            service.replace(
+                created.subscription_id,
+                NwdafMLModelTrainSubsc.model_validate(replacement_payload),
+            )
+        after_rejected_put = service.get(created.subscription_id)
+        assert after_rejected_put.revision == before_rejected_patch.revision
+        assert after_rejected_put.representation == before_rejected_patch.representation
+        assert service._capacity.acquire(blocking=False)
+        assert service._outbox_capacity.acquire(blocking=False)
+        service._capacity.release()
+        service._outbox_capacity.release()
+    finally:
+        service.close()
+
+
+def test_candidate_resource_delete_and_generation_reset_remove_contract(tmp_path):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id=(
+            "11111111-1111-4111-8111-111111111111"
+        ),
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+    )
+    registry = FLExperimentRegistry()
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+        experiments=registry,
+    )
+    try:
+        first = service.create(
+            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+        )
+        service.delete(first.subscription_id)
+        with pytest.raises(KeyError):
+            service.get(first.subscription_id)
+        assert registry.active() is None
+
+        second_payload = candidate_preparation_payload()
+        second_payload["notifCorreId"] = "prep-client-b"
+        second = service.create(
+            NwdafMLModelTrainSubsc.model_validate(second_payload)
+        )
+        service.abort_generation("containing NWDAF process generation changed")
+        with pytest.raises(KeyError):
+            service.get(second.subscription_id)
+        registry.reset_generation()
+        assert service._capacity.acquire(blocking=False)
+        assert service._outbox_capacity.acquire(blocking=False)
+        service._capacity.release()
+        service._outbox_capacity.release()
+    finally:
+        registry.reset_generation()
+        service.close()
+
+
+def test_unnegotiated_candidate_put_is_gated_before_context_lookup(tmp_path):
+    context = Mock()
+    context.get.side_effect = [
+        NwdafContext(
+            nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            containing_nwdaf_process_instance_id=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+            api_root="http://nwdaf.example",
+            internal_api_root="http://nwdaf-internal.example",
+        ),
+        RuntimeError("containing NWDAF context is unavailable"),
+    ]
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+    )
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+        )
+        with pytest.raises(RequirementsError):
+            service.replace(
+                resource.subscription_id,
+                NwdafMLModelTrainSubsc.model_validate(
+                    candidate_preparation_payload()
+                ),
+            )
+        assert context.get.call_count == 1
     finally:
         service.close()
 

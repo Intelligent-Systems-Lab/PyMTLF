@@ -55,6 +55,11 @@ from py_mtlf.core.trainer import (
 from py_mtlf.core.training_data import TrainingDatasetBuilder, dataset_evidence
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
+from py_mtlf.wire.features import (
+    HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
+    feature_intersection,
+    includes_feature,
+)
 from py_mtlf.wire.ml_model import MLEventNotification, MLModelAddress
 from py_mtlf.wire.ml_model_training import (
     DelayEventNotif,
@@ -64,6 +69,11 @@ from py_mtlf.wire.ml_model_training import (
     NwdafMLModelTrainSubscPatch,
     RequirementsError,
     TrainingResourceIdentity,
+    apply_subscription_patch,
+    has_candidate_patch_fields,
+    has_candidate_subscription_fields,
+    split_candidate_operations,
+    validate_candidate_subscription_receiver,
     validate_fl_patch,
     validate_fl_subscription,
 )
@@ -158,6 +168,8 @@ class FLClientResource:
     branch_process_id: str = ""
     experiment_reservation_id: str = ""
     callback_slot_owned: bool = True
+    candidate_contract: bool = False
+    hierarchical_feature_negotiated: bool = False
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -292,7 +304,24 @@ class FLClientEngine:
 
     def create(self, value: NwdafMLModelTrainSubsc) -> FLClientResource:
         validate_fl_subscription(value)
-        self._validate_preparation_admission(value)
+        candidate_contract = has_candidate_subscription_fields(value)
+        if candidate_contract:
+            validate_candidate_subscription_receiver(
+                value,
+                self._nwdaf_context.get().nf_instance_id,
+            )
+            value = value.model_copy(
+                update={
+                    "supported_features": feature_intersection(
+                        value.supported_features or "",
+                        "",
+                    )
+                },
+                deep=True,
+            )
+        else:
+            self._validate_preparation_admission(value)
+        persistent, _operation = split_candidate_operations(value)
         if not self._capacity.acquire(blocking=False):
             raise FLClientCapacityError("FL client work capacity is exhausted")
         if not self._outbox_capacity.acquire(blocking=False):
@@ -314,10 +343,15 @@ class FLClientEngine:
             reservation_id = reservation.reservation_id
             resource = FLClientResource(
                 subscription_id=resource_id,
-                representation=value.model_copy(deep=True),
+                representation=persistent,
                 state=FLClientState.PROVISIONAL,
-                scope=TrainingScopeDescriptor.from_training_request(value, 0),
+                scope=TrainingScopeDescriptor.from_training_request(persistent, 0),
                 experiment_reservation_id=reservation_id,
+                candidate_contract=candidate_contract,
+                hierarchical_feature_negotiated=includes_feature(
+                    persistent.supported_features or "",
+                    HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
+                ),
             )
             with self._lock:
                 if any(
@@ -327,7 +361,7 @@ class FLClientEngine:
                 ):
                     raise ValueError("notifCorreId must be unique")
                 self._resources[resource_id] = resource
-            self._start_operation(resource)
+            self._start_resource_operation(resource)
             return self.get(resource_id)
         except Exception:
             with self._lock:
@@ -342,12 +376,43 @@ class FLClientEngine:
 
     def replace(self, subscription_id: str, value: NwdafMLModelTrainSubsc) -> FLClientResource:
         validate_fl_subscription(value)
-        scope = TrainingScopeDescriptor.from_training_request(value, 0)
+        candidate_operation = has_candidate_subscription_fields(value)
+        if candidate_operation:
+            with self._lock:
+                resource = self._required(subscription_id)
+                self._ensure_mutable(resource)
+                self._require_candidate_feature(resource)
+        if value.fl_topology is not None:
+            validate_candidate_subscription_receiver(
+                value,
+                self._nwdaf_context.get().nf_instance_id,
+            )
+        persistent, _operation = split_candidate_operations(value)
+        return self._replace_resource(
+            subscription_id,
+            value,
+            persistent,
+            candidate_operation=candidate_operation,
+            candidate_contract=candidate_operation,
+        )
+
+    def _replace_resource(
+        self,
+        subscription_id: str,
+        requested: NwdafMLModelTrainSubsc,
+        persistent: NwdafMLModelTrainSubsc,
+        *,
+        candidate_operation: bool,
+        candidate_contract: bool,
+    ) -> FLClientResource:
+        scope = TrainingScopeDescriptor.from_training_request(persistent, 0)
         with self._lock:
             resource = self._required(subscription_id)
             self._ensure_mutable(resource)
-            validate_fl_subscription(value, resource.identity)
-            if self._same_representation(value, resource.representation):
+            validate_fl_subscription(requested, resource.identity)
+            if candidate_operation:
+                self._require_candidate_feature(resource)
+            if self._same_representation(persistent, resource.representation):
                 return copy.deepcopy(resource)
             if resource.state in {
                 FLClientState.PREPARING,
@@ -364,13 +429,18 @@ class FLClientEngine:
                 raise FLClientCapacityError("FL client callback outbox is full")
             previous = copy.deepcopy(resource)
             try:
-                resource.representation = value.model_copy(deep=True)
+                resource.representation = persistent.model_copy(deep=True)
                 resource.scope = scope
                 resource.revision += 1
                 resource.state = FLClientState.PROVISIONAL
                 resource.callback_slot_owned = True
                 resource.work_slot_owned = True
-                self._start_operation(resource)
+                resource.candidate_contract = candidate_contract
+                resource.hierarchical_feature_negotiated = includes_feature(
+                    persistent.supported_features or "",
+                    HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
+                )
+                self._start_resource_operation(resource)
                 return copy.deepcopy(resource)
             except Exception:
                 self._resources[subscription_id] = previous
@@ -379,32 +449,35 @@ class FLClientEngine:
                 raise
 
     def patch(self, subscription_id: str, patch: NwdafMLModelTrainSubscPatch) -> FLClientResource:
+        candidate_operation = has_candidate_patch_fields(patch)
         with self._lock:
             resource = self._required(subscription_id)
             self._ensure_mutable(resource)
             validate_fl_patch(patch, resource.identity)
+            if candidate_operation:
+                self._require_candidate_feature(resource)
             update = patch.model_dump(
                 by_alias=True,
                 exclude_unset=True,
-                exclude_none=True,
+                exclude_none=False,
                 mode="json",
             )
-            effective = resource.representation.model_dump(
-                by_alias=True,
-                exclude_none=True,
-                mode="json",
-            )
-            effective.update(update)
-            value = NwdafMLModelTrainSubsc.model_validate(effective)
+            value = apply_subscription_patch(resource.representation, patch)
+            if value.fl_topology is not None:
+                validate_candidate_subscription_receiver(
+                    value,
+                    self._nwdaf_context.get().nf_instance_id,
+                )
+            persistent, _operation = split_candidate_operations(value)
             if set(update) == {"mLTrainRepInfo"} and resource.state in {
                 FLClientState.PREPARING,
                 FLClientState.ROUND_RUNNING,
                 FLClientState.VALIDATION_RUNNING,
             }:
-                resource.representation = value
+                resource.representation = persistent
                 self._schedule_delay(resource)
                 return copy.deepcopy(resource)
-            if self._same_representation(value, resource.representation):
+            if self._same_representation(persistent, resource.representation):
                 return copy.deepcopy(resource)
             if (
                 resource.representation.round_indicator is not None
@@ -412,7 +485,14 @@ class FLClientEngine:
                 and value.round_indicator <= resource.representation.round_indicator
             ):
                 raise RuntimeError("stale or conflicting FL round command")
-        return self.replace(subscription_id, value)
+            candidate_contract = resource.candidate_contract or candidate_operation
+        return self._replace_resource(
+            subscription_id,
+            value,
+            persistent,
+            candidate_operation=False,
+            candidate_contract=candidate_contract,
+        )
 
     def delete(self, subscription_id: str) -> None:
         with self._lock:
@@ -523,6 +603,29 @@ class FLClientEngine:
     def get(self, subscription_id: str) -> FLClientResource:
         with self._lock:
             return copy.deepcopy(self._required(subscription_id))
+
+    def _start_resource_operation(self, resource: FLClientResource) -> None:
+        if resource.candidate_contract and not resource.hierarchical_feature_negotiated:
+            resource.state = FLClientState.READY
+            resource.callback_slot_owned = False
+            resource.work_slot_owned = False
+            self._capacity.release()
+            self._outbox_capacity.release()
+            return
+        self._start_operation(resource)
+
+    @staticmethod
+    def _require_candidate_feature(resource: FLClientResource) -> None:
+        if resource.hierarchical_feature_negotiated:
+            return
+        raise RequirementsError(
+            [
+                InvalidParameter(
+                    "suppFeats",
+                    "HierarchicalFLOrch was not negotiated for this resource",
+                )
+            ]
+        )
 
     def _start_operation(self, resource: FLClientResource) -> None:
         value = resource.representation

@@ -3,6 +3,27 @@ from fastapi.responses import JSONResponse
 from py_mtlf.wire.ml_model import ProblemDetails
 
 
+def validation_error_invalid_params(errors: list[dict]) -> list[dict[str, str]]:
+    invalid_params: list[dict[str, str]] = []
+    for error in errors:
+        location = tuple(part for part in error.get("loc", ()) if part != "body")
+        path = ""
+        for part in location:
+            if isinstance(part, int):
+                path += f"[{part}]"
+            elif path:
+                path += f".{part}"
+            else:
+                path = str(part)
+        invalid_params.append(
+            {
+                "param": path,
+                "reason": str(error.get("msg", "request validation failed")),
+            }
+        )
+    return invalid_params
+
+
 def problem_response(
     status_code: int,
     title: str,

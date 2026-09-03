@@ -1,7 +1,85 @@
+from unittest.mock import Mock
+
 from fastapi.testclient import TestClient
 
 from py_mtlf.app import create_app
 from py_mtlf.config import FederatedLearningSettings, FLClientSettings, Settings
+from py_mtlf.core.nwdaf_context import (
+    FLCapabilityType,
+    MLAnalyticsCapability,
+    NwdafContext,
+)
+
+
+def candidate_payload() -> dict:
+    return {
+        "mLEventSubscs": [
+            {
+                "mLEvent": "UE_COMMUNICATION",
+                "mLEventFilter": {},
+                "modelInterInfo": "001122",
+            }
+        ],
+        "notifUri": "http://server.example/callback",
+        "notifCorreId": "correlation-1",
+        "suppFeats": "4",
+        "mlCorreId": "training-1",
+        "mLPreFlag": True,
+        "mLModelTrainInfos": [
+            {
+                "dataAvReq": {"inpEvents": [{"upfEvent": "USER_DATA_USAGE_TRENDS"}]},
+                "timeAvReq": "PT5M",
+            }
+        ],
+        "x-retainedResultReq": True,
+        "x-flTopology": {
+            "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "children": [
+                {
+                    "nfInstanceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "priority": 100,
+                    "retainedResultReq": True,
+                }
+            ],
+            "policy": {
+                "selectionMethod": "priority",
+                "minAvailableNodes": 1,
+                "minTrainNodes": 1,
+            },
+        },
+    }
+
+
+def candidate_settings(settings, tmp_path) -> Settings:
+    payload = settings.model_dump(mode="python")
+    payload["runtime"] = {"mode": "federated"}
+    payload["local_training"] = None
+    payload["federated_learning"] = FederatedLearningSettings(
+        workspace_root=tmp_path / "fl-client",
+        public_base_url=settings.artifact.public_base_url,
+        client=FLClientSettings(
+            training_data={"collection_trigger": "consumer_subscription"},
+            model_interoperability_ids=("001122",),
+        ),
+    )
+    return Settings.model_validate(payload)
+
+
+def candidate_context() -> Mock:
+    client = Mock()
+    client.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("UE_COMMUNICATION",),
+                fl_capability_type=FLCapabilityType.CLIENT,
+            ),
+        ),
+    )
+    return client
 
 
 def test_training_requirements_failure_identifies_invalid_parameters(
@@ -116,3 +194,120 @@ def test_training_admission_is_unavailable_without_containing_go_generation(
 
     assert response.status_code == 503
     assert response.json()["cause"] == "UNAVAILABLE_ML_MODEL_TRAINING_FOR_ALLEVENTS"
+
+
+def test_candidate_create_returns_lossless_persistent_contract_without_feature(
+    settings,
+    tmp_path,
+):
+    configured = candidate_settings(settings, tmp_path)
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        response = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=candidate_payload(),
+        )
+
+        assert response.status_code == 201
+        assert "/subscriptions/" in response.headers["location"]
+        representation = response.json()
+        assert representation["suppFeats"] == ""
+        assert representation["x-flTopology"]["nfInstanceId"].startswith("aaaaaaaa")
+        assert "x-retainedResultReq" not in representation
+        assert "retainedResultReq" not in representation["x-flTopology"]["children"][0]
+
+
+def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    payload = candidate_payload()
+    payload["x-flTopology"]["strategy"] = {
+        "method": "fedProx",
+        "aggregation": "sampleWeighted",
+        "methodParameters": {"proximalMu": 0.01, "unknown": True},
+    }
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        response = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["cause"] == "INVALID_MSG_FORMAT"
+    assert response.json()["invalidParams"] == [
+        {
+            "param": "x-flTopology.strategy.methodParameters.unknown",
+            "reason": "Extra inputs are not permitted",
+        }
+    ]
+
+
+def test_candidate_patch_is_rejected_when_feature_was_not_negotiated(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        created = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=candidate_payload(),
+        )
+        response = client.patch(
+            created.headers["location"],
+            json={"x-flTopology": {"policy": {"minTrainNodes": 1}}},
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+
+    assert created.status_code == 201
+    assert response.status_code == 403
+    assert response.json()["cause"] == "ML_MODEL_TRAINING_REQS_NOT_MET"
+    assert response.json()["invalidParams"] == [
+        {
+            "param": "suppFeats",
+            "reason": "HierarchicalFLOrch was not negotiated for this resource",
+        }
+    ]
+
+
+def test_candidate_put_is_rejected_when_feature_was_not_negotiated(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        created = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=candidate_payload(),
+        )
+        replacement = candidate_payload()
+        replacement["x-flTopology"]["children"][0]["priority"] = 80
+        response = client.put(created.headers["location"], json=replacement)
+
+    assert created.status_code == 201
+    assert response.status_code == 403
+    assert response.json()["cause"] == "ML_MODEL_TRAINING_REQS_NOT_MET"
+    assert response.json()["invalidParams"][0]["param"] == "suppFeats"
+
+
+def test_candidate_receiver_mismatch_is_structured_bad_request(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    payload = candidate_payload()
+    payload["x-flTopology"]["nfInstanceId"] = (
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    )
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        response = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["cause"] == "INVALID_MSG_FORMAT"
+    assert response.json()["invalidParams"] == [
+        {
+            "param": "x-flTopology.nfInstanceId",
+            "reason": "must identify the request receiver",
+        }
+    ]
