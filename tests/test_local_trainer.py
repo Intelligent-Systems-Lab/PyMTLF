@@ -179,7 +179,7 @@ def test_fedprox_penalty_uses_immutable_global_reference():
     )
 
 
-@pytest.mark.parametrize("value", [0, -0.1, math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("value", [-0.1, math.nan, math.inf, -math.inf])
 def test_federated_trainer_rejects_invalid_fedprox_mu(value):
     with pytest.raises(ValueError, match="proximal_mu"):
         FederatedTrainer(FittingSettings()).train(

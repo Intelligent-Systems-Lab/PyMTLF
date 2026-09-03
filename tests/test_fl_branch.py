@@ -16,6 +16,7 @@ from py_mtlf.core.fl_branch import (
     BranchPreparationExecution,
     FLBranchPreparationCoordinator,
 )
+from py_mtlf.core.fl_candidate_orchestration import IntermediateLocalWork
 from py_mtlf.core.fl_hierarchy import PreparationFailureCause, PreparationOutcome
 from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyNodeRole,
@@ -163,6 +164,45 @@ def _coordinator(resolver, artifacts, server, **kwargs) -> FLBranchPreparationCo
         artifact_service=artifacts,
         server=server,
         **kwargs,
+    )
+
+
+def _lower_global(tmp_path, round_indicator: int):
+    path = tmp_path / f"lower-global-{round_indicator}.tar.gz"
+    path.write_bytes(f"lower-{round_indicator}".encode())
+    contract = RoundGlobalArtifact.model_validate(
+        {
+            "artifact_role": "ROUND_GLOBAL",
+            "bundle_schema_version": "1.0",
+            "file_digests": {
+                "model.py": "1" * 64,
+                "model.npy": "2" * 64,
+                "scaler.pkl": "3" * 64,
+            },
+            "fl_metadata": {
+                "contract_version": "1.0",
+                "ml_corre_id": "lower-process",
+                "round_ind": round_indicator,
+                "model_contract_digest": "4" * 64,
+                "preprocessing_contract_digest": "5" * 64,
+                "base_weights_digest": "6" * 64,
+                "weights_digest": "7" * 64,
+                "participants": [
+                    {
+                        "participant_nf_instance_id": LEAF_A,
+                        "training_sample_count": 1,
+                        "local_artifact_digest": "8" * 64,
+                    }
+                ],
+                "aggregated_training_sample_count": 1,
+            },
+        }
+    )
+    return Mock(
+        url=f"http://branch.example/global-{round_indicator}",
+        digest=str(round_indicator + 4) * 64,
+        path=path,
+        contract=contract,
     )
 
 
@@ -591,6 +631,121 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
         "lower-process",
         "conflicting duplicate Branch upper round command",
     )
+
+
+def test_branch_report_after_runs_sequential_lower_rounds_before_upper_report(tmp_path):
+    artifacts = Mock()
+    server = Mock()
+    coordinator = _coordinator(Mock(), artifacts, server)
+    assignment = _assignment(tmp_path)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=assignment,
+        leaf_nodes=(_node(LEAF_A), _node(LEAF_B)),
+        leaf_assignments=(Mock(), Mock()),
+        process_id="lower-process",
+    )
+    lower_inputs = [
+        Mock(url=f"http://branch.example/input-{index}", digest=str(index + 1) * 64)
+        for index in range(3)
+    ]
+    artifacts.publish_round_input.side_effect = lower_inputs
+    lower_globals = [_lower_global(tmp_path, index) for index in range(3)]
+    server.execute_hierarchy_round.side_effect = lower_globals
+    loaded_intermediates = (Mock(name="lower-aggregate-0"), Mock(name="lower-aggregate-1"))
+    coordinator._loader = Mock()
+    coordinator._loader.load.side_effect = loaded_intermediates
+    upper_result = Mock(url="http://branch.example/upper-result")
+    artifacts.publish_hierarchy_aggregate.return_value = upper_result
+    payload = _representation().model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 4,
+            "mLTrainRepInfo": {"maxResTime": 300},
+        }
+    )
+    upper_input = Mock(manifest={"fl_metadata": {"client_training": {"epochs": 7}}})
+
+    result = coordinator.execute_round(
+        assignment=assignment,
+        representation=NwdafMLModelTrainSubsc.model_validate(payload),
+        upper_input=upper_input,
+        upper_client_subscription_id="upper-resource",
+        upper_resource_revision=2,
+        upper_input_artifact_digest="3" * 64,
+        upper_scope_digest="7" * 64,
+        callback_margin_seconds=6,
+        local_work=IntermediateLocalWork(lower_round_count=3),
+    )
+
+    assert result is upper_result
+    assert [
+        item.kwargs["round_indicator"]
+        for item in artifacts.publish_round_input.call_args_list
+    ] == [0, 1, 2]
+    assert [item.kwargs["base"] for item in artifacts.publish_round_input.call_args_list] == [
+        upper_input,
+        *loaded_intermediates,
+    ]
+    assert [
+        item.kwargs["timeout_seconds"]
+        for item in server.execute_hierarchy_round.call_args_list
+    ] == [98, 98, 98]
+    assert artifacts.publish_hierarchy_aggregate.call_args.kwargs["lower_global"] is (
+        lower_globals[-1]
+    )
+    assert coordinator._rounds[(PLAN, "root-process", 4)].lower_round_indicator == 2
+
+
+def test_branch_report_after_failure_does_not_publish_earlier_partial_aggregate(tmp_path):
+    artifacts = Mock()
+    artifacts.publish_round_input.side_effect = [
+        Mock(url="http://branch.example/input-0", digest="1" * 64),
+        Mock(url="http://branch.example/input-1", digest="2" * 64),
+    ]
+    server = Mock()
+    server.execute_hierarchy_round.side_effect = [
+        _lower_global(tmp_path, 0),
+        RuntimeError("lower round failed"),
+    ]
+    coordinator = _coordinator(Mock(), artifacts, server)
+    coordinator._loader = Mock(return_value=Mock(name="lower-aggregate-0"))
+    assignment = _assignment(tmp_path)
+    coordinator._executions[PLAN] = BranchPreparationExecution(
+        plan_id=PLAN,
+        parent_assignment=assignment,
+        leaf_nodes=(_node(LEAF_A), _node(LEAF_B)),
+        leaf_assignments=(Mock(), Mock()),
+        process_id="lower-process",
+    )
+    payload = _representation().model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload.update(
+        {
+            "mLPreFlag": False,
+            "roundInd": 4,
+            "mLTrainRepInfo": {"maxResTime": 300},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="lower round failed"):
+        coordinator.execute_round(
+            assignment=assignment,
+            representation=NwdafMLModelTrainSubsc.model_validate(payload),
+            upper_input=Mock(
+                manifest={"fl_metadata": {"client_training": {"epochs": 7}}}
+            ),
+            upper_client_subscription_id="upper-resource",
+            upper_resource_revision=2,
+            upper_input_artifact_digest="3" * 64,
+            upper_scope_digest="7" * 64,
+            callback_margin_seconds=6,
+            local_work=IntermediateLocalWork(lower_round_count=3),
+        )
+
+    assert server.execute_hierarchy_round.call_count == 2
+    artifacts.publish_hierarchy_aggregate.assert_not_called()
+    assert coordinator._rounds[(PLAN, "root-process", 4)].state == "FAILED"
 
 
 def test_branch_validation_republishes_before_lower_dispatch_and_returns_leaf_evidence(

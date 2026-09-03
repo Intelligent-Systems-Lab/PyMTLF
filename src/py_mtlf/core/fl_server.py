@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from py_mtlf.core.fl_experiment import (
     ExperimentRegistryError,
     FLExperimentRegistry,
 )
+from py_mtlf.core.fl_hierarchy import normalize_nf_instance_id
 from py_mtlf.core.fl_orchestration import (
     FlatExecutionRequest,
     FlatParticipantScope,
@@ -177,6 +179,7 @@ class FLProcess:
     hierarchy_cleanup_complete: bool = False
     hierarchy_validation: HierarchyValidation | None = None
     hierarchy_state_observer: Callable[[FLServerState], None] | None = None
+    hierarchy_selected_participant_ids: frozenset[str] = frozenset()
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -666,6 +669,14 @@ class FLServerEngine:
                 FLServerState.FINAL_VALIDATION_DISPATCH,
                 FLServerState.FINAL_VALIDATION_WAITING,
             }
+            participant_id = participant.candidate.target.nf_instance_id
+            if (
+                process.hierarchy_plan_id
+                and active_round
+                and process.hierarchy_selected_participant_ids
+                and participant_id not in process.hierarchy_selected_participant_ids
+            ):
+                raise ValueError("hierarchy callback participant is not selected for this round")
             identity = participant.identity
             identity = TrainingResourceIdentity(
                 subscription_id=identity.subscription_id,
@@ -956,6 +967,9 @@ class FLServerEngine:
         round_input_artifact: FLWorkspaceArtifact | None = None,
         expected_result_type: RoundLocalResultType,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
+        selected_participant_nf_instance_ids: tuple[str, ...] | None = None,
+        accept_failures: bool = False,
+        minimum_completion_rate: float = 1.0,
         timeout_seconds: int | None = None,
         state_observer: Callable[[FLServerState], None] | None = None,
     ) -> FLWorkspaceArtifact:
@@ -969,15 +983,49 @@ class FLServerEngine:
             raise ValueError("hierarchy round indicator must be non-negative")
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("hierarchy round timeout must be positive")
+        if not isinstance(accept_failures, bool):
+            raise ValueError("accept_failures must be a boolean")
+        if (
+            not isinstance(minimum_completion_rate, (int, float))
+            or isinstance(minimum_completion_rate, bool)
+            or not math.isfinite(minimum_completion_rate)
+            or not 0 < minimum_completion_rate <= 1
+        ):
+            raise ValueError("minimum_completion_rate must be in (0, 1]")
+        all_participants = {
+            normalize_nf_instance_id(item.candidate.target.nf_instance_id): item
+            for item in process.participants
+        }
+        if len(all_participants) != len(process.participants):
+            raise ValueError("hierarchy participant identities must be unique")
+        explicit_selection = selected_participant_nf_instance_ids is not None
+        selected_ids = (
+            tuple(all_participants)
+            if selected_participant_nf_instance_ids is None
+            else tuple(
+                normalize_nf_instance_id(value)
+                for value in selected_participant_nf_instance_ids
+            )
+        )
+        if not selected_ids or len(selected_ids) != len(set(selected_ids)):
+            raise ValueError("hierarchy round selection must be non-empty and unique")
+        missing = sorted(set(selected_ids) - set(all_participants))
+        if missing:
+            raise ValueError(
+                "hierarchy round selection contains unknown participants: "
+                + ",".join(missing)
+            )
+        selected = [all_participants[nf_id] for nf_id in selected_ids]
         timeout = min(
             timeout_seconds or self._server_settings.round_timeout_seconds,
             self._server_settings.round_timeout_seconds,
         )
         try:
             process.state = FLServerState.ROUND_DISPATCH
+            process.hierarchy_selected_participant_ids = frozenset(selected_ids)
             if state_observer is not None:
                 state_observer(process.state)
-            for participant in process.participants:
+            for participant in selected:
                 self._raise_if_failed(process)
                 participant.expected_round = round_indicator
                 participant.notification = None
@@ -1002,23 +1050,26 @@ class FLServerEngine:
             try:
                 self._wait(
                     process,
-                    lambda: all(item.round_complete for item in process.participants),
+                    lambda: all(item.round_complete for item in selected),
                     timeout,
                     collect_participant_failures=True,
                 )
             except RuntimeError as error:
                 if str(error) == "federated stage deadline expired":
-                    for participant in process.participants:
+                    for participant in selected:
                         if not participant.round_complete:
                             participant.round_failure = "round deadline expired"
                             participant.round_complete = True
-                raise
+                    if not accept_failures:
+                        raise
+                else:
+                    raise
             process.state = FLServerState.ROUND_EVALUATING
             if state_observer is not None:
                 state_observer(process.state)
             failed = [
                 item.candidate.target.nf_instance_id
-                for item in process.participants
+                for item in selected
                 if item.round_failure
                 or (
                     item.notification is not None
@@ -1026,21 +1077,34 @@ class FLServerEngine:
                 )
             ]
             if failed:
-                raise RuntimeError(
-                    "required hierarchy participants terminated: " + ",".join(failed)
-                )
+                successful_count = len(selected) - len(failed)
+                completion_rate = successful_count / len(selected)
+                if not accept_failures or completion_rate < minimum_completion_rate:
+                    raise RuntimeError(
+                        "required hierarchy participants terminated: " + ",".join(failed)
+                    )
             process.state = FLServerState.AGGREGATING
             if state_observer is not None:
                 state_observer(process.state)
             if round_input_artifact is None:
                 raise RuntimeError("Server aggregation requires its owned ROUND_INPUT artifact")
+            successful_ids = tuple(
+                item.candidate.target.nf_instance_id
+                for item in selected
+                if item.candidate.target.nf_instance_id not in failed
+            )
+            aggregate_options = {
+                "round_input_artifact": round_input_artifact,
+                "expected_result_type": expected_result_type,
+                "expected_subordinates": expected_subordinates,
+            }
+            if explicit_selection or failed:
+                aggregate_options["participant_nf_instance_ids"] = successful_ids
             result = self._aggregate_round(
                 process,
                 round_input_url,
                 round_indicator,
-                round_input_artifact=round_input_artifact,
-                expected_result_type=expected_result_type,
-                expected_subordinates=expected_subordinates,
+                **aggregate_options,
             )
             process.current_global_url = result.url
             process.state = FLServerState.READY
@@ -1929,6 +1993,7 @@ class FLServerEngine:
         round_input_artifact: FLWorkspaceArtifact,
         expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
+        participant_nf_instance_ids: tuple[str, ...] | None = None,
     ) -> FLWorkspaceArtifact:
         if round_input_artifact.url != round_input_url:
             raise RuntimeError("Server aggregation input URL does not match artifact")
@@ -1950,9 +2015,19 @@ class FLServerEngine:
             raise RuntimeError("Server aggregation input identity does not match round")
         expected_model_contract = model_contract_digest(base.manifest)
         expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
+        included_ids = (
+            None
+            if participant_nf_instance_ids is None
+            else frozenset(participant_nf_instance_ids)
+        )
         local_bundles: list[tuple[LoadedBundle, int]] = []
         participant_metadata = []
         for participant in process.participants:
+            if (
+                included_ids is not None
+                and participant.candidate.target.nf_instance_id not in included_ids
+            ):
+                continue
             notification = participant.notification
             model_infos = notification.ml_model_infos if notification is not None else None
             if (

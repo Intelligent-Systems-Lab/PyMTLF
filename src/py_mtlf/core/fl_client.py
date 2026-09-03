@@ -24,6 +24,10 @@ from py_mtlf.core.fl_artifacts import (
     RoundInputArtifact,
     validate_fl_artifact_manifest,
 )
+from py_mtlf.core.fl_candidate_orchestration import (
+    ClientLocalWork,
+    IntermediateLocalWork,
+)
 from py_mtlf.core.fl_experiment import (
     ExperimentAdmissionClosedError,
     ExperimentLifecycle,
@@ -133,6 +137,7 @@ class BranchPreparationDispatcher(Protocol):
         upper_input_artifact_digest: str,
         upper_scope_digest: str,
         callback_margin_seconds: int,
+        local_work: IntermediateLocalWork | None = None,
     ) -> BranchArtifactView: ...
 
     def execute_validation(
@@ -170,6 +175,8 @@ class FLClientResource:
     callback_slot_owned: bool = True
     candidate_contract: bool = False
     hierarchical_feature_negotiated: bool = False
+    client_local_work: ClientLocalWork | None = None
+    intermediate_local_work: IntermediateLocalWork | None = None
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -721,6 +728,7 @@ class FLClientEngine:
         intent: RetrainIntent,
         window: AdrfTimeWindow,
     ) -> None:
+        unbound_hierarchy_plan_id: str | None = None
         try:
             with self._lock:
                 resource = self._required(subscription_id)
@@ -731,13 +739,13 @@ class FLClientEngine:
             model_info = value.ml_model_infos[0]
             if model_info.model_file_address is None:
                 raise RuntimeError("FL preparation base model must use mLFileAddr")
-            artifact = self._workspace.download(
+            downloaded = self._workspace.download_archive(
                 str(model_info.model_file_address.model_url),
                 value.ml_correlation_id or subscription_id,
                 "preparation-base",
             )
-            artifact_url = str(model_info.model_file_address.model_url)
-            inspected = self._workspace.inspect_artifact(artifact)
+            artifact = downloaded.metadata
+            inspected = downloaded.validated
             hierarchy_assignment: ValidatedHierarchyArtifact | None = None
             hierarchy_contract = (
                 inspected.contract if isinstance(inspected, ValidatedArchive) else None
@@ -752,7 +760,6 @@ class FLClientEngine:
                 ArtifactRole.HIERARCHY_ASSIGNMENT,
                 ArtifactRole.HIERARCHY_PREPARATION_RESULT,
             }:
-                artifact.path.unlink(missing_ok=True)
                 if not isinstance(hierarchy_contract, HierarchyAssignmentArtifact):
                     raise RuntimeError(
                         "FL preparation input is not a hierarchy assignment"
@@ -762,12 +769,12 @@ class FLClientEngine:
                     raise RuntimeError(
                         "containing NWDAF does not advertise the FL Client capability"
                     )
-                hierarchy_assignment = self._workspace.download_assignment(
-                    artifact_url,
+                hierarchy_assignment = self._workspace.admit_assignment(
+                    downloaded,
                     intended_recipient_nf_instance_id=context.nf_instance_id,
                 )
                 metadata = hierarchy_assignment.contract.hierarchy_metadata
-                self._workspace.claim_artifact(metadata.plan_id, artifact)
+                unbound_hierarchy_plan_id = metadata.plan_id
                 if isinstance(metadata, BranchAssignmentMetadata):
                     if self._branch_coordinator is None:
                         raise RuntimeError(
@@ -805,15 +812,21 @@ class FLClientEngine:
                     )
                 with self._lock:
                     current = self._resources.get(subscription_id)
-                    if current is None or current.revision != revision:
-                        self._release_work_slot(subscription_id, revision)
-                        return
-                    reservation_id = current.experiment_reservation_id
+                    stale = current is None or current.revision != revision
+                    reservation_id = (
+                        "" if current is None else current.experiment_reservation_id
+                    )
+                if stale:
+                    self._workspace.release_plan(metadata.plan_id)
+                    unbound_hierarchy_plan_id = None
+                    self._release_work_slot(subscription_id, revision)
+                    return
                 self._experiments.bind_plan(
                     reservation_id,
                     metadata.plan_id,
                     assigned_role,
                 )
+                unbound_hierarchy_plan_id = None
                 artifact = hierarchy_assignment.metadata
                 if assigned_role is ExperimentRole.BRANCH:
                     with self._lock:
@@ -912,6 +925,14 @@ class FLClientEngine:
                 if current is not None and current.revision == revision:
                     current.dataset_job_id = job_id
         except Exception as error:
+            if unbound_hierarchy_plan_id is not None:
+                try:
+                    self._workspace.release_plan(unbound_hierarchy_plan_id)
+                except RuntimeError:
+                    logger.exception(
+                        "Failed to release unbound FL hierarchy artifact plan_id=%s",
+                        unbound_hierarchy_plan_id,
+                    )
             logger.exception(
                 "FL client preparation failed subscription_id=%s",
                 subscription_id,
@@ -1045,17 +1066,22 @@ class FLClientEngine:
             if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
                 if self._branch_coordinator is None:
                     raise RuntimeError("Branch hierarchy round requires the Branch coordinator")
-                published = self._branch_coordinator.execute_round(
-                    assignment=resource.hierarchy_assignment,
-                    representation=value,
-                    upper_input=base,
-                    upper_client_subscription_id=subscription_id,
-                    upper_resource_revision=revision,
-                    upper_input_artifact_digest=artifact.key,
-                    upper_scope_digest=resource.scope.scope_digest,
-                    callback_margin_seconds=(
+                arguments = {
+                    "assignment": resource.hierarchy_assignment,
+                    "representation": value,
+                    "upper_input": base,
+                    "upper_client_subscription_id": subscription_id,
+                    "upper_resource_revision": revision,
+                    "upper_input_artifact_digest": artifact.key,
+                    "upper_scope_digest": resource.scope.scope_digest,
+                    "callback_margin_seconds": (
                         self._client_settings.callback_deadline_margin_seconds
                     ),
+                }
+                if resource.intermediate_local_work is not None:
+                    arguments["local_work"] = resource.intermediate_local_work
+                published = self._branch_coordinator.execute_round(
+                    **arguments,
                 )
                 notification = NwdafMLModelTrainNotif(
                     notifCorreId=value.notification_correlation_id,
@@ -1085,14 +1111,18 @@ class FLClientEngine:
             if training_sample_count != resource.prepared_training_sample_count:
                 raise RuntimeError("FL round dataset changed after preparation")
             proximal_mu = None
-            if resource.hierarchy_assignment is not None:
+            epochs = round_input.fl_metadata.client_training.epochs
+            if resource.client_local_work is not None:
+                epochs = resource.client_local_work.epochs
+                proximal_mu = resource.client_local_work.proximal_mu
+            elif resource.hierarchy_assignment is not None:
                 if not isinstance(hierarchy_metadata, LeafAssignmentMetadata):
                     raise RuntimeError("hierarchy round assignment is unsupported")
                 proximal_mu = hierarchy_metadata.strategy.algorithm.proximal_mu
             result = self._trainer.train(
                 base,
                 dataset,
-                epochs=round_input.fl_metadata.client_training.epochs,
+                epochs=epochs,
                 proximal_mu=proximal_mu,
             )
             evidence = dataset_evidence(dataset)

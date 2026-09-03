@@ -21,6 +21,7 @@ from py_mtlf.core.fl_branch import (
     BranchPreparationExecution,
     FLBranchPreparationCoordinator,
 )
+from py_mtlf.core.fl_candidate_orchestration import ClientLocalWork
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
     FLClientEngine,
@@ -32,6 +33,7 @@ from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy import HierarchyMessageType, PreparationOutcome
 from py_mtlf.core.fl_server import HierarchyValidationCollection
 from py_mtlf.core.fl_workspace import (
+    DownloadedArchive,
     ValidatedArchive,
     ValidatedHierarchyArtifact,
     model_contract_digest,
@@ -1136,13 +1138,17 @@ def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
     workspace = Mock()
     artifact_path = tmp_path / "base.tar.gz"
     artifact_path.write_bytes(b"base")
-    workspace.download.return_value = ArtifactMetadata(
+    artifact = ArtifactMetadata(
         key="a" * 64,
         size_bytes=artifact_path.stat().st_size,
         path=artifact_path,
         url="http://server.example/base.tar.gz",
     )
-    workspace.inspect_artifact.return_value = None
+    workspace.download_archive.return_value = DownloadedArchive(
+        metadata=artifact,
+        validated=ValidatedArchive(manifest={}, contract=None),
+        response_digest_headers=(),
+    )
     base_manifest = {
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
@@ -1269,12 +1275,12 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(
         contract=contract,
     )
     workspace = Mock()
-    workspace.download.return_value = generic
-    workspace.inspect_artifact.return_value = ValidatedArchive(
-        manifest=manifest,
-        contract=contract,
+    workspace.download_archive.return_value = DownloadedArchive(
+        metadata=generic,
+        validated=ValidatedArchive(manifest=manifest, contract=contract),
+        response_digest_headers=("a" * 64,),
     )
-    workspace.download_assignment.return_value = admitted
+    workspace.admit_assignment.return_value = admitted
     context_client = Mock()
     context_client.get.return_value = NwdafContext(
         nf_instance_id=leaf_id,
@@ -1340,11 +1346,77 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(
             datasets.submit_external.assert_not_called()
             notification = service._enqueue_delivery.call_args.args[1]
             assert notification.termination_request == "NOT_AVAILABLE_ML_TRAIN"
-        assert not generic_path.exists()
-        workspace.download_assignment.assert_called_once_with(
+        workspace.download_archive.assert_called_once_with(
             assignment_url,
+            value.ml_correlation_id,
+            "preparation-base",
+        )
+        workspace.admit_assignment.assert_called_once_with(
+            workspace.download_archive.return_value,
             intended_recipient_nf_instance_id=leaf_id,
         )
+        workspace.claim_artifact.assert_not_called()
+    finally:
+        service.close()
+
+
+def test_hierarchy_assignment_bind_failure_releases_adopted_plan_artifact(tmp_path):
+    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    assignment = hierarchy_assignment(tmp_path, branch=False)
+    metadata = assignment.contract.hierarchy_metadata
+    payload = preparation_payload()
+    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment.metadata.url
+    value = NwdafMLModelTrainSubsc.model_validate(payload)
+    workspace = Mock()
+    workspace.download_archive.return_value = DownloadedArchive(
+        metadata=assignment.metadata,
+        validated=ValidatedArchive(
+            manifest=assignment.manifest,
+            contract=assignment.contract,
+        ),
+        response_digest_headers=(assignment.metadata.key,),
+    )
+    workspace.admit_assignment.return_value = assignment
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id=leaf_id,
+        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
+        api_root="http://leaf.example",
+        internal_api_root="http://leaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("UE_COMMUNICATION",),
+                fl_capability_type=FLCapabilityType.CLIENT,
+            ),
+        ),
+    )
+    experiments = Mock()
+    experiments.bind_plan.side_effect = RuntimeError("plan is unavailable")
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        context,
+        Mock(),
+        workspace,
+        experiments=experiments,
+    )
+    service._enqueue_delivery = Mock()
+    resource = FLClientResource(
+        subscription_id="resource-1",
+        representation=value,
+        state=FLClientState.PREPARING,
+        scope=TrainingScopeDescriptor.from_training_request(value, 0),
+        experiment_reservation_id="reservation-1",
+    )
+    service._resources[resource.subscription_id] = resource
+    assert service._capacity.acquire(blocking=False)
+    try:
+        service._run_preparation(resource.subscription_id, resource.revision, Mock(), Mock())
+
+        assert service.get(resource.subscription_id).state is FLClientState.FAILED
+        workspace.release_plan.assert_called_once_with(metadata.plan_id)
+        service._enqueue_delivery.assert_called_once()
     finally:
         service.close()
 
@@ -1419,12 +1491,12 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
         contract=contract,
     )
     workspace = Mock()
-    workspace.download.return_value = generic
-    workspace.inspect_artifact.return_value = ValidatedArchive(
-        manifest=admitted.manifest,
-        contract=contract,
+    workspace.download_archive.return_value = DownloadedArchive(
+        metadata=generic,
+        validated=ValidatedArchive(manifest=admitted.manifest, contract=contract),
+        response_digest_headers=("a" * 64,),
     )
-    workspace.download_assignment.return_value = admitted
+    workspace.admit_assignment.return_value = admitted
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id=branch_id,
@@ -2378,7 +2450,19 @@ def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_pa
         branch.close()
 
 
-def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
+@pytest.mark.parametrize(
+    ("local_work", "expected_epochs", "expected_proximal_mu"),
+    [
+        (None, 7, 0.01),
+        (ClientLocalWork(epochs=3, proximal_mu=0), 3, 0),
+    ],
+)
+def test_leaf_round_uses_resolved_or_legacy_local_work(
+    tmp_path,
+    local_work,
+    expected_epochs,
+    expected_proximal_mu,
+):
     payload = preparation_payload()
     payload.update(
         {
@@ -2436,6 +2520,7 @@ def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
             base.manifest
         ),
         hierarchy_assignment=assignment,
+        client_local_work=local_work,
     )
     service._resources[resource.subscription_id] = resource
     assert service._capacity.acquire(blocking=False)
@@ -2445,8 +2530,8 @@ def test_leaf_round_uses_server_epochs_and_assignment_proximal_mu(tmp_path):
         service._trainer.train.assert_called_once_with(
             base,
             dataset,
-            epochs=7,
-            proximal_mu=0.01,
+            epochs=expected_epochs,
+            proximal_mu=expected_proximal_mu,
         )
         metadata = workspace.publish.call_args.kwargs["metadata"]
         assert metadata["fl_metadata"]["training_sample_count"] == 10

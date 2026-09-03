@@ -78,6 +78,13 @@ class ValidatedArchive:
 
 
 @dataclass(frozen=True)
+class DownloadedArchive:
+    metadata: ArtifactMetadata
+    validated: ValidatedArchive
+    response_digest_headers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ValidatedHierarchyArtifact:
     metadata: ArtifactMetadata
     manifest: dict[str, object]
@@ -171,6 +178,21 @@ class FLWorkspace:
         *,
         owner_plan_id: str | None = None,
     ) -> ArtifactMetadata:
+        return self.download_archive(
+            url,
+            process_id,
+            label,
+            owner_plan_id=owner_plan_id,
+        ).metadata
+
+    def download_archive(
+        self,
+        url: str,
+        process_id: str,
+        label: str,
+        *,
+        owner_plan_id: str | None = None,
+    ) -> DownloadedArchive:
         self.cleanup_expired()
         allowed = set(self._settings.artifact_download.allowed_origins)
         origin = _origin(url)
@@ -179,13 +201,23 @@ class FLWorkspace:
         directory = self._root / _safe(process_id) / "downloads"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{_safe(label)}.tar.gz"
-        temporary = path.with_name(f".{path.name}.{os.getpid()}")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{_safe(label)}.",
+            suffix=".tar.gz",
+            dir=directory,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
         digest = hashlib.sha256()
         size = 0
+        response_digest_headers: tuple[str, ...] = ()
         try:
             with self._client.stream("GET", url) as response:
                 if response.status_code != 200:
                     raise RuntimeError(f"FL artifact download failed with {response.status_code}")
+                response_digest_headers = tuple(
+                    response.headers.get_list("X-Artifact-SHA256")
+                )
                 with temporary.open("wb") as output:
                     for chunk in response.iter_bytes():
                         size += len(chunk)
@@ -195,10 +227,13 @@ class FLWorkspace:
                         output.write(chunk)
             if size == 0:
                 raise RuntimeError("FL artifact download is empty")
-            self._validate_archive(temporary)
+            validated = self._validate_archive(temporary)
             os.replace(temporary, path)
-        finally:
+        except Exception:
             temporary.unlink(missing_ok=True)
+            _remove_empty_download_parent(temporary, self._root)
+            raise
+        temporary.unlink(missing_ok=True)
         artifact = ArtifactMetadata(
             key=digest.hexdigest(),
             size_bytes=size,
@@ -207,7 +242,11 @@ class FLWorkspace:
         )
         if owner_plan_id is not None:
             self._register_owned_directory(owner_plan_id, directory.parent)
-        return artifact
+        return DownloadedArchive(
+            metadata=artifact,
+            validated=validated,
+            response_digest_headers=response_digest_headers,
+        )
 
     def download_hierarchy(
         self,
@@ -244,8 +283,129 @@ class FLWorkspace:
             expected_plan_id=expected_plan_id,
         )
 
+    def admit_assignment(
+        self,
+        downloaded: DownloadedArchive,
+        *,
+        intended_recipient_nf_instance_id: str,
+        expected_plan_id: str | None = None,
+        expected_publisher_nf_instance_id: str | None = None,
+    ) -> ValidatedHierarchyArtifact:
+        return self._admit_downloaded_hierarchy(
+            downloaded,
+            expected_role=ArtifactRole.HIERARCHY_ASSIGNMENT,
+            expected_message_type=None,
+            expected_publisher_nf_instance_id=expected_publisher_nf_instance_id,
+            intended_recipient_nf_instance_id=intended_recipient_nf_instance_id,
+            expected_plan_id=expected_plan_id,
+        )
+
     def inspect_artifact(self, artifact: ArtifactMetadata) -> ValidatedArchive:
         return self._validate_archive(artifact.path)
+
+    def _admit_downloaded_hierarchy(
+        self,
+        downloaded: DownloadedArchive,
+        *,
+        expected_role: ArtifactRole,
+        expected_message_type: HierarchyMessageType | None,
+        expected_publisher_nf_instance_id: str | None,
+        intended_recipient_nf_instance_id: str,
+        expected_plan_id: str | None,
+    ) -> ValidatedHierarchyArtifact:
+        source = downloaded.metadata.path
+        try:
+            expected_digest = _artifact_url_digest(downloaded.metadata.url)
+            digest_headers = downloaded.response_digest_headers
+            if len(digest_headers) != 1 or not SHA256_PATTERN.fullmatch(digest_headers[0]):
+                raise FLArtifactIntegrityError(
+                    "FL artifact digest response header is invalid"
+                )
+            if digest_headers[0] != expected_digest:
+                raise FLArtifactIntegrityError(
+                    "FL artifact URL and response digest do not match"
+                )
+            if (
+                downloaded.metadata.key != expected_digest
+                or _hash_file(source) != expected_digest
+            ):
+                raise FLArtifactIntegrityError(
+                    "FL artifact downloaded archive digest does not match"
+                )
+            contract = downloaded.validated.contract
+            if not isinstance(
+                contract,
+                (HierarchyAssignmentArtifact, HierarchyPreparationResultArtifact),
+            ):
+                raise FLArtifactContractError("FL artifact is not a hierarchy artifact")
+            metadata = contract.hierarchy_metadata
+            if contract.artifact_role is not expected_role:
+                raise FLArtifactContractError(
+                    "FL hierarchy artifact role does not match expectation"
+                )
+            if (
+                expected_message_type is not None
+                and metadata.message_type is not expected_message_type
+            ):
+                raise FLArtifactContractError(
+                    "FL hierarchy message type does not match expectation"
+                )
+            expected_publisher = (
+                normalize_nf_instance_id(expected_publisher_nf_instance_id)
+                if expected_publisher_nf_instance_id is not None
+                else None
+            )
+            if (
+                expected_publisher is not None
+                and metadata.publisher_nf_instance_id != expected_publisher
+            ):
+                raise FLArtifactIdentityError(
+                    "FL hierarchy publisher does not match expected peer"
+                )
+            intended_recipient = normalize_nf_instance_id(
+                intended_recipient_nf_instance_id
+            )
+            if metadata.intended_recipient_nf_instance_id != intended_recipient:
+                raise FLArtifactIdentityError(
+                    "FL hierarchy artifact has the wrong intended recipient"
+                )
+            normalized_plan = (
+                normalize_plan_id(expected_plan_id)
+                if expected_plan_id is not None
+                else None
+            )
+            if normalized_plan is not None and metadata.plan_id != normalized_plan:
+                raise FLArtifactIdentityError(
+                    "FL hierarchy plan ID does not match expectation"
+                )
+
+            directory = self._root / metadata.plan_id / "downloads"
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / f"{expected_digest}.tar.gz"
+            if destination.exists():
+                if _hash_file(destination) != expected_digest:
+                    raise FLArtifactIntegrityError(
+                        "existing FL hierarchy download conflicts with digest"
+                    )
+                source.unlink(missing_ok=True)
+            else:
+                os.replace(source, destination)
+            self._register_owned_directory(metadata.plan_id, directory.parent)
+            _remove_empty_download_parent(source, self._root)
+            return ValidatedHierarchyArtifact(
+                metadata=ArtifactMetadata(
+                    key=expected_digest,
+                    size_bytes=downloaded.metadata.size_bytes,
+                    path=destination,
+                    url=downloaded.metadata.url,
+                ),
+                manifest=downloaded.validated.manifest,
+                contract=contract,
+            )
+        except Exception:
+            source.unlink(missing_ok=True)
+            _remove_empty_download_parent(source, self._root)
+            raise
 
     def _download_hierarchy(
         self,
@@ -989,6 +1149,18 @@ def _remove_hierarchy_staging(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError as error:
         raise FLWorkspaceError("FL hierarchy download staging cleanup failed") from error
+
+
+def _remove_empty_download_parent(path: Path, workspace_root: Path) -> None:
+    parent = path.parent
+    process_directory = parent.parent
+    for candidate in (parent, process_directory):
+        if candidate == workspace_root:
+            break
+        try:
+            candidate.rmdir()
+        except OSError:
+            break
 
 
 def _validated_manifest(

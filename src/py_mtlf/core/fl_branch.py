@@ -11,6 +11,7 @@ from py_mtlf.core.fl_artifacts import (
     RoundGlobalArtifact,
     RoundLocalResultType,
 )
+from py_mtlf.core.fl_candidate_orchestration import IntermediateLocalWork
 from py_mtlf.core.fl_hierarchy import (
     BranchAssignmentMetadata,
     FailedClient,
@@ -33,7 +34,7 @@ from py_mtlf.core.fl_server import (
 )
 from py_mtlf.core.fl_workspace import FLWorkspaceArtifact, ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
-from py_mtlf.core.trainer import LoadedBundle
+from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainSubsc
 
 
@@ -129,6 +130,7 @@ class FLBranchPreparationCoordinator:
         self._nwdaf_context = nwdaf_context
         self._artifact_service = artifact_service
         self._server = server
+        self._loader = TrustedBundleLoader()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._executions: dict[str, BranchPreparationExecution] = {}
@@ -370,6 +372,7 @@ class FLBranchPreparationCoordinator:
         upper_input_artifact_digest: str,
         upper_scope_digest: str,
         callback_margin_seconds: int,
+        local_work: IntermediateLocalWork | None = None,
     ) -> FLWorkspaceArtifact:
         metadata = assignment.contract.hierarchy_metadata
         if not isinstance(metadata, BranchAssignmentMetadata):
@@ -391,6 +394,11 @@ class FLBranchPreparationCoordinator:
         if context.nf_instance_id != metadata.intended_recipient_nf_instance_id:
             raise RuntimeError("Branch assignment recipient no longer matches local NWDAF")
         epochs = _round_epochs(upper_input)
+        lower_round_count = local_work.lower_round_count if local_work is not None else 1
+        lower_budget = parent_budget - callback_margin_seconds
+        if lower_budget < lower_round_count:
+            raise RuntimeError("Branch upper round budget cannot contain all lower rounds")
+        per_round_timeout = lower_budget // lower_round_count
         conflicting = False
         lower_round = -1
         with self._condition:
@@ -402,7 +410,9 @@ class FLBranchPreparationCoordinator:
                 existing = self._rounds.get(key)
                 if existing is None:
                     lower_round = self._next_lower_round.get(metadata.plan_id, 0)
-                    self._next_lower_round[metadata.plan_id] = lower_round + 1
+                    self._next_lower_round[metadata.plan_id] = (
+                        lower_round + lower_round_count
+                    )
                     self._rounds[key] = BranchRoundExecution(
                         plan_id=metadata.plan_id,
                         upper_client_subscription_id=upper_client_subscription_id,
@@ -439,37 +449,56 @@ class FLBranchPreparationCoordinator:
             raise RuntimeError(failure)
 
         try:
-            with self._condition:
-                self._ensure_dispatch_active(metadata.plan_id)
-                current = self._rounds.get(key)
-                if current is None:
-                    raise RuntimeError("Branch round mapping disappeared")
-                lower_input = self._artifact_service.publish_round_input(
-                    plan_id=execution.plan_id,
-                    base=upper_input,
+            current_input = upper_input
+            lower_global = None
+            for offset in range(lower_round_count):
+                current_lower_round = lower_round + offset
+                with self._condition:
+                    self._ensure_dispatch_active(metadata.plan_id)
+                    current = self._rounds.get(key)
+                    if current is None:
+                        raise RuntimeError("Branch round mapping disappeared")
+                    lower_input = self._artifact_service.publish_round_input(
+                        plan_id=execution.plan_id,
+                        base=current_input,
+                        process_id=execution.process_id,
+                        server_nf_instance_id=context.nf_instance_id,
+                        round_indicator=current_lower_round,
+                        epochs=epochs,
+                    )
+                    self._rounds[key] = replace(
+                        current,
+                        lower_round_indicator=current_lower_round,
+                        lower_input_artifact_digest=lower_input.digest,
+                    )
+                lower_global = self._server.execute_hierarchy_round(
                     process_id=execution.process_id,
-                    server_nf_instance_id=context.nf_instance_id,
-                    round_indicator=lower_round,
-                    epochs=epochs,
+                    round_indicator=current_lower_round,
+                    round_input_url=lower_input.url,
+                    round_input_artifact=lower_input,
+                    expected_result_type=RoundLocalResultType.TRAINING,
+                    timeout_seconds=per_round_timeout,
                 )
-                self._rounds[key] = replace(
-                    current,
-                    lower_input_artifact_digest=lower_input.digest,
-                )
-            lower_global = self._server.execute_hierarchy_round(
-                process_id=execution.process_id,
-                round_indicator=lower_round,
-                round_input_url=lower_input.url,
-                round_input_artifact=lower_input,
-                expected_result_type=RoundLocalResultType.TRAINING,
-                timeout_seconds=parent_budget - callback_margin_seconds,
-            )
-            if (
-                not isinstance(lower_global.contract, RoundGlobalArtifact)
-                or lower_global.contract.fl_metadata.ml_corre_id != execution.process_id
-                or lower_global.contract.fl_metadata.round_ind != lower_round
-            ):
-                raise RuntimeError("Branch lower result does not match the mapped lower round")
+                if (
+                    not isinstance(lower_global.contract, RoundGlobalArtifact)
+                    or lower_global.contract.fl_metadata.ml_corre_id
+                    != execution.process_id
+                    or lower_global.contract.fl_metadata.round_ind
+                    != current_lower_round
+                ):
+                    raise RuntimeError(
+                        "Branch lower result does not match the mapped lower round"
+                    )
+                if offset + 1 < lower_round_count:
+                    current_input = self._loader.load(
+                        ArtifactMetadata(
+                            key=lower_global.digest,
+                            size_bytes=lower_global.path.stat().st_size,
+                            path=lower_global.path,
+                            url=lower_global.url,
+                        )
+                    )
+            assert lower_global is not None
             with self._condition:
                 self._ensure_dispatch_active(metadata.plan_id)
                 current = self._rounds.get(key)

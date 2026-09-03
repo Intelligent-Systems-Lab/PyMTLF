@@ -18,6 +18,8 @@ from py_mtlf.config import (
     ArtifactDownloadSettings,
     ArtifactSettings,
     FederatedLearningSettings,
+    FLClientSettings,
+    NotificationSettings,
 )
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import (
@@ -30,6 +32,8 @@ from py_mtlf.core.fl_artifacts import (
     ValidationSummary,
     WapeComponents,
 )
+from py_mtlf.core.fl_client import FLClientEngine, FLClientResource, FLClientState
+from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy import (
     FailedClient,
     FederatedStrategy,
@@ -52,7 +56,14 @@ from py_mtlf.core.fl_workspace import (
     preprocessing_contract_digest,
     weights_digest,
 )
+from py_mtlf.core.nwdaf_context import (
+    FLCapabilityType,
+    MLAnalyticsCapability,
+    NwdafContext,
+)
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
+from py_mtlf.core.training_scope import TrainingScopeDescriptor
+from py_mtlf.wire.ml_model_training import NwdafMLModelTrainSubsc
 
 ROOT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 BRANCH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -598,6 +609,391 @@ def test_assignment_ingress_discovers_typed_message_without_expected_publisher(t
         )
         assert downloaded.contract.hierarchy_metadata.publisher_nf_instance_id == ROOT
         assert downloaded.contract.hierarchy_metadata.plan_id == PLAN
+    finally:
+        root_workspace.close()
+        branch_workspace.close()
+        client.close()
+
+
+def test_branch_and_leaf_assignment_admission_each_fetches_once_and_adopts_same_bytes(
+    tmp_path,
+) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    root_assignment = publish_root_assignment(root_workspace)
+    root_content = root_assignment.path.read_bytes()
+    root_requests = 0
+
+    def root_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal root_requests
+        root_requests += 1
+        return httpx.Response(
+            200,
+            content=root_content,
+            headers={"X-Artifact-SHA256": root_assignment.digest},
+            request=request,
+        )
+
+    branch_client = httpx.Client(transport=httpx.MockTransport(root_handler))
+    branch_workspace = workspace(
+        tmp_path / "branch",
+        "http://branch.example",
+        client=branch_client,
+        allowed_origins=("http://root.example",),
+    )
+    leaf_workspace = None
+    leaf_client = None
+    try:
+        fetched_branch = branch_workspace.download_archive(
+            root_assignment.url,
+            "upper-process",
+            "preparation-base",
+        )
+        admitted_branch = branch_workspace.admit_assignment(
+            fetched_branch,
+            intended_recipient_nf_instance_id=BRANCH,
+        )
+        assert root_requests == 1
+        assert admitted_branch.metadata.path.parent == tmp_path / "branch" / PLAN / "downloads"
+        assert admitted_branch.metadata.path.read_bytes() == root_content
+        assert not (tmp_path / "branch" / "upper-process").exists()
+
+        leaf_assignment = HierarchyArtifactService(
+            branch_workspace
+        ).republish_leaf_assignment(
+            parent=admitted_branch,
+            containing_branch_nf_instance_id=BRANCH,
+            leaf_nf_instance_id=LEAF_A,
+        )
+        leaf_content = leaf_assignment.path.read_bytes()
+        leaf_requests = 0
+
+        def leaf_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal leaf_requests
+            leaf_requests += 1
+            return httpx.Response(
+                200,
+                content=leaf_content,
+                headers={"X-Artifact-SHA256": leaf_assignment.digest},
+                request=request,
+            )
+
+        leaf_client = httpx.Client(transport=httpx.MockTransport(leaf_handler))
+        leaf_workspace = workspace(
+            tmp_path / "leaf",
+            "http://leaf.example",
+            client=leaf_client,
+            allowed_origins=("http://branch.example",),
+        )
+        fetched_leaf = leaf_workspace.download_archive(
+            leaf_assignment.url,
+            "lower-process",
+            "preparation-base",
+        )
+        admitted_leaf = leaf_workspace.admit_assignment(
+            fetched_leaf,
+            intended_recipient_nf_instance_id=LEAF_A,
+        )
+
+        assert leaf_requests == 1
+        assert admitted_leaf.metadata.path.parent == tmp_path / "leaf" / PLAN / "downloads"
+        assert admitted_leaf.metadata.path.read_bytes() == leaf_content
+        assert not (tmp_path / "leaf" / "lower-process").exists()
+    finally:
+        root_workspace.close()
+        branch_workspace.close()
+        branch_client.close()
+        if leaf_workspace is not None:
+            leaf_workspace.close()
+        if leaf_client is not None:
+            leaf_client.close()
+
+
+def test_branch_and_leaf_client_preparation_each_performs_one_assignment_get(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "publisher-root", "http://root.example")
+    root_assignment = publish_root_assignment(root_workspace)
+    root_content = root_assignment.path.read_bytes()
+
+    def root_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=root_content,
+            headers={"X-Artifact-SHA256": root_assignment.digest},
+            request=request,
+        )
+
+    publisher_client = httpx.Client(transport=httpx.MockTransport(root_handler))
+    branch_publisher = workspace(
+        tmp_path / "publisher-branch",
+        "http://branch.example",
+        client=publisher_client,
+        allowed_origins=("http://root.example",),
+    )
+    downloaded = branch_publisher.download_archive(
+        root_assignment.url,
+        "publisher-process",
+        "preparation-base",
+    )
+    admitted = branch_publisher.admit_assignment(
+        downloaded,
+        intended_recipient_nf_instance_id=BRANCH,
+    )
+    leaf_assignment = HierarchyArtifactService(branch_publisher).republish_leaf_assignment(
+        parent=admitted,
+        containing_branch_nf_instance_id=BRANCH,
+        leaf_nf_instance_id=LEAF_A,
+    )
+
+    cases = (
+        (
+            "branch",
+            root_assignment,
+            ROOT,
+            BRANCH,
+            FLCapabilityType.SERVER_AND_CLIENT,
+        ),
+        ("leaf", leaf_assignment, BRANCH, LEAF_A, FLCapabilityType.CLIENT),
+    )
+    try:
+        for name, source, publisher_id, recipient_id, capability in cases:
+            content = source.path.read_bytes()
+            request_count = 0
+
+            def handler(
+                request: httpx.Request,
+                response_content=content,
+                response_digest=source.digest,
+            ) -> httpx.Response:
+                nonlocal request_count
+                request_count += 1
+                return httpx.Response(
+                    200,
+                    content=response_content,
+                    headers={"X-Artifact-SHA256": response_digest},
+                    request=request,
+                )
+
+            receiver_client = httpx.Client(transport=httpx.MockTransport(handler))
+            allowed_origin = (
+                "http://root.example" if name == "branch" else "http://branch.example"
+            )
+            settings = FederatedLearningSettings(
+                workspace_root=tmp_path / f"receiver-{name}",
+                public_base_url=f"http://{name}-receiver.example",
+                artifact_download=ArtifactDownloadSettings(
+                    allowed_origins=(allowed_origin,)
+                ),
+            )
+            receiver_workspace = FLWorkspace(
+                settings,
+                ArtifactSettings(),
+                receiver_client,
+            )
+            receiver_workspace.open()
+            context = Mock()
+            context.get.return_value = NwdafContext(
+                nf_instance_id=recipient_id,
+                containing_nwdaf_process_instance_id=(
+                    "22222222-2222-4222-8222-222222222222"
+                ),
+                api_root=f"http://{name}-receiver.example",
+                internal_api_root=f"http://{name}-receiver-internal.example",
+                ml_analytics_capabilities=(
+                    MLAnalyticsCapability(
+                        ml_analytics_ids=("UE_COMMUNICATION",),
+                        fl_capability_type=capability,
+                    ),
+                ),
+            )
+            payload = {
+                "mLEventSubscs": [
+                    {
+                        "mLEvent": "UE_COMMUNICATION",
+                        "mLEventFilter": {"networkArea": {"tais": []}},
+                        "modelInterInfo": "001122",
+                    }
+                ],
+                "notifUri": "http://go.internal/training/callback",
+                "notifCorreId": f"{name}-callback",
+                "mlCorreId": "fl-process-001",
+                "mLPreFlag": True,
+                "mLModelInfos": [
+                    {
+                        "event": "UE_COMMUNICATION",
+                        "mLFileAddr": {"mLModelUrl": source.url},
+                    }
+                ],
+                "eventReq": {"notifMethod": "ON_EVENT_DETECTION"},
+                "mLModelTrainInfos": [
+                    {
+                        "dataAvReq": {
+                            "inpEvents": [{"upfEvent": "USER_DATA_USAGE_TRENDS"}],
+                            "minNumSamples": 1,
+                            "timeWindows": [
+                                {
+                                    "startTime": "2026-07-01T00:00:00Z",
+                                    "stopTime": "2026-07-02T00:00:00Z",
+                                }
+                            ],
+                        },
+                        "timeAvReq": "PT5M",
+                    }
+                ],
+                "mLTrainRepInfo": {"maxResTime": 300},
+            }
+            value = NwdafMLModelTrainSubsc.model_validate(payload)
+            datasets = Mock()
+            datasets.submit_external.return_value = "dataset-job-1"
+            branch = Mock()
+            branch.prepare.return_value = Mock(
+                execution=Mock(process_id="lower-process"),
+                artifact=Mock(url="http://branch.example/preparation-result"),
+                outcome=PreparationOutcome.READY,
+            )
+            registry = FLExperimentRegistry()
+            reservation = registry.reserve_client("resource-1", "fl-process-001")
+            service = FLClientEngine(
+                settings,
+                FLClientSettings(
+                    training_data={"collection_trigger": "consumer_subscription"},
+                    model_interoperability_ids=("001122",),
+                ),
+                NotificationSettings(),
+                context,
+                datasets,
+                receiver_workspace,
+                experiments=registry,
+                branch_coordinator=branch if name == "branch" else None,
+            )
+            service._enqueue_delivery = Mock()
+            resource = FLClientResource(
+                subscription_id="resource-1",
+                representation=value,
+                state=FLClientState.PREPARING,
+                scope=TrainingScopeDescriptor.from_training_request(value, 0),
+                experiment_reservation_id=reservation.reservation_id,
+            )
+            service._resources[resource.subscription_id] = resource
+            assert service._capacity.acquire(blocking=False)
+            try:
+                service._run_preparation(
+                    resource.subscription_id,
+                    resource.revision,
+                    Mock(),
+                    Mock(),
+                )
+
+                assert request_count == 1
+                accepted = service.get(resource.subscription_id).hierarchy_assignment
+                assert accepted is not None
+                assert accepted.metadata.path.read_bytes() == content
+                assert accepted.contract.hierarchy_metadata.publisher_nf_instance_id == (
+                    publisher_id
+                )
+            finally:
+                service.close()
+                receiver_workspace.close()
+                receiver_client.close()
+    finally:
+        root_workspace.close()
+        branch_publisher.close()
+        publisher_client.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        ("missing-header", FLArtifactIntegrityError),
+        ("duplicate-header", FLArtifactIntegrityError),
+        ("publisher", FLArtifactIdentityError),
+        ("recipient", FLArtifactIdentityError),
+        ("plan", FLArtifactIdentityError),
+    ],
+)
+def test_single_fetch_assignment_admission_preserves_strict_identity_checks(
+    tmp_path,
+    failure,
+    expected_error,
+) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    root_assignment = publish_root_assignment(root_workspace)
+    content = root_assignment.path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers: list[tuple[str, str]] = []
+        if failure != "missing-header":
+            headers.append(("X-Artifact-SHA256", root_assignment.digest))
+        if failure == "duplicate-header":
+            headers.append(("X-Artifact-SHA256", root_assignment.digest))
+        return httpx.Response(200, content=content, headers=headers, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    branch_workspace = workspace(
+        tmp_path / "branch",
+        "http://branch.example",
+        client=client,
+        allowed_origins=("http://root.example",),
+    )
+    try:
+        downloaded = branch_workspace.download_archive(
+            root_assignment.url,
+            "upper-process",
+            "preparation-base",
+        )
+        with pytest.raises(expected_error):
+            branch_workspace.admit_assignment(
+                downloaded,
+                intended_recipient_nf_instance_id=(
+                    ROOT if failure == "recipient" else BRANCH
+                ),
+                expected_plan_id=PLAN_B if failure == "plan" else PLAN,
+                expected_publisher_nf_instance_id=(
+                    BRANCH if failure == "publisher" else ROOT
+                ),
+            )
+
+        assert not (tmp_path / "branch" / "upper-process").exists()
+        assert not (tmp_path / "branch" / PLAN / "downloads").exists()
+    finally:
+        root_workspace.close()
+        branch_workspace.close()
+        client.close()
+
+
+def test_single_fetch_assignment_rejects_valid_archive_with_wrong_body_digest(tmp_path) -> None:
+    root_workspace = workspace(tmp_path / "root", "http://root.example")
+    requested = publish_root_assignment(root_workspace)
+    substituted = publish_root_assignment(root_workspace, PLAN_B)
+    substituted_content = substituted.path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=substituted_content,
+            headers={"X-Artifact-SHA256": requested.digest},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    branch_workspace = workspace(
+        tmp_path / "branch",
+        "http://branch.example",
+        client=client,
+        allowed_origins=("http://root.example",),
+    )
+    try:
+        downloaded = branch_workspace.download_archive(
+            requested.url,
+            "upper-process",
+            "preparation-base",
+        )
+        with pytest.raises(FLArtifactIntegrityError, match="archive digest"):
+            branch_workspace.admit_assignment(
+                downloaded,
+                intended_recipient_nf_instance_id=BRANCH,
+            )
+
+        assert not (tmp_path / "branch" / "upper-process").exists()
+        assert not (tmp_path / "branch" / PLAN_B / "downloads").exists()
     finally:
         root_workspace.close()
         branch_workspace.close()

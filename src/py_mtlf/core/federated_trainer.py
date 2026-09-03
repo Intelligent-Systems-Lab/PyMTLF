@@ -37,8 +37,8 @@ class FederatedTrainer:
     ) -> FederatedTrainingResult:
         if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs <= 0:
             raise ValueError("epochs must be a positive integer")
-        if proximal_mu is not None and (not math.isfinite(proximal_mu) or proximal_mu <= 0):
-            raise ValueError("proximal_mu must be finite and positive")
+        if proximal_mu is not None and (not math.isfinite(proximal_mu) or proximal_mu < 0):
+            raise ValueError("proximal_mu must be finite and non-negative")
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         np.random.seed(self._settings.random_seed)
         torch.manual_seed(self._settings.random_seed)
