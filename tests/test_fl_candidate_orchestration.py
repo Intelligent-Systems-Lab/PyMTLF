@@ -332,6 +332,17 @@ def test_priority_establishment_is_bounded_and_stale_completion_is_fenced():
     assert record.status_cause is None
 
 
+def test_priority_ties_use_canonical_candidate_identity():
+    pool = CandidatePool(
+        contract(node(children=[child(CHILD_B, 5), child(CHILD_A, 5)])),
+        random_source=random.Random(7),
+    )
+
+    intents = pool.next_establishment_intents(2)
+
+    assert tuple(item.nf_instance_id for item in intents) == (CHILD_A, CHILD_B)
+
+
 def test_only_active_candidates_are_round_participants():
     pool = CandidatePool(
         contract(

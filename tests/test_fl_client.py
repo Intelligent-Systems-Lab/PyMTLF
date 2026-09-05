@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -45,9 +46,11 @@ from py_mtlf.core.nwdaf_context import (
 from py_mtlf.core.trainer import LocalTrainer
 from py_mtlf.core.training_data import FEATURE_ORDER, ScopeTrainingData, TrainingDataset
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
+from py_mtlf.core.workloads import WorkloadProfile
 from py_mtlf.models import TrainingDataDescriptor
 from py_mtlf.wire.adrf import DataNotification, DataSubscription, NadrfDataStoreRecord
 from py_mtlf.wire.ml_model_training import (
+    FlTopologyReport,
     InvalidMessageError,
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
@@ -109,14 +112,12 @@ def candidate_preparation_payload() -> dict:
     payload = preparation_payload()
     payload.pop("mLModelInfos")
     payload["suppFeats"] = "4"
-    payload["x-retainedResultReq"] = True
     payload["x-flTopology"] = {
         "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "children": [
             {
                 "nfInstanceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                 "priority": 100,
-                "retainedResultReq": True,
             }
         ],
         "policy": {
@@ -124,6 +125,58 @@ def candidate_preparation_payload() -> dict:
             "minAvailableNodes": 1,
             "minTrainNodes": 1,
         },
+    }
+    return payload
+
+
+def protocol_leaf_preparation_payload() -> dict:
+    payload = candidate_preparation_payload()
+    payload["mlCorreId"] = "99999999-9999-4999-8999-999999999999"
+    payload["mLEventSubscs"] = [
+        {
+            "mLEvent": "X_IMAGE_CLASSIFICATION",
+            "mLEventFilter": {},
+            "modelInterInfo": "pymtlf-image-classification-mnist",
+        }
+    ]
+    payload["x-flTopology"] = {
+        "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "strategy": {
+            "method": "fedProx",
+            "aggregation": "sampleWeighted",
+            "methodParameters": {"proximalMu": 0.01},
+        },
+        "reportAfter": {"count": 2, "unit": "epoch"},
+    }
+    return payload
+
+
+def protocol_branch_preparation_payload() -> dict:
+    payload = protocol_leaf_preparation_payload()
+    payload["x-flTopology"] = {
+        "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "policy": {
+            "allowAdditionalCandidates": False,
+            "additionalCandidatePriority": 0,
+            "selectionMethod": "priority",
+            "minAvailableNodes": 1,
+            "fractionTrain": 1.0,
+            "minTrainNodes": 1,
+            "acceptFailures": False,
+            "minCompletionRate": 1.0,
+        },
+        "strategy": {
+            "method": "fedProx",
+            "aggregation": "sampleWeighted",
+            "methodParameters": {"proximalMu": 0.01},
+        },
+        "reportAfter": {"count": 1, "unit": "round"},
+        "children": [
+            {
+                "nfInstanceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "priority": 100,
+            }
+        ],
     }
     return payload
 
@@ -189,6 +242,31 @@ def round_input_bundle(*, epochs: int = 7):
         "client_training": {"epochs": epochs},
     }
     return Mock(manifest=manifest, model=model)
+
+
+def image_round_input_bundle():
+    return Mock(
+        workload_profile=WorkloadProfile.IMAGE_CLASSIFICATION,
+        manifest={
+            "artifact_role": "ROUND_INPUT",
+            "analytics_event": "X_IMAGE_CLASSIFICATION",
+            "model_interoperability": "pymtlf-image-classification-mnist",
+            "workload_profile": "image_classification",
+            "dataset": "mnist",
+            "runtime_compatibility": {"framework": "torch"},
+            "model": {"input_channels": 1, "num_classes": 10},
+            "inference": {
+                "input_shape": [1, 28, 28],
+                "class_count": 10,
+                "normalization": "uint8_to_float32_div_255",
+            },
+            "fl_metadata": {
+                "ml_corre_id": "99999999-9999-4999-8999-999999999999",
+                "round_ind": 1,
+                "client_training": {"epochs": 1},
+            },
+        },
+    )
 
 
 def round_global_bundle():
@@ -301,9 +379,8 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
         service.close()
 
 
-def test_candidate_create_is_retained_without_starting_legacy_execution(
+def test_candidate_create_rejects_retained_instruction_before_resource_creation(
     tmp_path,
-    monkeypatch,
 ):
     context = Mock()
     context.get.return_value = NwdafContext(
@@ -320,29 +397,319 @@ def test_candidate_create_is_retained_without_starting_legacy_execution(
         Mock(),
         Mock(),
     )
-    start_operation = Mock()
-    monkeypatch.setattr(service, "_start_operation", start_operation)
-
     try:
-        resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
-        )
+        payload = candidate_preparation_payload()
+        payload["x-retainedResultReq"] = True
+        payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
+        with pytest.raises(RequirementsError) as captured:
+            service.create(NwdafMLModelTrainSubsc.model_validate(payload))
 
-        assert resource.state is FLClientState.READY
-        assert resource.representation.supported_features == ""
-        assert resource.representation.fl_topology is not None
-        assert resource.representation.retained_result_request is None
-        assert (
-            resource.representation.fl_topology.children[0].retained_result_request
-            is None
-        )
-        start_operation.assert_not_called()
+        assert [item.parameter for item in captured.value.violations] == [
+            "x-retainedResultReq",
+            "x-flTopology",
+        ]
+        assert service._resources == {}
         assert service._capacity.acquire(blocking=False)
         assert service._outbox_capacity.acquire(blocking=False)
         service._capacity.release()
         service._outbox_capacity.release()
     finally:
         service.close()
+
+
+def test_protocol_leaf_preparation_reports_ready_without_model_or_dataset_read(tmp_path):
+    delivered = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        delivered.append(json.loads(request.content))
+        return httpx.Response(204, request=request)
+
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    datasets = Mock()
+    workspace = Mock()
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    branch = Mock()
+    settings = FLClientSettings(
+        workload={"profile": "image_classification"},
+        training_data={
+            "collection_trigger": "local",
+            "dataset": "mnist",
+            "shard_path": str(tmp_path / "leaf.npz"),
+        },
+        model_interoperability_ids=("pymtlf-image-classification-mnist",),
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        settings,
+        NotificationSettings(),
+        context,
+        datasets,
+        workspace,
+        client=client,
+        branch_coordinator=branch,
+        round_model_distribution=Mock(),
+    )
+    try:
+        resource = service.create(
+            NwdafMLModelTrainSubsc.model_validate(
+                protocol_leaf_preparation_payload()
+            )
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            resource = service.get(resource.subscription_id)
+            if resource.state is FLClientState.PREPARED:
+                break
+            time.sleep(0.01)
+
+        assert resource.state is FLClientState.PREPARED
+        assert resource.representation.supported_features == "4"
+        assert resource.protocol_image_dataset.value == "mnist"
+        assert delivered == [
+            {
+                "mlCorreId": "99999999-9999-4999-8999-999999999999",
+                "notifCorreId": "prep-client-a",
+                "x-flTopologyReport": {
+                    "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "strategy": {
+                        "method": "fedProx",
+                        "aggregation": "sampleWeighted",
+                        "methodParameters": {"proximalMu": 0.01},
+                    },
+                    "reportAfter": {"count": 2, "unit": "epoch"},
+                },
+            }
+        ]
+        workspace.assert_not_called()
+        assert not workspace.method_calls
+        datasets.assert_not_called()
+        assert not datasets.method_calls
+        branch.prepare_protocol.assert_not_called()
+    finally:
+        service.close()
+        client.close()
+
+
+def test_protocol_intermediate_accepts_image_round_without_local_training_config(
+    tmp_path,
+):
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        client_settings(),
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+    )
+    try:
+        service._validate_protocol_intermediate_bundle(
+            image_round_input_bundle(),
+            "X_IMAGE_CLASSIFICATION",
+            "pymtlf-image-classification-mnist",
+        )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("model_interoperability", "local_dataset"),
+    (
+        ("pymtlf-image-classification-unknown", "mnist"),
+        ("pymtlf-image-classification-mnist", "cifar10"),
+    ),
+    ids=("unknown-contract", "incompatible-local-dataset"),
+)
+def test_protocol_leaf_refuses_feature_for_unsupported_image_contract(
+    tmp_path,
+    model_interoperability,
+    local_dataset,
+):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id=(
+            "11111111-1111-4111-8111-111111111111"
+        ),
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    settings = FLClientSettings(
+        workload={"profile": "image_classification"},
+        training_data={
+            "collection_trigger": "local",
+            "dataset": local_dataset,
+            "shard_path": str(tmp_path / "leaf.npz"),
+        },
+        model_interoperability_ids=(model_interoperability,),
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        settings,
+        NotificationSettings(),
+        context,
+        Mock(),
+        Mock(),
+        round_model_distribution=Mock(),
+    )
+    try:
+        payload = protocol_leaf_preparation_payload()
+        payload["mLEventSubscs"][0]["modelInterInfo"] = model_interoperability
+        resource = service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+
+        assert resource.representation.supported_features == ""
+        assert resource.state is FLClientState.READY
+        assert resource.protocol_image_dataset is None
+    finally:
+        service.close()
+
+
+def test_protocol_leaf_rejects_first_round_bundle_with_incompatible_dataset(
+    tmp_path,
+):
+    settings = FLClientSettings(
+        workload={"profile": "image_classification"},
+        training_data={
+            "collection_trigger": "local",
+            "dataset": "mnist",
+            "shard_path": str(tmp_path / "leaf.npz"),
+        },
+        model_interoperability_ids=("pymtlf-image-classification-mnist",),
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        settings,
+        NotificationSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+    )
+    bundle = image_round_input_bundle()
+    bundle.manifest["dataset"] = "cifar10"
+    bundle.manifest["model"]["input_channels"] = 3
+    bundle.manifest["inference"]["input_shape"] = [3, 32, 32]
+    try:
+        with pytest.raises(RuntimeError, match="image dataset is incompatible"):
+            service._validate_workload_bundle(
+                bundle,
+                "X_IMAGE_CLASSIFICATION",
+                "pymtlf-image-classification-mnist",
+            )
+    finally:
+        service.close()
+
+
+def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_read(
+    tmp_path,
+):
+    delivered = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        delivered.append(json.loads(request.content))
+        return httpx.Response(204, request=request)
+
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id=(
+            "11111111-1111-4111-8111-111111111111"
+        ),
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    datasets = Mock()
+    workspace = Mock()
+    branch = Mock()
+    branch.prepare_protocol.side_effect = [
+        FlTopologyReport(
+            nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        ),
+        FlTopologyReport(
+            nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        ),
+    ]
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        FLClientSettings(
+            workload={"profile": "image_classification"},
+            training_data={
+                "collection_trigger": "local",
+                "dataset": "mnist",
+                "shard_path": str(tmp_path / "branch.npz"),
+            },
+            model_interoperability_ids=(
+                "pymtlf-image-classification-mnist",
+            ),
+        ),
+        NotificationSettings(),
+        context,
+        datasets,
+        workspace,
+        client=client,
+        branch_coordinator=branch,
+        round_model_distribution=Mock(),
+    )
+    try:
+        created = service.create(
+            NwdafMLModelTrainSubsc.model_validate(
+                protocol_branch_preparation_payload()
+            )
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if service.get(created.subscription_id).state is FLClientState.PREPARED:
+                break
+            time.sleep(0.01)
+
+        topology = protocol_branch_preparation_payload()["x-flTopology"]
+        topology["children"][0]["enabled"] = False
+        updated = service.patch(
+            created.subscription_id,
+            NwdafMLModelTrainSubscPatch.model_validate(
+                {"x-flTopology": topology}
+            ),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            updated = service.get(updated.subscription_id)
+            if updated.state is FLClientState.PREPARED:
+                break
+            time.sleep(0.01)
+
+        assert updated.state is FLClientState.PREPARED
+        assert branch.prepare_protocol.call_count == 2
+        assert len(delivered) == 2
+        datasets.assert_not_called()
+        assert not datasets.method_calls
+        workspace.assert_not_called()
+        assert not workspace.method_calls
+    finally:
+        service.close()
+        client.close()
 
 
 def test_candidate_create_validates_containing_nwdaf_identity(tmp_path):

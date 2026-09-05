@@ -59,8 +59,12 @@ class AdrfResolver:
             required_nf_instance_id,
         )
 
-    def resolve_model(self) -> SelectedTarget | None:
-        return self._resolve_service("nadrf-mlmodelmanagement", "ml-model-storage-ind")
+    def resolve_model(self, required_nf_instance_id: str = "") -> SelectedTarget | None:
+        return self._resolve_service(
+            "nadrf-mlmodelmanagement",
+            "ml-model-storage-ind",
+            required_nf_instance_id,
+        )
 
     def invalidate(self, service_name: str | None = None) -> None:
         with self._lock:

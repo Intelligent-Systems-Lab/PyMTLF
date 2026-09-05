@@ -31,14 +31,12 @@ def candidate_payload() -> dict:
                 "timeAvReq": "PT5M",
             }
         ],
-        "x-retainedResultReq": True,
         "x-flTopology": {
             "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "children": [
                 {
                     "nfInstanceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                     "priority": 100,
-                    "retainedResultReq": True,
                 }
             ],
             "policy": {
@@ -216,6 +214,28 @@ def test_candidate_create_returns_lossless_persistent_contract_without_feature(
         assert representation["x-flTopology"]["nfInstanceId"].startswith("aaaaaaaa")
         assert "x-retainedResultReq" not in representation
         assert "retainedResultReq" not in representation["x-flTopology"]["children"][0]
+
+
+def test_candidate_retained_result_instruction_is_rejected_atomically(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    payload = candidate_payload()
+    payload["x-retainedResultReq"] = True
+    payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
+    with TestClient(
+        create_app(configured, nwdaf_context_client=candidate_context())
+    ) as client:
+        rejected = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=payload,
+        )
+        valid = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            json=candidate_payload(),
+        )
+
+    assert rejected.status_code == 403
+    assert rejected.json()["cause"] == "ML_MODEL_TRAINING_REQS_NOT_MET"
+    assert valid.status_code == 201
 
 
 def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):

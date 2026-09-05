@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import pytest
@@ -221,9 +222,7 @@ def test_federated_learning_settings_fail_fast(payload):
         (
             "local",
             None,
-            FLClientSettings(
-                training_data={"collection_trigger": "consumer_subscription"}
-            ),
+            FLClientSettings(training_data={"collection_trigger": "consumer_subscription"}),
             None,
             False,
         ),
@@ -232,18 +231,14 @@ def test_federated_learning_settings_fail_fast(payload):
         (
             "federated",
             None,
-            FLClientSettings(
-                training_data={"collection_trigger": "consumer_subscription"}
-            ),
+            FLClientSettings(training_data={"collection_trigger": "consumer_subscription"}),
             None,
             True,
         ),
         (
             "federated",
             FLServerSettings(),
-            FLClientSettings(
-                training_data={"collection_trigger": "consumer_subscription"}
-            ),
+            FLClientSettings(training_data={"collection_trigger": "consumer_subscription"}),
             None,
             True,
         ),
@@ -315,9 +310,7 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
     )
 
     with pytest.raises(ValidationError):
-        FLClientSettings.model_validate(
-            {"training_data": {"collection_trigger": "local_file"}}
-        )
+        FLClientSettings.model_validate({"training_data": {"collection_trigger": "local_file"}})
 
 
 def test_fl_client_accepts_only_matching_local_image_workload(tmp_path):
@@ -421,9 +414,7 @@ federated_learning:
                 {
                     "profile_id": "ue-communication-default",
                     "ml_event": "UE_COMMUNICATION",
-                    "target_ue": {
-                        "intGroupIds": ["group-a.example", "group-a.example"]
-                    },
+                    "target_ue": {"intGroupIds": ["group-a.example", "group-a.example"]},
                     "network_area": private_network_area(),
                     "sampling_interval_seconds": 2,
                 }
@@ -614,9 +605,7 @@ def test_flat_monitor_owner_requires_explicit_orchestration_and_degradation_trig
             "training_trigger": {"degradation": {"enabled": True}},
         },
         {
-            "client": {
-                "training_data": {"collection_trigger": "consumer_subscription"}
-            },
+            "client": {"training_data": {"collection_trigger": "consumer_subscription"}},
             "orchestration": {
                 "mode": "flat",
                 "participant_source": "monitor_scopes",
@@ -670,9 +659,7 @@ def test_tracked_hierarchy_profile_references_a_valid_topology():
 
     assert loaded.federated_learning.topology is not None
     planner = StaticTopologyPlanner.load(loaded.federated_learning.topology.config_file)
-    assignment = planner.build(
-        root_nf_instance_id="00000000-0000-4000-8000-000000000001"
-    )
+    assignment = planner.build(root_nf_instance_id="00000000-0000-4000-8000-000000000001")
     assert len(assignment.branches) == 1
 
 
@@ -767,6 +754,52 @@ def test_hierarchy_configuration_requires_server_strategy_and_topology_together(
             {
                 "server": {},
                 "training_trigger": {"private_api": {"enabled": True}},
+            }
+        )
+
+
+def test_hierarchy_contract_defaults_to_model_bundle_and_accepts_protocol(tmp_path):
+    base = {
+        "server": {},
+        "orchestration": {
+            "mode": "hierarchical",
+            "participant_source": "static",
+        },
+        "training_trigger": {"private_api": {"enabled": True}},
+        "strategy": {
+            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
+            "participant_selection": "all",
+            "waiting_policy": "all",
+            "aggregation": "sample_weighted",
+        },
+        "topology": {
+            "strategy": "static",
+            "config_file": tmp_path / "topology.yaml",
+        },
+    }
+
+    legacy = FederatedLearningSettings.model_validate(base)
+    assert legacy.orchestration is not None
+    assert legacy.orchestration.hierarchy_contract == "model_bundle"
+
+    protocol_payload = copy.deepcopy(base)
+    protocol_payload["orchestration"]["hierarchy_contract"] = "protocol"
+    protocol = FederatedLearningSettings.model_validate(protocol_payload)
+    assert protocol.orchestration is not None
+    assert protocol.orchestration.hierarchy_contract == "protocol"
+
+
+def test_flat_orchestration_rejects_hierarchy_contract():
+    with pytest.raises(ValidationError, match="flat orchestration must not configure"):
+        FederatedLearningSettings.model_validate(
+            {
+                "server": {},
+                "orchestration": {
+                    "mode": "flat",
+                    "participant_source": "monitor_scopes",
+                    "hierarchy_contract": "protocol",
+                },
+                "training_trigger": {"degradation": {"enabled": True}},
             }
         )
 

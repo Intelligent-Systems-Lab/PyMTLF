@@ -13,6 +13,7 @@ import httpx
 from py_mtlf.config import FederatedLearningSettings
 from py_mtlf.core.fl_hierarchy import normalize_nf_instance_id
 from py_mtlf.core.nwdaf_context import NwdafContextClient
+from py_mtlf.core.workloads import IMAGE_MODEL_INTEROPERABILITY
 from py_mtlf.wire.ml_model_training import (
     InvalidParameter,
     NwdafMLModelTrainSubsc,
@@ -146,6 +147,7 @@ class HierarchyNodeResolver:
             raise ValueError("ml_event must be a non-empty canonical value")
         if not model_interoperability.strip():
             raise ValueError("model_interoperability must not be blank")
+        profile_interoperability = _profile_interoperability(model_interoperability)
 
         capability = (
             "FL_SERVER_AND_CLIENT"
@@ -155,7 +157,7 @@ class HierarchyNodeResolver:
         query_entry = _query_entry(
             ml_event=ml_event,
             capability=capability,
-            model_interoperability=model_interoperability,
+            model_interoperability=profile_interoperability,
             tracking_areas=(),
         )
         try:
@@ -198,7 +200,7 @@ class HierarchyNodeResolver:
             profile,
             role=role,
             ml_event=ml_event,
-            model_interoperability=model_interoperability,
+            model_interoperability=profile_interoperability,
         ):
             raise HierarchyDiscoveryError(
                 f"{role.value} {nf_id} does not advertise the required FL capability"
@@ -233,6 +235,7 @@ class HierarchyNodeResolver:
             raise ValueError("ml_event must be a non-empty canonical value")
         if not model_interoperability.strip():
             raise ValueError("model_interoperability must not be blank")
+        profile_interoperability = _profile_interoperability(model_interoperability)
         tais = _normalize_tais(tracking_areas)
         if not tais:
             raise ValueError("bounded hierarchy discovery requires tracking areas")
@@ -245,7 +248,7 @@ class HierarchyNodeResolver:
         query_entry = _query_entry(
             ml_event=ml_event,
             capability=capability,
-            model_interoperability=model_interoperability,
+            model_interoperability=profile_interoperability,
             tracking_areas=tais,
         )
         try:
@@ -284,7 +287,7 @@ class HierarchyNodeResolver:
                 profile,
                 role=role,
                 ml_event=ml_event,
-                model_interoperability=model_interoperability,
+                model_interoperability=profile_interoperability,
                 tracking_areas=tais,
             ):
                 continue
@@ -344,6 +347,32 @@ class HierarchyNodeResolver:
             model_interoperability=requirements.model_interoperability,
             tracking_areas=requirements.tracking_areas,
             excluded_nf_instance_ids=excluded_nf_instance_ids,
+        )
+
+    def discovery_scope_for_subscription(
+        self,
+        value: NwdafMLModelTrainSubsc,
+        *,
+        role: HierarchyNodeRole,
+    ) -> HierarchyDiscoveryScope:
+        try:
+            requirements = hierarchy_discovery_requirements(value)
+        except ValueError as error:
+            raise RequirementsError(
+                [
+                    InvalidParameter(
+                        "mLEventSubscs[0].mLEventFilter.networkArea.tais",
+                        str(error),
+                    )
+                ]
+            ) from error
+        context = self._nwdaf_context.get()
+        return _scope(
+            containing_nf_instance_id=context.nf_instance_id,
+            role=role,
+            ml_event=requirements.ml_event,
+            model_interoperability=requirements.model_interoperability,
+            tracking_areas=requirements.tracking_areas,
         )
 
     def _search(
@@ -584,6 +613,16 @@ def _query_entry(
     if tracking_areas:
         entry["trackingAreaList"] = list(tracking_areas)
     return entry
+
+
+def _profile_interoperability(value: str) -> str:
+    if re.fullmatch(r"[0-9]{6}", value):
+        return value
+    if value in IMAGE_MODEL_INTEROPERABILITY.values():
+        return "001122"
+    raise ValueError(
+        "model interoperability has no configured NRF VendorId mapping"
+    )
 
 
 _MCC = re.compile(r"^[0-9]{3}$")

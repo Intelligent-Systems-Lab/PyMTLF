@@ -5,6 +5,7 @@ import tarfile
 from pathlib import Path
 
 from py_mtlf.core.workloads import (
+    IMAGE_CLASSIFICATION_EVENT,
     WorkloadProfile,
     required_bundle_files,
     workload_profile,
@@ -52,8 +53,12 @@ def build_seed_bundle(
     )
     if profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
         config["analytics_event"] = event or "UE_COMMUNICATION"
-    elif event is not None:
-        raise ValueError("image classification seed does not accept an analytics event")
+    elif event not in {None, IMAGE_CLASSIFICATION_EVENT}:
+        raise ValueError(
+            f"image classification seed requires {IMAGE_CLASSIFICATION_EVENT}"
+        )
+    else:
+        config["analytics_event"] = IMAGE_CLASSIFICATION_EVENT
     files = {
         "config.json": json.dumps(
             config,

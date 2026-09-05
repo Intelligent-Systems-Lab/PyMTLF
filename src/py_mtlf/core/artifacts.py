@@ -9,6 +9,7 @@ from typing import BinaryIO
 
 from py_mtlf.config import ArtifactSettings
 from py_mtlf.core.workloads import (
+    IMAGE_CLASSIFICATION_EVENT,
     WorkloadContractError,
     WorkloadProfile,
     required_bundle_files,
@@ -272,9 +273,9 @@ class ArtifactRepository:
             if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
                 raise InvalidArtifactError("bundle component filenames are invalid")
         else:
-            if "analytics_event" in config:
+            if config.get("analytics_event") != IMAGE_CLASSIFICATION_EVENT:
                 raise InvalidArtifactError(
-                    "image classification bundle must not declare analytics_event"
+                    f"image classification bundle requires {IMAGE_CLASSIFICATION_EVENT}"
                 )
             if config.get("MODEL_SCRIPT") != "model.py" or config.get("MODEL_PATH") != "model.npy":
                 raise InvalidArtifactError("bundle component filenames are invalid")

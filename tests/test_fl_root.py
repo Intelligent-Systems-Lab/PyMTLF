@@ -41,13 +41,17 @@ from py_mtlf.core.nwdaf_context import (
     MLAnalyticsCapability,
     NwdafContext,
 )
-from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
+from py_mtlf.wire.ml_model import MLModelAdrf
+from py_mtlf.wire.ml_model_training import FlTopologyReport, NwdafMLModelTrainNotif
 from py_mtlf.wire.private import SelectedTarget
 
 ROOT_ID = "00000000-0000-4000-8000-000000000001"
 BRANCH_ID = "00000000-0000-4000-8000-000000000010"
+BRANCH_B_ID = "00000000-0000-4000-8000-000000000020"
 LEAF_A_ID = "00000000-0000-4000-8000-000000000101"
 LEAF_B_ID = "00000000-0000-4000-8000-000000000102"
+LEAF_C_ID = "00000000-0000-4000-8000-000000000201"
+LEAF_D_ID = "00000000-0000-4000-8000-000000000202"
 REQUEST_A_ID = "00000000-0000-4000-8000-000000000701"
 REQUEST_B_ID = "00000000-0000-4000-8000-000000000702"
 
@@ -60,10 +64,16 @@ def root_coordinator(
     terminal_status_ttl_seconds: int = 3600,
     clock=None,
     workspace_override=None,
+    hierarchy_contract: str = "model_bundle",
+    round_model_distribution=None,
+    ml_event: str = "UE_COMMUNICATION",
+    model_interoperability: str = "001122",
+    topology_text: str | None = None,
 ):
     topology_path = tmp_path / "topology.yaml"
     topology_path.write_text(
-        f"""
+        topology_text
+        or f"""
 version: 1
 admission:
   mode: complete_required
@@ -102,8 +112,8 @@ branches:
         api_root="http://root.example",
         internal_api_root="http://go.example",
         ml_analytics_capabilities=(
-            MLAnalyticsCapability(
-                ml_analytics_ids=("UE_COMMUNICATION",),
+                MLAnalyticsCapability(
+                    ml_analytics_ids=(ml_event,),
                 fl_capability_type=FLCapabilityType.SERVER,
             ),
         ),
@@ -113,10 +123,10 @@ branches:
         artifact=SimpleNamespace(key="a" * 64, url="http://root.example/base"),
         descriptor=SimpleNamespace(
             family_id="ue-communication-default",
-            event="UE_COMMUNICATION",
+            event=ml_event,
             event_filter={"networkArea": {"tais": []}},
             target_ue=None,
-            model_interoperability="001122",
+            model_interoperability=model_interoperability,
         ),
     )
     catalog = Mock()
@@ -132,14 +142,16 @@ branches:
     server = Mock()
 
     def start_hierarchy_preparation(**kwargs):
+        plan_id = kwargs.get("plan_id", kwargs.get("ml_correlation_id"))
         registry.attach_server(
             kwargs["reservation_id"],
-            kwargs["plan_id"],
+            plan_id,
             "server-process",
         )
         return SimpleNamespace(process_id="server-process")
 
     server.start_hierarchy_preparation.side_effect = start_hierarchy_preparation
+    server.start_protocol_preparation.side_effect = start_hierarchy_preparation
     collection_cancelled = threading.Event()
 
     def collect_hierarchy_preparation(_process_id):
@@ -181,6 +193,8 @@ branches:
         policy=policy,
         experiments=registry,
         loader=loader,
+        hierarchy_contract=hierarchy_contract,
+        round_model_distribution=round_model_distribution,
         terminal_status_ttl_seconds=terminal_status_ttl_seconds,
         **root_kwargs,
     )
@@ -195,6 +209,286 @@ branches:
         catalog,
         model,
     )
+
+
+def test_protocol_root_dispatches_model_free_recursive_preparation(tmp_path):
+    distribution = Mock()
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        _registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(
+        tmp_path,
+        hierarchy_contract="protocol",
+        round_model_distribution=distribution,
+        ml_event="X_IMAGE_CLASSIFICATION",
+        model_interoperability="pymtlf-image-classification-mnist",
+    )
+
+    try:
+        accepted = coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        waiting = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.PREPARATION_WAITING, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert waiting.state is RootRequestState.PREPARATION_WAITING
+        kwargs = server.start_protocol_preparation.call_args.kwargs
+        assert kwargs["ml_correlation_id"] == accepted.plan_id
+        assert UUID(kwargs["ml_correlation_id"]).version == 4
+        assert kwargs["ml_event"] == "X_IMAGE_CLASSIFICATION"
+        assert kwargs["model_interoperability"] == (
+            "pymtlf-image-classification-mnist"
+        )
+        branch = kwargs["targets"][0].topology
+        assert branch.nf_instance_id == BRANCH_ID
+        assert tuple(child.nf_instance_id for child in branch.children) == (
+            LEAF_A_ID,
+            LEAF_B_ID,
+        )
+        assert branch.report_after.unit == "round"
+        assert all(child.report_after.unit == "epoch" for child in branch.children)
+        artifacts.publish_branch_assignment.assert_not_called()
+        distribution.store.assert_not_called()
+    finally:
+        coordinator.close()
+
+
+def test_protocol_root_dispatches_two_explicit_branch_subtrees(tmp_path):
+    topology_text = f"""
+version: 1
+admission:
+  mode: complete_required
+branches:
+  - nf_instance_id: {BRANCH_ID}
+    leaves:
+      - nf_instance_id: {LEAF_A_ID}
+      - nf_instance_id: {LEAF_B_ID}
+  - nf_instance_id: {BRANCH_B_ID}
+    leaves:
+      - nf_instance_id: {LEAF_C_ID}
+      - nf_instance_id: {LEAF_D_ID}
+""".strip() + "\n"
+    (
+        coordinator,
+        _resolver,
+        _artifacts,
+        _workspace,
+        server,
+        _registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(
+        tmp_path,
+        hierarchy_contract="protocol",
+        round_model_distribution=Mock(),
+        ml_event="X_IMAGE_CLASSIFICATION",
+        model_interoperability="pymtlf-image-classification-mnist",
+        topology_text=topology_text,
+    )
+
+    try:
+        coordinator.submit_manual(
+            request_id=REQUEST_A_ID,
+            model_family_id="ue-communication-default",
+        )
+        waiting = coordinator.wait_for_state(
+            REQUEST_A_ID,
+            {RootRequestState.PREPARATION_WAITING, RootRequestState.FAILED},
+            timeout=2,
+        )
+
+        assert waiting.state is RootRequestState.PREPARATION_WAITING
+        targets = server.start_protocol_preparation.call_args.kwargs["targets"]
+        assert tuple(target.participant_nf_instance_id for target in targets) == (
+            BRANCH_ID,
+            BRANCH_B_ID,
+        )
+        assert tuple(
+            child.nf_instance_id for child in targets[0].topology.children
+        ) == (LEAF_A_ID, LEAF_B_ID)
+        assert tuple(
+            child.nf_instance_id for child in targets[1].topology.children
+        ) == (LEAF_C_ID, LEAF_D_ID)
+    finally:
+        coordinator.close()
+
+
+def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
+    topology_text = f"""
+version: 1
+admission:
+  mode: complete_required
+branches:
+  - nf_instance_id: {BRANCH_ID}
+    leaves:
+      - nf_instance_id: {LEAF_A_ID}
+      - nf_instance_id: {LEAF_B_ID}
+  - nf_instance_id: {BRANCH_B_ID}
+    leaves:
+      - nf_instance_id: {LEAF_C_ID}
+      - nf_instance_id: {LEAF_D_ID}
+""".strip() + "\n"
+    distribution = Mock()
+    stored = SimpleNamespace(
+        model_unique_id=77,
+        wire_reference=MLModelAdrf(
+            adrfId="00000000-0000-4000-8000-000000000900",
+            storTransId="round-store",
+        ),
+    )
+    distribution.store.return_value = stored
+    (
+        coordinator,
+        _resolver,
+        artifacts,
+        workspace,
+        server,
+        _registry,
+        _policy,
+        _catalog,
+        _model,
+    ) = root_coordinator(
+        tmp_path,
+        hierarchy_contract="protocol",
+        round_model_distribution=distribution,
+        ml_event="X_IMAGE_CLASSIFICATION",
+        model_interoperability="pymtlf-image-classification-mnist",
+        topology_text=topology_text,
+    )
+    round_path = tmp_path / "round.tar.gz"
+    round_path.write_bytes(b"round")
+    aggregate_path = tmp_path / "aggregate.tar.gz"
+    aggregate_path.write_bytes(b"aggregate")
+    round_input = SimpleNamespace(
+        digest="b" * 64,
+        path=round_path,
+        url="http://root.example/round",
+    )
+    aggregate = SimpleNamespace(
+        digest="c" * 64,
+        path=aggregate_path,
+        url="http://branch.example/aggregate",
+    )
+    handoff = SimpleNamespace(
+        digest=aggregate.digest,
+        path=tmp_path / "root-handoff.tar.gz",
+        url="http://root.example/final-handoff",
+    )
+    workspace.republish_validation_candidate.return_value = handoff
+    artifacts.publish_round_input.return_value = round_input
+    process_id = None
+
+    def collect_protocol(process):
+        nonlocal process_id
+        process_id = process
+        reports = {
+            BRANCH_ID: (LEAF_A_ID, LEAF_B_ID),
+            BRANCH_B_ID: (LEAF_C_ID, LEAF_D_ID),
+        }
+        return HierarchyPreparationCollection(
+            process_id=process,
+            plan_id=server.start_protocol_preparation.call_args.kwargs[
+                "ml_correlation_id"
+            ],
+            participants=tuple(
+                HierarchyParticipantPreparationOutcome(
+                    participant_nf_instance_id=branch_id,
+                    resource_location=f"http://{branch_id}.example/subscriptions/1",
+                    assignment_url="",
+                    notification=NwdafMLModelTrainNotif(
+                        notifCorreId=f"branch-callback-{index}",
+                        mlCorreId=server.start_protocol_preparation.call_args.kwargs[
+                            "ml_correlation_id"
+                        ],
+                        **{
+                            "x-flTopologyReport": FlTopologyReport.model_validate(
+                                {
+                                    "nfInstanceId": branch_id,
+                                    "children": [
+                                        {
+                                            "nfInstanceId": leaf_id,
+                                            "status": "ACTIVE",
+                                            "statusTimestamp": "2026-09-05T12:00:00Z",
+                                        }
+                                        for leaf_id in leaf_ids
+                                    ],
+                                }
+                            )
+                        },
+                    ),
+                    failure="",
+                    delay_extensions=0,
+                    granted_extension_seconds=0,
+                )
+                for index, (branch_id, leaf_ids) in enumerate(
+                    reports.items(),
+                    start=1,
+                )
+            ),
+            timed_out_participant_nf_instance_ids=(),
+        )
+
+    server.collect_hierarchy_preparation.side_effect = collect_protocol
+    def execute_round(**_kwargs):
+        assert distribution.store.called
+        return aggregate
+
+    server.execute_hierarchy_round.side_effect = execute_round
+    coordinator.submit_manual(
+        request_id=REQUEST_A_ID,
+        model_family_id="ue-communication-default",
+    )
+    completed = coordinator.wait_for_state(
+        REQUEST_A_ID,
+        {RootRequestState.COMPLETE, RootRequestState.FAILED},
+        timeout=2,
+    )
+
+    assert completed.state is RootRequestState.COMPLETE
+    assert completed.candidate_url == handoff.url
+    assert completed.candidate_digest == handoff.digest
+    assert completed.published_model_id is None
+    assert process_id is not None
+    store_kwargs = distribution.store.call_args.kwargs
+    assert store_kwargs["ml_correlation_id"] == completed.plan_id
+    assert store_kwargs["round_indicator"] == 0
+    assert store_kwargs["allowed_consumer_ids"] == (
+        BRANCH_ID,
+        BRANCH_B_ID,
+        LEAF_A_ID,
+        LEAF_B_ID,
+        LEAF_C_ID,
+        LEAF_D_ID,
+    )
+    round_kwargs = server.execute_hierarchy_round.call_args.kwargs
+    assert round_kwargs["expected_subordinates"] == {
+        BRANCH_ID: (LEAF_A_ID, LEAF_B_ID),
+        BRANCH_B_ID: (LEAF_C_ID, LEAF_D_ID),
+    }
+    assert round_kwargs["round_input_model"].model_unique_id == 77
+    assert round_kwargs["round_input_model"].model_adrf == stored.wire_reference
+    distribution.cleanup.assert_called_once_with(completed.plan_id, 0)
+    workspace.republish_validation_candidate.assert_called_once()
+    server.finalize_hierarchy_candidate.assert_not_called()
+    server.close_hierarchy_training.assert_called_once_with(
+        process_id,
+        retain_for_adoption=False,
+    )
+    workspace.release_plan.assert_not_called()
+    coordinator.close()
+    workspace.release_plan.assert_called_once_with(completed.plan_id)
 
 
 def test_go_generation_reset_discards_root_status_and_releases_slot(tmp_path):

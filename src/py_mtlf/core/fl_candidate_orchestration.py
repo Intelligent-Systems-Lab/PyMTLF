@@ -372,6 +372,11 @@ class CandidatePool:
         with self._lock:
             return self._revision
 
+    @property
+    def contract(self) -> EffectiveNodeContract:
+        with self._lock:
+            return self._contract
+
     def records(self) -> tuple[CandidateRecord, ...]:
         with self._lock:
             return tuple(self._copy_record(self._records[key]) for key in sorted(self._records))
@@ -886,9 +891,12 @@ class CandidatePool:
 
     def _ordered(self, records: list[CandidateRecord]) -> list[CandidateRecord]:
         values = list(records)
-        self._random.shuffle(values)
         if self._contract.policy.selection_method == "priority":
-            values.sort(key=lambda record: record.priority, reverse=True)
+            values.sort(
+                key=lambda record: (-record.priority, record.nf_instance_id)
+            )
+        else:
+            self._random.shuffle(values)
         return values
 
     def _deactivate_locked(

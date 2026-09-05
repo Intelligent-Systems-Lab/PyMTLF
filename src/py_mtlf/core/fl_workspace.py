@@ -36,6 +36,7 @@ from py_mtlf.core.fl_hierarchy import (
 )
 from py_mtlf.core.trainer import LoadedBundle
 from py_mtlf.core.workloads import (
+    IMAGE_CLASSIFICATION_EVENT,
     WorkloadProfile,
     required_bundle_files,
     validate_image_manifest,
@@ -242,6 +243,71 @@ class FLWorkspace:
         temporary.unlink(missing_ok=True)
         artifact = ArtifactMetadata(
             key=expected_digest,
+            size_bytes=size,
+            path=path,
+            url=url,
+        )
+        if owner_plan_id is not None:
+            self._register_owned_directory(owner_plan_id, directory.parent)
+        return DownloadedArchive(metadata=artifact, validated=validated)
+
+    def download_adrf_archive(
+        self,
+        url: str,
+        process_id: str,
+        label: str,
+        *,
+        expected_size: int,
+        owner_plan_id: str | None = None,
+    ) -> DownloadedArchive:
+        """Download an ADRF-owned URL whose path does not expose the source digest."""
+        self.cleanup_expired()
+        allowed = set(self._settings.artifact_download.allowed_origins)
+        origin = _origin(url)
+        if allowed and origin not in allowed:
+            raise RuntimeError("FL artifact origin is not allowed")
+        if expected_size <= 0 or expected_size > self._artifact_settings.max_compressed_bytes:
+            raise RuntimeError("ADRF model size is outside the configured limit")
+        directory = self._root / _safe(process_id) / "downloads"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{_safe(label)}.tar.gz"
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{_safe(label)}.",
+            suffix=".tar.gz",
+            dir=directory,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self._client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"ADRF model artifact download failed with {response.status_code}"
+                    )
+                with temporary.open("wb") as output:
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > self._artifact_settings.max_compressed_bytes:
+                            raise RuntimeError(
+                                "ADRF model artifact download exceeds the configured limit"
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+            if size != expected_size:
+                raise FLArtifactIntegrityError(
+                    "ADRF model artifact size does not match the store record"
+                )
+            validated = self._validate_archive(temporary)
+            os.replace(temporary, path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            _remove_empty_download_parent(temporary, self._root)
+            raise
+        temporary.unlink(missing_ok=True)
+        artifact = ArtifactMetadata(
+            key=digest.hexdigest(),
             size_bytes=size,
             path=path,
             url=url,
@@ -1158,9 +1224,9 @@ def _validated_manifest(manifest_bytes: bytes | None) -> dict[str, object]:
         if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
             raise FLArtifactContractError("FL artifact component filenames are invalid")
     else:
-        if "analytics_event" in manifest:
+        if manifest.get("analytics_event") != IMAGE_CLASSIFICATION_EVENT:
             raise FLArtifactContractError(
-                "image classification artifact must not declare analytics_event"
+                f"image classification artifact requires {IMAGE_CLASSIFICATION_EVENT}"
             )
         if (
             manifest.get("MODEL_SCRIPT") != "model.py"

@@ -43,9 +43,13 @@ from py_mtlf.core.fl_server import (
     FLServerState,
     HierarchyPreparationTarget,
     HierarchyValidationCollection,
+    ProtocolPreparationTarget,
     _assign,
 )
-from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
+from py_mtlf.wire.ml_model_training import (
+    FlTopologyNode,
+    NwdafMLModelTrainNotif,
+)
 from py_mtlf.wire.private import SelectedTarget
 
 
@@ -183,6 +187,332 @@ def test_assignment_does_not_substitute_another_eligible_same_tai_client():
             (scope("scope-a", "000001", owner_id),),
             (candidate(decoy_id, "000001"),),
         )
+
+
+def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback():
+    root_id = "11111111-1111-4111-8111-111111111111"
+    branch_id = "22222222-2222-4222-8222-222222222222"
+    procedure_id = "99999999-9999-4999-8999-999999999999"
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "DELETE":
+            return httpx.Response(204, request=request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            201,
+            request=request,
+            headers={"Location": "http://branch.example/subscriptions/resource-a"},
+            json=payload,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_root(procedure_id)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root="/tmp/fl-server-protocol-test"),
+        FLServerSettings(),
+        context_client(
+            nf_instance_id=root_id,
+            api_root="http://root.example",
+            internal_api_root="http://root-go.example",
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    topology = FlTopologyNode.model_validate(
+        {
+            "nfInstanceId": branch_id,
+            "policy": {
+                "selectionMethod": "priority",
+                "minAvailableNodes": 1,
+                "fractionTrain": 1.0,
+                "minTrainNodes": 1,
+                "acceptFailures": False,
+            },
+            "strategy": {
+                "method": "fedProx",
+                "aggregation": "sampleWeighted",
+                "methodParameters": {"proximalMu": 0.01},
+            },
+            "reportAfter": {"count": 1, "unit": "round"},
+            "children": [
+                {
+                    "nfInstanceId": "33333333-3333-4333-8333-333333333333",
+                    "priority": 10,
+                }
+            ],
+        }
+    )
+    try:
+        process = orchestrator.start_protocol_preparation(
+            ml_correlation_id=procedure_id,
+            reservation_id=reservation.reservation_id,
+            ml_event="X_IMAGE_CLASSIFICATION",
+            ml_event_filter={},
+            model_interoperability="pymtlf-image-classification-mnist",
+            targets=(
+                ProtocolPreparationTarget(
+                    participant_nf_instance_id=branch_id,
+                    candidate=candidate(branch_id, "branch"),
+                    topology=topology,
+                ),
+            ),
+        )
+        create_payload = json.loads(requests[0].content)
+        assert create_payload["mlCorreId"] == procedure_id
+        assert create_payload["suppFeats"] == "4"
+        assert create_payload["mLPreFlag"] is True
+        assert "mLModelInfos" not in create_payload
+        data_requirement = create_payload["mLModelTrainInfos"][0]["dataAvReq"]
+        assert data_requirement["inpEvents"] == [
+            {"nwdafEvent": "X_IMAGE_CLASSIFICATION"}
+        ]
+        assert data_requirement["minNumSamples"] == 1
+        assert create_payload["mLModelTrainInfos"][0]["timeAvReq"] == "PT300S"
+        assert create_payload["x-flTopology"]["nfInstanceId"] == branch_id
+        assert create_payload["mLEventSubscs"] == [
+            {
+                "mLEvent": "X_IMAGE_CLASSIFICATION",
+                "mLEventFilter": {},
+                "modelInterInfo": "pymtlf-image-classification-mnist",
+                "useCaseCxt": "",
+            }
+        ]
+
+        participant = process.participants[0]
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participant.notification_correlation_id,
+                    "mlCorreId": procedure_id,
+                    "x-flTopologyReport": {
+                        "nfInstanceId": branch_id,
+                    },
+                }
+            )
+        )
+        collected = orchestrator.collect_hierarchy_preparation(process.process_id)
+
+        assert collected.participants[0].notification.fl_topology_report.nf_instance_id == branch_id
+        assert collected.timed_out_participant_nf_instance_ids == ()
+    finally:
+        orchestrator.close()
+        registry.reset_generation()
+        client.close()
+
+
+def test_protocol_feature_mismatch_is_a_participant_failure():
+    root_id = "11111111-1111-4111-8111-111111111111"
+    branch_id = "22222222-2222-4222-8222-222222222222"
+    procedure_id = "99999999-9999-4999-8999-999999999999"
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "DELETE":
+            return httpx.Response(204, request=request)
+        payload = json.loads(request.content)
+        payload.pop("suppFeats", None)
+        return httpx.Response(
+            201,
+            request=request,
+            headers={"Location": "http://branch.example/subscriptions/resource-a"},
+            json=payload,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_root(procedure_id)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root="/tmp/fl-server-protocol-test"),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        context_client(
+            nf_instance_id=root_id,
+            api_root="http://root.example",
+            internal_api_root="http://root-go.example",
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+    topology = FlTopologyNode.model_validate(
+        {
+            "nfInstanceId": branch_id,
+            "policy": {
+                "selectionMethod": "priority",
+                "minAvailableNodes": 1,
+                "fractionTrain": 1.0,
+                "minTrainNodes": 1,
+                "acceptFailures": False,
+            },
+            "strategy": {
+                "method": "fedProx",
+                "aggregation": "sampleWeighted",
+                "methodParameters": {"proximalMu": 0.01},
+            },
+            "reportAfter": {"count": 1, "unit": "round"},
+        }
+    )
+    try:
+        process = orchestrator.start_protocol_preparation(
+            ml_correlation_id=procedure_id,
+            reservation_id=reservation.reservation_id,
+            ml_event="X_IMAGE_CLASSIFICATION",
+            ml_event_filter={},
+            model_interoperability="pymtlf-image-classification-mnist",
+            targets=(
+                ProtocolPreparationTarget(
+                    participant_nf_instance_id=branch_id,
+                    candidate=candidate(branch_id, "branch"),
+                    topology=topology,
+                ),
+            ),
+        )
+        collected = orchestrator.collect_hierarchy_preparation(process.process_id)
+
+        assert process.state is FLServerState.PREPARATION_EVALUATING
+        assert collected.participants[0].failure == "FEATURE_NOT_SUPPORTED"
+        assert [request.method for request in requests] == ["POST", "DELETE"]
+    finally:
+        orchestrator.close()
+        registry.reset_generation()
+        client.close()
+
+
+def test_protocol_process_adds_and_removes_participants_after_admission():
+    root_id = "11111111-1111-4111-8111-111111111111"
+    branch_a = "22222222-2222-4222-8222-222222222222"
+    branch_b = "33333333-3333-4333-8333-333333333333"
+    procedure_id = "99999999-9999-4999-8999-999999999999"
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "DELETE":
+            return httpx.Response(204, request=request)
+        payload = json.loads(request.content)
+        target = request.headers["x-nwdaf-target-nf-instance-id"]
+        return httpx.Response(
+            201,
+            request=request,
+            headers={"Location": f"http://branch.example/subscriptions/{target}"},
+            json=payload,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_root(procedure_id)
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root="/tmp/fl-server-protocol-test"),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        context_client(
+            nf_instance_id=root_id,
+            api_root="http://root.example",
+            internal_api_root="http://root-go.example",
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+    )
+
+    def topology(nf_instance_id: str) -> FlTopologyNode:
+        return FlTopologyNode.model_validate(
+            {
+                "nfInstanceId": nf_instance_id,
+                "policy": {
+                    "selectionMethod": "priority",
+                    "minAvailableNodes": 1,
+                    "fractionTrain": 1.0,
+                    "minTrainNodes": 1,
+                    "acceptFailures": False,
+                },
+                "strategy": {
+                    "method": "fedProx",
+                    "aggregation": "sampleWeighted",
+                    "methodParameters": {"proximalMu": 0.01},
+                },
+                "reportAfter": {"count": 1, "unit": "round"},
+            }
+        )
+
+    def target(nf_instance_id: str) -> ProtocolPreparationTarget:
+        return ProtocolPreparationTarget(
+            participant_nf_instance_id=nf_instance_id,
+            candidate=candidate(nf_instance_id, nf_instance_id[:4]),
+            topology=topology(nf_instance_id),
+        )
+
+    try:
+        process = orchestrator.start_protocol_preparation(
+            ml_correlation_id=procedure_id,
+            reservation_id=reservation.reservation_id,
+            ml_event="X_IMAGE_CLASSIFICATION",
+            ml_event_filter={},
+            model_interoperability="pymtlf-image-classification-mnist",
+            targets=(target(branch_a),),
+        )
+        first = process.participants[0]
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": first.notification_correlation_id,
+                    "mlCorreId": procedure_id,
+                    "x-flTopologyReport": {"nfInstanceId": branch_a},
+                }
+            )
+        )
+        orchestrator.collect_hierarchy_preparation(process.process_id)
+        orchestrator.admit_hierarchy_preparation(process.process_id)
+
+        orchestrator.add_protocol_preparation_targets(
+            process_id=process.process_id,
+            ml_event="X_IMAGE_CLASSIFICATION",
+            ml_event_filter={},
+            model_interoperability="pymtlf-image-classification-mnist",
+            targets=(target(branch_b),),
+        )
+        second = next(
+            participant
+            for participant in process.participants
+            if participant.candidate.target.nf_instance_id == branch_b
+        )
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": second.notification_correlation_id,
+                    "mlCorreId": procedure_id,
+                    "x-flTopologyReport": {"nfInstanceId": branch_b},
+                }
+            )
+        )
+        collected = orchestrator.collect_hierarchy_preparation(process.process_id)
+        orchestrator.admit_hierarchy_preparation(process.process_id)
+
+        assert tuple(
+            item.participant_nf_instance_id for item in collected.participants
+        ) == (branch_a, branch_b)
+        orchestrator.remove_protocol_participant(process.process_id, branch_a)
+        assert tuple(
+            participant.candidate.target.nf_instance_id
+            for participant in process.participants
+        ) == (branch_b,)
+        assert [request.method for request in requests] == ["POST", "POST", "DELETE"]
+    finally:
+        orchestrator.close()
+        registry.reset_generation()
+        client.close()
 
 
 def test_fl_client_discovery_requests_training_capability_for_scope_tai():

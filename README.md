@@ -51,7 +51,7 @@ uv run python tools/import_seed_model.py \
   --config config/fl-client-image-classification.yaml \
   --source seed_models/image_classification/mnist \
   --model-id 1001 \
-  --model-interoperability image-classification-pytorch
+  --model-interoperability pymtlf-image-classification-mnist
 ```
 
 Image clients read a deployment-mounted `.npz` shard containing only `images`

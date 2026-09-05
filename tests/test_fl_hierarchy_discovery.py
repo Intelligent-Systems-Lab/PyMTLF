@@ -168,6 +168,55 @@ def test_exact_hierarchy_discovery_resolves_required_capabilities(
     client.close()
 
 
+def test_image_training_contract_maps_to_nrf_vendor_identity() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = json.loads(request.url.params["ml-analytics-info-list"])[0]
+        assert query["mlAnalyticsIds"] == ["X_IMAGE_CLASSIFICATION"]
+        assert query["mlModelInterInfo"] == {"vendorList": ["001122"]}
+        value = profile(LEAF_ID, capability="FL_CLIENT")
+        value["nwdafInfo"]["mlAnalyticsList"][0]["mlAnalyticsIds"] = [
+            "X_IMAGE_CLASSIFICATION"
+        ]
+        return httpx.Response(
+            200,
+            json={"validityPeriod": 60, "nfInstances": [value]},
+            request=request,
+        )
+
+    instance, client = resolver(handler)
+    resolved = instance.resolve(
+        nf_instance_id=LEAF_ID,
+        role=HierarchyNodeRole.LEAF,
+        ml_event="X_IMAGE_CLASSIFICATION",
+        model_interoperability="pymtlf-image-classification-mnist",
+    )
+
+    assert resolved.nf_instance_id == LEAF_ID
+    assert resolved.discovery_scope is not None
+    assert (
+        resolved.discovery_scope.model_interoperability
+        == "pymtlf-image-classification-mnist"
+    )
+    instance.close()
+    client.close()
+
+
+def test_hierarchy_discovery_rejects_unmapped_non_vendor_interoperability() -> None:
+    instance, client = resolver(
+        lambda request: httpx.Response(200, json={}, request=request)
+    )
+
+    with pytest.raises(ValueError, match="VendorId mapping"):
+        instance.resolve(
+            nf_instance_id=LEAF_ID,
+            role=HierarchyNodeRole.LEAF,
+            ml_event="X_IMAGE_CLASSIFICATION",
+            model_interoperability="unknown-image-contract",
+        )
+    instance.close()
+    client.close()
+
+
 @pytest.mark.parametrize(
     "profiles",
     [

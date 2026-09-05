@@ -37,6 +37,7 @@ from py_mtlf.core.fl_flat import FlatFLCoordinator
 from py_mtlf.core.fl_hierarchy_artifacts import HierarchyArtifactService
 from py_mtlf.core.fl_hierarchy_discovery import HierarchyNodeResolver
 from py_mtlf.core.fl_root import FLRootCoordinator
+from py_mtlf.core.fl_round_model_distribution import RoundModelDistribution
 from py_mtlf.core.fl_server import FLClientResolver, FLServerEngine
 from py_mtlf.core.fl_topology import StaticFlatTopologyPlanner, StaticTopologyPlanner
 from py_mtlf.core.fl_workspace import FLWorkspace
@@ -128,6 +129,11 @@ def create_app(
     monitor_registrations = MonitorRegistrationStore(state_lock)
     monitor_subscriptions = MonitorSubscriptionProjectionStore(state_lock)
     adrf_resolver = AdrfResolver(settings.adrf, nwdaf_context)
+    round_model_distribution = RoundModelDistribution(
+        settings.adrf,
+        adrf_resolver,
+        nwdaf_context,
+    )
     fl_workspace = FLWorkspace(settings.federated_learning, settings.artifact)
     local_training = settings.local_training
     fl_client_settings = settings.federated_learning.client
@@ -287,6 +293,7 @@ def create_app(
             fl_workspace,
             experiments=fl_experiments,
             branch_coordinator=fl_branch,
+            round_model_distribution=round_model_distribution,
         )
         if fl_client_settings is not None
         else None
@@ -318,6 +325,8 @@ def create_app(
                 server=fl_server,
                 policy=accuracy_policy,
                 experiments=fl_experiments,
+                hierarchy_contract=orchestration_settings.hierarchy_contract,
+                round_model_distribution=round_model_distribution,
                 terminal_status_ttl_seconds=(
                     settings.federated_learning.lifecycle.terminal_status_ttl_seconds
                 ),
@@ -358,6 +367,13 @@ def create_app(
                     "Containing NWDAF generation cleanup failed owner=%s",
                     type(owner).__name__,
                 )
+        try:
+            round_model_distribution.abort_generation(reason)
+        except Exception as error:
+            errors.append(error)
+            logger.exception(
+                "Containing NWDAF generation round-model cleanup failed"
+            )
         accuracy_policy.abort_generation()
         fl_experiments.reset_generation()
         try:
@@ -419,6 +435,7 @@ def create_app(
             except RuntimeError:
                 logger.exception("FL workspace shutdown cleanup failed")
             publication.close()
+            round_model_distribution.close()
             fl_workspace.close()
             dataset_coordinator.shutdown()
             adrf_resolver.close()
@@ -461,6 +478,7 @@ def create_app(
     )
     app.state.fl_experiments = fl_experiments
     app.state.publication = publication
+    app.state.round_model_distribution = round_model_distribution
     app.state.state_lock = state_lock
     app.include_router(health.router)
     app.include_router(artifacts.router)

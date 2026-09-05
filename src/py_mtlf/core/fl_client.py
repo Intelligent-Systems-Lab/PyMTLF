@@ -33,6 +33,9 @@ from py_mtlf.core.fl_artifacts import (
 from py_mtlf.core.fl_candidate_orchestration import (
     ClientLocalWork,
     IntermediateLocalWork,
+    LocalContractDefaults,
+    LocalExecutionRole,
+    resolve_effective_node_contract,
 )
 from py_mtlf.core.fl_experiment import (
     ExperimentAdmissionClosedError,
@@ -46,6 +49,7 @@ from py_mtlf.core.fl_hierarchy import (
     LeafAssignmentMetadata,
     PreparationOutcome,
 )
+from py_mtlf.core.fl_round_model_distribution import RoundModelDistribution
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     ValidatedArchive,
@@ -64,18 +68,23 @@ from py_mtlf.core.trainer import (
 from py_mtlf.core.training_data import TrainingDatasetBuilder, dataset_evidence
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.core.workloads import (
+    IMAGE_CLASSIFICATION_EVENT,
+    ImageDatasetName,
     WorkloadProfile,
+    image_training_contract,
     validate_image_manifest,
 )
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
 from py_mtlf.wire.features import (
     HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
     feature_intersection,
+    feature_mask,
     includes_feature,
 )
 from py_mtlf.wire.ml_model import MLEventNotification, MLModelAddress
 from py_mtlf.wire.ml_model_training import (
     DelayEventNotif,
+    FlTopologyReport,
     InvalidParameter,
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
@@ -125,6 +134,13 @@ class BranchPreparationResultView(Protocol):
 
 
 class BranchPreparationDispatcher(Protocol):
+    def prepare_protocol(
+        self,
+        *,
+        representation: NwdafMLModelTrainSubsc,
+        reservation_id: str,
+    ) -> FlTopologyReport: ...
+
     def prepare(
         self,
         *,
@@ -147,6 +163,20 @@ class BranchPreparationDispatcher(Protocol):
         upper_training_scope: TrainingScopeDescriptor,
         callback_margin_seconds: int,
         local_work: IntermediateLocalWork | None = None,
+    ) -> BranchArtifactView: ...
+
+    def execute_protocol_round(
+        self,
+        *,
+        representation: NwdafMLModelTrainSubsc,
+        upper_input: LoadedBundle,
+        upper_input_artifact: ArtifactMetadata,
+        upper_model: MLEventNotification,
+        upper_client_subscription_id: str,
+        upper_resource_revision: int,
+        upper_training_scope: TrainingScopeDescriptor,
+        callback_margin_seconds: int,
+        local_work: IntermediateLocalWork,
     ) -> BranchArtifactView: ...
 
     def execute_validation(
@@ -182,6 +212,7 @@ class FLClientResource:
     callback_slot_owned: bool = True
     candidate_contract: bool = False
     hierarchical_feature_negotiated: bool = False
+    protocol_image_dataset: ImageDatasetName | None = None
     client_local_work: ClientLocalWork | None = None
     intermediate_local_work: IntermediateLocalWork | None = None
 
@@ -216,6 +247,7 @@ class FLClientEngine:
         client: httpx.Client | None = None,
         experiments: FLExperimentRegistry | None = None,
         branch_coordinator: BranchPreparationDispatcher | None = None,
+        round_model_distribution: RoundModelDistribution | None = None,
         clock=time.monotonic,
     ) -> None:
         self._settings = settings
@@ -226,6 +258,7 @@ class FLClientEngine:
         self._workspace = workspace
         self._experiments = experiments or FLExperimentRegistry()
         self._branch_coordinator = branch_coordinator
+        self._round_model_distribution = round_model_distribution
         self._trainer = FederatedTrainer(client_settings.training)
         self._device = resolve_device(client_settings.training.device)
         self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
@@ -321,15 +354,22 @@ class FLClientEngine:
         validate_fl_subscription(value)
         candidate_contract = has_candidate_subscription_fields(value)
         if candidate_contract:
+            self._reject_retained_instruction(value)
+            context = self._nwdaf_context.get()
             validate_candidate_subscription_receiver(
                 value,
-                self._nwdaf_context.get().nf_instance_id,
+                context.nf_instance_id,
+            )
+            accepted_offer = (
+                feature_mask(HIERARCHICAL_FL_ORCHESTRATION_FEATURE)
+                if self._can_accept_protocol_resource(value, context)
+                else ""
             )
             value = value.model_copy(
                 update={
                     "supported_features": feature_intersection(
                         value.supported_features or "",
-                        "",
+                        accepted_offer,
                     )
                 },
                 deep=True,
@@ -376,7 +416,11 @@ class FLClientEngine:
                 ):
                     raise ValueError("notifCorreId must be unique")
                 self._resources[resource_id] = resource
-            self._start_resource_operation(resource)
+            self._start_resource_operation(
+                resource,
+                candidate_operation=candidate_contract,
+                initial_candidate_operation=candidate_contract,
+            )
             return self.get(resource_id)
         except Exception:
             with self._lock:
@@ -393,6 +437,7 @@ class FLClientEngine:
         validate_fl_subscription(value)
         candidate_operation = has_candidate_subscription_fields(value)
         if candidate_operation:
+            self._reject_retained_instruction(value)
             with self._lock:
                 resource = self._required(subscription_id)
                 self._ensure_mutable(resource)
@@ -455,7 +500,10 @@ class FLClientEngine:
                     persistent.supported_features or "",
                     HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
                 )
-                self._start_resource_operation(resource)
+                self._start_resource_operation(
+                    resource,
+                    candidate_operation=candidate_operation,
+                )
                 return copy.deepcopy(resource)
             except Exception:
                 self._resources[subscription_id] = previous
@@ -478,6 +526,7 @@ class FLClientEngine:
                 mode="json",
             )
             value = apply_subscription_patch(resource.representation, patch)
+            self._reject_retained_instruction(value)
             if value.fl_topology is not None:
                 validate_candidate_subscription_receiver(
                     value,
@@ -505,9 +554,30 @@ class FLClientEngine:
             subscription_id,
             value,
             persistent,
-            candidate_operation=False,
+            candidate_operation=candidate_operation,
             candidate_contract=candidate_contract,
         )
+
+    @staticmethod
+    def _reject_retained_instruction(value: NwdafMLModelTrainSubsc) -> None:
+        _persistent, operation = split_candidate_operations(value)
+        violations = []
+        if operation.top_level_retained_result_request:
+            violations.append(
+                InvalidParameter(
+                    "x-retainedResultReq",
+                    "retained-result execution is not supported",
+                )
+            )
+        violations.extend(
+            InvalidParameter(
+                "x-flTopology",
+                f"retained-result execution is not supported for node {node_id}",
+            )
+            for node_id in operation.node_requests
+        )
+        if violations:
+            raise RequirementsError(violations)
 
     def delete(self, subscription_id: str) -> None:
         with self._lock:
@@ -619,13 +689,25 @@ class FLClientEngine:
         with self._lock:
             return copy.deepcopy(self._required(subscription_id))
 
-    def _start_resource_operation(self, resource: FLClientResource) -> None:
+    def _start_resource_operation(
+        self,
+        resource: FLClientResource,
+        *,
+        candidate_operation: bool = False,
+        initial_candidate_operation: bool = False,
+    ) -> None:
         if resource.candidate_contract and not resource.hierarchical_feature_negotiated:
             resource.state = FLClientState.READY
             resource.callback_slot_owned = False
             resource.work_slot_owned = False
             self._capacity.release()
             self._outbox_capacity.release()
+            return
+        if candidate_operation:
+            self._start_preparation(
+                resource,
+                protocol_initial=initial_candidate_operation,
+            )
             return
         self._start_operation(resource)
 
@@ -640,6 +722,71 @@ class FLClientEngine:
                     "HierarchicalFLOrch was not negotiated for this resource",
                 )
             ]
+        )
+
+    def _can_accept_protocol_resource(self, value, context) -> bool:
+        node = value.fl_topology
+        if (
+            value.ml_preparation_flag is not True
+            or value.ml_model_infos
+            or node is None
+            or self._round_model_distribution is None
+        ):
+            return False
+        event = value.ml_event_subscriptions[0]
+        try:
+            contract = image_training_contract(
+                event.ml_event,
+                event.model_interoperability,
+            )
+        except ValueError:
+            return False
+        intermediate_role = bool(node.children) or (
+            node.policy is not None
+            and node.policy.allow_additional_candidates is True
+        )
+        required_capabilities = (
+            {FLCapabilityType.SERVER_AND_CLIENT}
+            if intermediate_role
+            else {
+                FLCapabilityType.CLIENT,
+                FLCapabilityType.SERVER_AND_CLIENT,
+            }
+        )
+        if not any(
+            event.ml_event in capability.ml_analytics_ids
+            and capability.fl_capability_type in required_capabilities
+            for capability in context.ml_analytics_capabilities
+        ):
+            return False
+        if intermediate_role:
+            if self._branch_coordinator is None or not hasattr(
+                self._branch_coordinator,
+                "prepare_protocol",
+            ):
+                return False
+            try:
+                resolve_effective_node_contract(
+                    node,
+                    role=LocalExecutionRole.INTERMEDIATE,
+                    defaults=LocalContractDefaults(),
+                )
+            except (RequirementsError, ValueError):
+                return False
+            return True
+        local_data = self._client_settings.training_data
+        return (
+            isinstance(
+                self._client_settings.workload,
+                ImageClassificationWorkloadSettings,
+            )
+            and isinstance(local_data, LocalImageTrainingDataSettings)
+            and local_data.dataset == contract.name.value
+            and event.model_interoperability
+            in self._client_settings.model_interoperability_ids
+            and node.strategy is not None
+            and node.report_after is not None
+            and node.report_after.unit == "epoch"
         )
 
     def _start_operation(self, resource: FLClientResource) -> None:
@@ -698,7 +845,12 @@ class FLClientEngine:
         self._schedule_delay(resource)
         self._submit(self._run_validation, resource.subscription_id, resource.revision)
 
-    def _start_preparation(self, resource: FLClientResource) -> None:
+    def _start_preparation(
+        self,
+        resource: FLClientResource,
+        *,
+        protocol_initial: bool = True,
+    ) -> None:
         value = resource.representation
         window = _requested_window(value)
         event = value.ml_event_subscriptions[0]
@@ -727,6 +879,7 @@ class FLClientEngine:
             resource.revision,
             intent,
             window,
+            protocol_initial,
         )
 
     def _run_preparation(
@@ -735,6 +888,7 @@ class FLClientEngine:
         revision: int,
         intent: RetrainIntent,
         window: AdrfTimeWindow,
+        protocol_initial: bool = True,
     ) -> None:
         unbound_hierarchy_plan_id: str | None = None
         try:
@@ -744,6 +898,15 @@ class FLClientEngine:
                     self._release_work_slot(subscription_id, revision)
                     return
                 value = resource.representation.model_copy(deep=True)
+                candidate_contract = resource.candidate_contract
+            if candidate_contract:
+                self._run_protocol_preparation(
+                    subscription_id,
+                    revision,
+                    value,
+                    initial=protocol_initial,
+                )
+                return
             model_info = value.ml_model_infos[0]
             if model_info.model_file_address is None:
                 raise RuntimeError("FL preparation base model must use mLFileAddr")
@@ -969,6 +1132,171 @@ class FLClientEngine:
             )
             self._release_work_slot(subscription_id, revision)
 
+    def _run_protocol_preparation(
+        self,
+        subscription_id: str,
+        revision: int,
+        value: NwdafMLModelTrainSubsc,
+        *,
+        initial: bool,
+    ) -> None:
+        violations = []
+        if initial and value.ml_preparation_flag is not True:
+            violations.append(
+                InvalidParameter("mLPreFlag", "must be true for protocol preparation")
+            )
+        if initial and value.ml_model_infos:
+            violations.append(
+                InvalidParameter(
+                    "mLModelInfos",
+                    "must be omitted from protocol preparation",
+                )
+            )
+        if value.fl_topology is None:
+            violations.append(
+                InvalidParameter("x-flTopology", "is required for protocol preparation")
+            )
+        if violations:
+            raise RequirementsError(violations)
+        node = value.fl_topology
+        assert node is not None
+        event = value.ml_event_subscriptions[0]
+        contract = image_training_contract(event.ml_event, event.model_interoperability)
+        context = self._nwdaf_context.get()
+        intermediate_role = bool(node.children) or (
+            node.policy is not None
+            and node.policy.allow_additional_candidates is True
+        )
+        required_capabilities = (
+            {FLCapabilityType.SERVER_AND_CLIENT}
+            if intermediate_role
+            else {
+                FLCapabilityType.CLIENT,
+                FLCapabilityType.SERVER_AND_CLIENT,
+            }
+        )
+        if not any(
+            event.ml_event in capability.ml_analytics_ids
+            and capability.fl_capability_type in required_capabilities
+            for capability in context.ml_analytics_capabilities
+        ):
+            raise RuntimeError(
+                "containing NWDAF does not advertise the requested protocol FL capability"
+            )
+        with self._lock:
+            current = self._resources.get(subscription_id)
+            reservation_id = "" if current is None else current.experiment_reservation_id
+        assigned_role = (
+            ExperimentRole.BRANCH
+            if intermediate_role
+            else ExperimentRole.LEAF
+        )
+        experiment = self._experiments.for_client_subscription(subscription_id)
+        if experiment is None or experiment.plan_id is None:
+            self._experiments.bind_plan(
+                reservation_id,
+                value.ml_correlation_id or "",
+                assigned_role,
+            )
+        elif (
+            experiment.plan_id != value.ml_correlation_id
+            or experiment.assigned_role is not assigned_role
+        ):
+            raise RuntimeError("protocol hierarchy binding changed")
+        if intermediate_role:
+            if node.report_after is None or node.report_after.unit != "round":
+                raise RuntimeError(
+                    "protocol Branch requires reportAfter with round unit"
+                )
+            intermediate_work = IntermediateLocalWork(
+                lower_round_count=node.report_after.count
+            )
+            if self._branch_coordinator is None or not hasattr(
+                self._branch_coordinator, "prepare_protocol"
+            ):
+                raise RuntimeError("protocol Branch preparation executor is unavailable")
+            report = self._branch_coordinator.prepare_protocol(
+                representation=value,
+                reservation_id=reservation_id,
+            )
+        else:
+            local_data = self._client_settings.training_data
+            if not isinstance(
+                self._client_settings.workload,
+                ImageClassificationWorkloadSettings,
+            ) or not isinstance(local_data, LocalImageTrainingDataSettings):
+                raise RuntimeError(
+                    "protocol image classification local training is not configured"
+                )
+            if local_data.dataset != contract.name.value:
+                raise RuntimeError(
+                    "protocol image dataset is incompatible with local configuration"
+                )
+            if (
+                event.model_interoperability
+                not in self._client_settings.model_interoperability_ids
+            ):
+                raise RuntimeError(
+                    "protocol model interoperability is not supported locally"
+                )
+            if node.strategy is None or node.report_after is None:
+                raise RuntimeError(
+                    "protocol Leaf requires strategy and reportAfter"
+                )
+            if node.report_after.unit != "epoch":
+                raise RuntimeError("protocol Leaf reportAfter unit must be epoch")
+            client_work = ClientLocalWork(
+                epochs=node.report_after.count,
+                proximal_mu=node.strategy.method_parameters.proximal_mu,
+            )
+            report_values = {
+                "nfInstanceId": context.nf_instance_id,
+                **(
+                    {"policy": node.policy.model_dump(by_alias=True, mode="json")}
+                    if node.policy is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "strategy": node.strategy.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
+                    }
+                    if node.strategy is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "reportAfter": node.report_after.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
+                    }
+                    if node.report_after is not None
+                    else {}
+                ),
+            }
+            report = FlTopologyReport.model_validate(report_values)
+        with self._lock:
+            current = self._resources.get(subscription_id)
+            if current is None or current.revision != revision:
+                return
+            current.protocol_image_dataset = contract.name
+            if intermediate_role:
+                current.intermediate_local_work = intermediate_work
+            else:
+                current.client_local_work = client_work
+            current.state = FLClientState.PREPARATION_RESULT_PENDING
+            self._cancel_delay(subscription_id)
+            notification = NwdafMLModelTrainNotif(
+                notifCorreId=value.notification_correlation_id,
+                mlCorreId=value.ml_correlation_id,
+                fl_topology_report=report,
+            )
+        self._enqueue_delivery(current, notification, FLClientState.PREPARED)
+        self._release_work_slot(subscription_id, revision)
+
     def _preparation_complete(
         self,
         subscription_id: str,
@@ -1041,26 +1369,68 @@ class FLClientEngine:
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
                 preparation_base_artifact = resource.preparation_base_artifact
-            if preparation_base_artifact is None:
-                raise RuntimeError("FL round has no prepared base model")
             model_info = value.ml_model_infos[0]
-            if model_info.model_file_address is None:
-                raise RuntimeError("FL round input must use mLFileAddr")
-            artifact = self._workspace.download(
-                str(model_info.model_file_address.model_url),
-                value.ml_correlation_id or subscription_id,
-                f"round-{value.round_indicator}-input",
-                owner_plan_id=_hierarchy_plan_id(resource),
-            )
+            if model_info.model_adrf is not None:
+                if self._round_model_distribution is None:
+                    raise RuntimeError("ADRF round model retrieval is unavailable")
+                if model_info.model_unique_id is None:
+                    raise RuntimeError("ADRF round input requires modelUniqueId")
+                retrieved = self._round_model_distribution.retrieve(
+                    reference=model_info.model_adrf,
+                    model_unique_id=model_info.model_unique_id,
+                    consumer_nf_instance_id=self._nwdaf_context.get().nf_instance_id,
+                )
+                downloaded = self._workspace.download_adrf_archive(
+                    retrieved.model_url,
+                    value.ml_correlation_id or subscription_id,
+                    f"round-{value.round_indicator}-input",
+                    expected_size=retrieved.model_size,
+                    owner_plan_id=_hierarchy_plan_id(resource),
+                )
+                artifact = downloaded.metadata
+            else:
+                if model_info.model_file_address is None:
+                    raise RuntimeError("FL round input has no supported model transport")
+                artifact = self._workspace.download(
+                    str(model_info.model_file_address.model_url),
+                    value.ml_correlation_id or subscription_id,
+                    f"round-{value.round_indicator}-input",
+                    owner_plan_id=_hierarchy_plan_id(resource),
+                )
             base = self._loader.load(artifact)
             round_input = validate_fl_artifact_manifest(base.manifest)
             if not isinstance(round_input, RoundInputArtifact):
                 raise RuntimeError("FL round input is not a ROUND_INPUT artifact")
             if (
                 round_input.fl_metadata.ml_corre_id != value.ml_correlation_id
-                or round_input.fl_metadata.round_ind != value.round_indicator
+                or (
+                    not resource.candidate_contract
+                    and round_input.fl_metadata.round_ind != value.round_indicator
+                )
             ):
                 raise RuntimeError("FL round input identity does not match the command")
+            if preparation_base_artifact is None:
+                if not resource.candidate_contract:
+                    raise RuntimeError("FL round has no prepared base model")
+                event = value.ml_event_subscriptions[0]
+                if resource.intermediate_local_work is not None:
+                    self._validate_protocol_intermediate_bundle(
+                        base,
+                        event.ml_event,
+                        event.model_interoperability,
+                    )
+                else:
+                    self._validate_workload_bundle(
+                        base,
+                        event.ml_event,
+                        event.model_interoperability,
+                    )
+                with self._lock:
+                    current = self._resources.get(subscription_id)
+                    if current is None or current.revision != revision:
+                        return
+                    current.preparation_base_artifact = artifact
+                    preparation_base_artifact = artifact
             prepared_base = self._loader.load(preparation_base_artifact)
             validate_model_compatibility(prepared_base, base)
             hierarchy_metadata = (
@@ -1068,6 +1438,46 @@ class FLClientEngine:
                 if resource.hierarchy_assignment is not None
                 else None
             )
+            if (
+                resource.candidate_contract
+                and resource.intermediate_local_work is not None
+            ):
+                if self._branch_coordinator is None:
+                    raise RuntimeError("protocol Branch round executor is unavailable")
+                if resource.intermediate_local_work is None:
+                    raise RuntimeError("protocol Branch local round contract is unavailable")
+                published = self._branch_coordinator.execute_protocol_round(
+                    representation=value,
+                    upper_input=base,
+                    upper_input_artifact=artifact,
+                    upper_model=model_info,
+                    upper_client_subscription_id=subscription_id,
+                    upper_resource_revision=revision,
+                    upper_training_scope=resource.scope,
+                    callback_margin_seconds=(
+                        self._client_settings.callback_deadline_margin_seconds
+                    ),
+                    local_work=resource.intermediate_local_work,
+                )
+                notification = NwdafMLModelTrainNotif(
+                    notifCorreId=value.notification_correlation_id,
+                    mlCorreId=value.ml_correlation_id,
+                    roundInd=value.round_indicator,
+                    mLModelInfos=[
+                        MLEventNotification(
+                            event=value.ml_event_subscriptions[0].ml_event,
+                            mLFileAddr=MLModelAddress(mLModelUrl=published.url),
+                        )
+                    ],
+                )
+                with self._lock:
+                    current = self._resources.get(subscription_id)
+                    if current is not resource or current.revision != revision:
+                        return
+                    current.state = FLClientState.RESULT_PENDING
+                    self._cancel_delay(subscription_id)
+                self._enqueue_delivery(current, notification, FLClientState.READY)
+                return
             if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
                 if self._branch_coordinator is None:
                     raise RuntimeError("Branch hierarchy round requires the Branch coordinator")
@@ -1236,6 +1646,13 @@ class FLClientEngine:
         if bundle.workload_profile is WorkloadProfile.IMAGE_CLASSIFICATION:
             if not image_workload:
                 raise RuntimeError("FL preparation model workload is incompatible")
+            if (
+                ml_event != IMAGE_CLASSIFICATION_EVENT
+                or bundle.manifest.get("analytics_event") != ml_event
+            ):
+                raise RuntimeError(
+                    "FL preparation image analytics event is incompatible"
+                )
             if not isinstance(
                 self._client_settings.training_data,
                 LocalImageTrainingDataSettings,
@@ -1251,6 +1668,26 @@ class FLClientEngine:
             raise RuntimeError("FL preparation model workload is incompatible")
         if bundle.manifest.get("analytics_event") != ml_event:
             raise RuntimeError("FL preparation base model analytics event is incompatible")
+
+    @staticmethod
+    def _validate_protocol_intermediate_bundle(
+        bundle: LoadedBundle,
+        ml_event: str,
+        model_interoperability: str,
+    ) -> None:
+        if bundle.manifest.get("model_interoperability") != model_interoperability:
+            raise RuntimeError("FL preparation base model interoperability is incompatible")
+        if bundle.workload_profile is not WorkloadProfile.IMAGE_CLASSIFICATION:
+            raise RuntimeError("FL preparation model workload is incompatible")
+        if (
+            ml_event != IMAGE_CLASSIFICATION_EVENT
+            or bundle.manifest.get("analytics_event") != ml_event
+        ):
+            raise RuntimeError("FL preparation image analytics event is incompatible")
+        expected = image_training_contract(ml_event, model_interoperability)
+        actual = validate_image_manifest(bundle.manifest)
+        if actual != expected:
+            raise RuntimeError("FL preparation image dataset is incompatible")
 
     def _run_validation(self, subscription_id: str, revision: int) -> None:
         try:

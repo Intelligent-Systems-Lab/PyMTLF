@@ -54,6 +54,11 @@ IMAGE_CLASSIFICATION_BUNDLE_FILES = frozenset(
     {"config.json", "model.py", "model.npy"}
 )
 IMAGE_NORMALIZATION = "uint8_to_float32_div_255"
+IMAGE_CLASSIFICATION_EVENT = "X_IMAGE_CLASSIFICATION"
+IMAGE_MODEL_INTEROPERABILITY = {
+    ImageDatasetName.MNIST: "pymtlf-image-classification-mnist",
+    ImageDatasetName.CIFAR10: "pymtlf-image-classification-cifar10",
+}
 
 
 def workload_profile(manifest: Mapping[str, object]) -> WorkloadProfile:
@@ -77,6 +82,18 @@ def image_dataset_contract(value: object) -> ImageDatasetContract:
     except (TypeError, ValueError) as error:
         raise WorkloadContractError("image dataset is unsupported") from error
     return IMAGE_DATASET_CONTRACTS[name]
+
+
+def image_training_contract(
+    ml_event: str,
+    model_interoperability: str,
+) -> ImageDatasetContract:
+    if ml_event != IMAGE_CLASSIFICATION_EVENT:
+        raise WorkloadContractError("image classification event is unsupported")
+    for dataset, interoperability_id in IMAGE_MODEL_INTEROPERABILITY.items():
+        if model_interoperability == interoperability_id:
+            return IMAGE_DATASET_CONTRACTS[dataset]
+    raise WorkloadContractError("image model interoperability is unsupported")
 
 
 def validate_image_manifest(manifest: Mapping[str, object]) -> ImageDatasetContract:

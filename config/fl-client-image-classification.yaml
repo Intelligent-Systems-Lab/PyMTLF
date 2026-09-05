@@ -27,7 +27,7 @@ federated_learning:
       dataset: "mnist"
       shard_path: "/data/train.npz"
     model_interoperability_ids:
-      - "image-classification-pytorch"
+      - "pymtlf-image-classification-mnist"
     training:
       device: "cpu"
       batch_size: 32

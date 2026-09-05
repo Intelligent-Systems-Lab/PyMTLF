@@ -73,21 +73,22 @@ def test_import_traffic_seed_uses_current_contract(tmp_path):
     repository.publish(output)
 
 
-def test_import_image_seed_omits_standard_event_and_scaler(tmp_path):
+def test_import_image_seed_records_protocol_event_and_omits_scaler(tmp_path):
     output = tmp_path / "image.tar.gz"
     build_seed_bundle(
         Path("seed_models/image_classification/mnist"),
         output,
         model_id=2,
-        event=None,
-        model_interoperability="image-classification-pytorch",
+        event="X_IMAGE_CLASSIFICATION",
+        model_interoperability="pymtlf-image-classification-mnist",
     )
 
     value, names = manifest(output)
 
     assert value["workload_profile"] == "image_classification"
     assert value["initialization_seed"] == 101
-    assert "analytics_event" not in value
+    assert value["analytics_event"] == "X_IMAGE_CLASSIFICATION"
+    assert value["model_interoperability"] == "pymtlf-image-classification-mnist"
     assert "SCALER_PATH" not in value
     assert names == {"config.json", "model.py", "model.npy"}
     repository = ArtifactRepository(tmp_path / "artifacts", ArtifactSettings())
@@ -95,8 +96,8 @@ def test_import_image_seed_omits_standard_event_and_scaler(tmp_path):
     repository.publish(output)
 
 
-def test_import_image_seed_rejects_analytics_event(tmp_path):
-    with pytest.raises(ValueError, match="does not accept"):
+def test_import_image_seed_rejects_wrong_analytics_event(tmp_path):
+    with pytest.raises(ValueError, match="requires X_IMAGE_CLASSIFICATION"):
         build_seed_bundle(
             Path("seed_models/image_classification/mnist"),
             tmp_path / "image.tar.gz",

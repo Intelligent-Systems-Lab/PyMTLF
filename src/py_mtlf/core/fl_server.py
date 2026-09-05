@@ -54,10 +54,16 @@ from py_mtlf.core.publication import PublicationCoordinator, ValidatedCandidate
 from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
+from py_mtlf.wire.features import (
+    HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
+    feature_mask,
+    includes_feature,
+)
 from py_mtlf.wire.ml_model import MLEventNotification, MLEventSubscription, MLModelAddress
 from py_mtlf.wire.ml_model_training import (
     DataAvReq,
     DCCFEvent,
+    FlTopologyNode,
     MLModelTrainInfo,
     MLTrainReportInfo,
     NwdafMLModelTrainNotif,
@@ -116,6 +122,13 @@ class HierarchyPreparationTarget:
     assignment_url: str
 
 
+@dataclass(frozen=True)
+class ProtocolPreparationTarget:
+    participant_nf_instance_id: str
+    candidate: FLClientCandidate
+    topology: FlTopologyNode
+
+
 @dataclass
 class FLParticipant:
     scope: FlatParticipantScope | ScopeReference
@@ -134,6 +147,7 @@ class FLParticipant:
     granted_extension_seconds: int = 0
     expected_training_scope: TrainingScopeDescriptor | None = None
     training_sample_count: int = 0
+    accepted_features: str = ""
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -175,6 +189,7 @@ class FLProcess:
     hierarchy_validation: HierarchyValidation | None = None
     hierarchy_state_observer: Callable[[FLServerState], None] | None = None
     hierarchy_selected_participant_ids: frozenset[str] = frozenset()
+    protocol_hierarchy: bool = False
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock())
     )
@@ -366,6 +381,10 @@ class FLServerEngine:
         )
         self._futures: set[Future] = set()
         self._closing = threading.Event()
+
+    @property
+    def default_protocol_client_epochs(self) -> int:
+        return self._server_settings.client_training.epochs
 
     def close(self) -> None:
         self._closing.set()
@@ -575,6 +594,198 @@ class FLServerEngine:
                 self._processes.pop(process.process_id, None)
             raise
 
+    def start_protocol_preparation(
+        self,
+        *,
+        ml_correlation_id: str,
+        reservation_id: str,
+        ml_event: str,
+        ml_event_filter: dict,
+        model_interoperability: str,
+        targets: tuple[ProtocolPreparationTarget, ...],
+    ) -> FLProcess:
+        with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("FL Server is closing")
+            generation = self._generation
+            if ml_correlation_id in self._processes:
+                raise RuntimeError("protocol hierarchy process already exists")
+        if not ml_correlation_id.strip():
+            raise ValueError("protocol hierarchy requires mlCorreId")
+        if not targets:
+            raise ValueError("protocol hierarchy requires at least one participant target")
+        participant_ids = tuple(item.participant_nf_instance_id for item in targets)
+        if participant_ids != tuple(sorted(participant_ids)) or len(participant_ids) != len(
+            set(participant_ids)
+        ):
+            raise ValueError(
+                "protocol participant targets must be unique and canonically ordered"
+            )
+        for target in targets:
+            if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
+                raise ValueError(
+                    "protocol participant target identity does not match its candidate"
+                )
+            if target.topology.nf_instance_id != target.participant_nf_instance_id:
+                raise ValueError(
+                    "protocol participant target identity does not match its topology"
+                )
+        process = FLProcess(
+            process_id=ml_correlation_id,
+            intent=None,
+            generation=generation,
+            experiment_reservation_id=reservation_id,
+            hierarchy_plan_id=ml_correlation_id,
+            protocol_hierarchy=True,
+        )
+        self._experiments.attach_server(
+            reservation_id,
+            ml_correlation_id,
+            process.process_id,
+        )
+        process.participants = [
+            FLParticipant(
+                scope=ScopeReference(
+                    scope_key=(
+                        f"hierarchy:{ml_correlation_id}:"
+                        f"{target.participant_nf_instance_id}"
+                    ),
+                    consumer_id=target.participant_nf_instance_id,
+                    model_ids=(),
+                    ml_event=ml_event,
+                    ml_event_filter=dict(ml_event_filter),
+                    target_ue=None,
+                ),
+                candidate=target.candidate,
+                notification_correlation_id=str(uuid4()),
+            )
+            for target in targets
+        ]
+        with self._lock:
+            if generation != self._generation:
+                self._experiments.detach_server(reservation_id, process.process_id)
+                raise RuntimeError("containing NWDAF process generation changed")
+            self._processes[process.process_id] = process
+            for participant in process.participants:
+                self._correlations[participant.notification_correlation_id] = (
+                    process.process_id
+                )
+        process.state = FLServerState.PREPARATION_CREATING
+        for participant, target in zip(process.participants, targets, strict=True):
+            self._attempt_protocol_preparation(
+                process,
+                participant,
+                model_interoperability,
+                target.topology,
+            )
+        process.state = FLServerState.PREPARATION_WAITING
+        return process
+
+    def add_protocol_preparation_targets(
+        self,
+        *,
+        process_id: str,
+        ml_event: str,
+        ml_event_filter: dict,
+        model_interoperability: str,
+        targets: tuple[ProtocolPreparationTarget, ...],
+    ) -> None:
+        if not targets:
+            return
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.protocol_hierarchy:
+            raise KeyError(process_id)
+        if process.state not in {
+            FLServerState.PREPARATION_EVALUATING,
+            FLServerState.READY,
+        }:
+            raise RuntimeError("protocol participants cannot change during an active operation")
+        participant_ids = tuple(item.participant_nf_instance_id for item in targets)
+        if participant_ids != tuple(sorted(participant_ids)) or len(participant_ids) != len(
+            set(participant_ids)
+        ):
+            raise ValueError("protocol participant targets must be unique and canonically ordered")
+        existing_ids = {
+            item.candidate.target.nf_instance_id for item in process.participants
+        }
+        for target in targets:
+            if target.participant_nf_instance_id in existing_ids:
+                raise ValueError("protocol participant target already exists")
+            if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
+                raise ValueError(
+                    "protocol participant target identity does not match its candidate"
+                )
+            if target.topology.nf_instance_id != target.participant_nf_instance_id:
+                raise ValueError(
+                    "protocol participant target identity does not match its topology"
+                )
+        added = [
+            FLParticipant(
+                scope=ScopeReference(
+                    scope_key=f"hierarchy:{process_id}:{target.participant_nf_instance_id}",
+                    consumer_id=target.participant_nf_instance_id,
+                    model_ids=(),
+                    ml_event=ml_event,
+                    ml_event_filter=dict(ml_event_filter),
+                    target_ue=None,
+                ),
+                candidate=target.candidate,
+                notification_correlation_id=str(uuid4()),
+            )
+            for target in targets
+        ]
+        with self._lock:
+            self._ensure_process_generation(process)
+            process.participants.extend(added)
+            process.participants.sort(
+                key=lambda item: item.candidate.target.nf_instance_id
+            )
+            for participant in added:
+                self._correlations[participant.notification_correlation_id] = process.process_id
+        process.state = FLServerState.PREPARATION_CREATING
+        for participant, target in zip(added, targets, strict=True):
+            self._attempt_protocol_preparation(
+                process,
+                participant,
+                model_interoperability,
+                target.topology,
+            )
+        process.state = FLServerState.PREPARATION_WAITING
+
+    def remove_protocol_participant(
+        self,
+        process_id: str,
+        participant_nf_instance_id: str,
+    ) -> None:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.protocol_hierarchy:
+            raise KeyError(process_id)
+        if process.state not in {
+            FLServerState.PREPARATION_EVALUATING,
+            FLServerState.READY,
+        }:
+            raise RuntimeError("protocol participants cannot change during an active operation")
+        nf_id = normalize_nf_instance_id(participant_nf_instance_id)
+        participant = next(
+            (
+                item
+                for item in process.participants
+                if item.candidate.target.nf_instance_id == nf_id
+            ),
+            None,
+        )
+        if participant is None:
+            raise KeyError(nf_id)
+        if participant.resource_location:
+            failure = self._cleanup_participant(process, participant)
+            if failure:
+                raise RuntimeError(failure)
+        with self._lock:
+            self._correlations.pop(participant.notification_correlation_id, None)
+            process.participants.remove(participant)
+
     def cancel_hierarchy_preparation(self, process_id: str, reason: str) -> None:
         with self._lock:
             process = self._processes.get(process_id)
@@ -664,6 +875,7 @@ class FLServerEngine:
                 notification_correlation_id=identity.notification_correlation_id,
                 expected_round_indicator=identity.expected_round_indicator,
                 notification_method=identity.notification_method,
+                bound_participant_nf_instance_id=participant_id,
             )
             try:
                 validate_fl_notification(notification, identity)
@@ -674,7 +886,9 @@ class FLServerEngine:
                     process.condition.notify_all()
                 raise
             terminal_outcome = bool(
-                notification.ml_model_infos or notification.termination_request
+                notification.ml_model_infos
+                or notification.termination_request
+                or notification.fl_topology_report
             )
             if not (active_preparation or active_round):
                 if terminal_outcome and (
@@ -722,7 +936,14 @@ class FLServerEngine:
                     )
                     process.condition.notify_all()
                     return
-                if not notification.ml_model_infos and not notification.termination_request:
+                if (
+                    not notification.ml_model_infos
+                    and not notification.termination_request
+                    and not (
+                        process.protocol_hierarchy
+                        and notification.fl_topology_report is not None
+                    )
+                ):
                     participant.preparation_failure = (
                         "notification does not contain a preparation outcome"
                     )
@@ -914,6 +1135,8 @@ class FLServerEngine:
         round_indicator: int,
         round_input_url: str,
         round_input_artifact: FLWorkspaceArtifact | None = None,
+        round_input_model: MLEventNotification | None = None,
+        input_round_indicator: int | None = None,
         expected_result_type: RoundLocalResultType,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
         selected_participant_nf_instance_ids: tuple[str, ...] | None = None,
@@ -983,13 +1206,22 @@ class FLServerEngine:
                 participant.delay_extensions = 0
                 participant.requested_extension = 0
                 participant.granted_extension_seconds = 0
-                self._patch_round(
-                    process,
-                    participant,
-                    round_indicator,
-                    round_input_url,
-                    timeout_seconds=timeout,
-                )
+                if round_input_model is None:
+                    self._patch_round(
+                        process,
+                        participant,
+                        round_indicator,
+                        round_input_url,
+                        timeout_seconds=timeout,
+                    )
+                else:
+                    self._patch_round_model(
+                        process,
+                        participant,
+                        round_indicator,
+                        round_input_model,
+                        timeout_seconds=timeout,
+                    )
             self._raise_if_failed(process)
             process.state = FLServerState.ROUND_WAITING
             if state_observer is not None:
@@ -1042,6 +1274,7 @@ class FLServerEngine:
             )
             aggregate_options = {
                 "round_input_artifact": round_input_artifact,
+                "expected_input_round": input_round_indicator,
                 "expected_result_type": expected_result_type,
                 "expected_subordinates": expected_subordinates,
             }
@@ -1714,6 +1947,130 @@ class FLServerEngine:
             participant.resource_location = ""
             raise RuntimeError(process.failure)
 
+    def _create_protocol_preparation(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+        model_interoperability: str,
+        topology: FlTopologyNode,
+    ) -> None:
+        now = datetime.now(UTC)
+        value = NwdafMLModelTrainSubsc(
+            mLEventSubscs=[
+                MLEventSubscription(
+                    mLEvent=participant.scope.ml_event,
+                    mLEventFilter=participant.scope.ml_event_filter,
+                    modelInterInfo=model_interoperability,
+                )
+            ],
+            notifUri=self._server_settings.callback_uri,
+            notifCorreId=participant.notification_correlation_id,
+            mlCorreId=process.process_id,
+            suppFeats=feature_mask(HIERARCHICAL_FL_ORCHESTRATION_FEATURE),
+            mLPreFlag=True,
+            eventReq=ReportingInformation(notifMethod="ON_EVENT_DETECTION"),
+            mLModelTrainInfos=[
+                MLModelTrainInfo(
+                    dataAvReq=DataAvReq(
+                        inpEvents=[DCCFEvent(nwdafEvent=participant.scope.ml_event)],
+                        minNumSamples=1,
+                        timeWindows=[
+                            TimeWindow(
+                                startTime=now
+                                - timedelta(
+                                    seconds=(
+                                        self._server_settings.preparation_data_window_seconds
+                                    )
+                                ),
+                                stopTime=now,
+                            )
+                        ],
+                    ),
+                    timeAvReq=(
+                        f"PT{self._server_settings.preparation_timeout_seconds}S"
+                    ),
+                )
+            ],
+            mLTrainRepInfo=MLTrainReportInfo(
+                maxResTime=self._server_settings.preparation_timeout_seconds
+            ),
+            fl_topology=topology,
+        )
+        response = self._client.post(
+            self._go_base() + "/internal/v1/ml-model-training/subscriptions",
+            headers=selected_target_headers(participant.candidate.target),
+            json=value.model_dump(by_alias=True, exclude_none=True, mode="json"),
+        )
+        location = response.headers.get("Location", "")
+        if response.status_code != 201 or not location:
+            raise RuntimeError(
+                "protocol participant preparation create failed with "
+                f"{response.status_code}: {response.text}"
+            )
+        participant.resource_location = location
+        try:
+            accepted = NwdafMLModelTrainSubsc.model_validate(response.json())
+        except ValueError as error:
+            self._cleanup_participant(process, participant)
+            participant.resource_location = ""
+            raise RuntimeError(
+                "protocol participant returned an invalid accepted representation"
+            ) from error
+        participant.accepted_features = accepted.supported_features or ""
+        if not includes_feature(
+            participant.accepted_features,
+            HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
+        ):
+            cleanup_failure = self._cleanup_participant(process, participant)
+            participant.resource_location = ""
+            participant.preparation_failure = (
+                "FEATURE_NOT_SUPPORTED"
+                + (f": {cleanup_failure}" if cleanup_failure else "")
+            )
+            raise RuntimeError(participant.preparation_failure)
+        if (
+            accepted.ml_correlation_id != process.process_id
+            or accepted.notification_correlation_id
+            != participant.notification_correlation_id
+        ):
+            self._cleanup_participant(process, participant)
+            participant.resource_location = ""
+            raise RuntimeError(
+                "protocol participant changed the accepted resource identity"
+            )
+        participant.expected_training_scope = TrainingScopeDescriptor.from_training_request(
+            value,
+            0,
+        )
+        with process.condition:
+            aborted = bool(process.failure)
+        if aborted:
+            self._cleanup_participant(process, participant)
+            participant.resource_location = ""
+            raise RuntimeError(process.failure)
+
+    def _attempt_protocol_preparation(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+        model_interoperability: str,
+        topology: FlTopologyNode,
+    ) -> None:
+        try:
+            self._ensure_process_generation(process)
+            self._create_protocol_preparation(
+                process,
+                participant,
+                model_interoperability,
+                topology,
+            )
+        except Exception as error:
+            with process.condition:
+                if not participant.preparation_failure:
+                    participant.preparation_failure = _protocol_candidate_failure(error)
+                participant.preparation_complete = True
+                process.condition.notify_all()
+
     def _patch_round(
         self,
         process: FLProcess,
@@ -1775,6 +2132,35 @@ class FLServerEngine:
         if response.status_code not in {200, 204}:
             raise RuntimeError(
                 f"participant final validation patch failed with {response.status_code}"
+            )
+
+    def _patch_round_model(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+        round_indicator: int,
+        model: MLEventNotification,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        if model.event != participant.scope.ml_event:
+            raise ValueError("round model event does not match the participant scope")
+        patch = NwdafMLModelTrainSubscPatch(
+            mLPreFlag=False,
+            roundInd=round_indicator,
+            mLModelInfos=[model.model_copy(deep=True)],
+            mLTrainRepInfo=MLTrainReportInfo(
+                maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
+            ),
+        )
+        response = self._client.patch(
+            participant.resource_location,
+            headers={"Content-Type": "application/merge-patch+json"},
+            content=patch.model_dump_json(by_alias=True, exclude_none=True),
+        )
+        if response.status_code not in {200, 204}:
+            raise RuntimeError(
+                f"participant protocol round patch failed with {response.status_code}"
             )
 
     def _wait(
@@ -1880,7 +2266,7 @@ class FLServerEngine:
         for attempt in range(self._server_settings.cleanup.max_attempts):
             try:
                 response = self._client.delete(participant.resource_location)
-                if response.status_code in {204, 404}:
+                if response.status_code in {200, 204, 404}:
                     logger.info(
                         "FL participant resource deleted process_id=%s nf=%s location=%s status=%s",
                         process.process_id,
@@ -1936,6 +2322,7 @@ class FLServerEngine:
         round_indicator: int,
         *,
         round_input_artifact: FLWorkspaceArtifact,
+        expected_input_round: int | None = None,
         expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
         participant_nf_instance_ids: tuple[str, ...] | None = None,
@@ -1949,7 +2336,12 @@ class FLServerEngine:
             raise RuntimeError("Server aggregation input is not a ROUND_INPUT artifact")
         if (
             input_contract.fl_metadata.ml_corre_id != process.process_id
-            or input_contract.fl_metadata.round_ind != round_indicator
+            or input_contract.fl_metadata.round_ind
+            != (
+                round_indicator
+                if expected_input_round is None
+                else expected_input_round
+            )
         ):
             raise RuntimeError("Server aggregation input identity does not match round")
         included_ids = (
@@ -2408,6 +2800,15 @@ def _assign(
     if len(assignments) < 2:
         raise RuntimeError("the first FL profile requires two distinct clients")
     return tuple(assignments)
+
+
+def _protocol_candidate_failure(error: Exception) -> str:
+    detail = str(error)
+    if detail.startswith("FEATURE_NOT_SUPPORTED"):
+        return "FEATURE_NOT_SUPPORTED"
+    if isinstance(error, httpx.HTTPError):
+        return "COMMUNICATION_FAILURE"
+    return "REQUIREMENTS_NOT_MET"
 
 
 def _scope_tais(scope: FlatParticipantScope | ScopeReference) -> set[str]:

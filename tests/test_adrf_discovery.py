@@ -30,6 +30,56 @@ def test_configured_mode_bypasses_go_discovery():
     client.close()
 
 
+def test_model_resolution_requires_exact_adrf_identity():
+    resolver = AdrfResolver(
+        AdrfSettings(
+            mode="configured",
+            configured_endpoint="http://adrf.example:9888",
+            configured_nf_instance_id="adrf-a",
+        ),
+        context_client(),
+    )
+
+    assert resolver.resolve_model("adrf-a") is not None
+    assert resolver.resolve_model("adrf-b") is None
+    resolver.close()
+
+
+def test_nrf_model_resolution_passes_required_identity_to_go_discovery():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["service-names"] == "nadrf-mlmodelmanagement"
+        assert request.url.params["ml-model-storage-ind"] == "true"
+        assert request.url.params["target-nf-instance-id"] == "adrf-a"
+        return httpx.Response(
+            200,
+            json={
+                "validityPeriod": 60,
+                "nfInstances": [
+                    {
+                        "nfInstanceId": "adrf-a",
+                        "nfStatus": "REGISTERED",
+                        "nfServices": [
+                            {
+                                "serviceName": "nadrf-mlmodelmanagement",
+                                "nfServiceStatus": "REGISTERED",
+                                "apiPrefix": "http://adrf-a.example:9888",
+                            }
+                        ],
+                    }
+                ],
+            },
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    resolver = AdrfResolver(AdrfSettings(mode="nrf"), context_client(), client)
+
+    target = resolver.resolve_model("adrf-a")
+    assert target is not None
+    assert target.nf_instance_id == "adrf-a"
+    client.close()
+
+
 def test_nrf_mode_selects_deterministically_and_reuses_valid_result():
     calls = 0
 

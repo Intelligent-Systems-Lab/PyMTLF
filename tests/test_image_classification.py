@@ -37,7 +37,13 @@ from py_mtlf.core.image_classification import (
 from py_mtlf.core.seed_import import build_seed_bundle
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
-from py_mtlf.core.workloads import ImageDatasetName
+from py_mtlf.core.workloads import (
+    IMAGE_CLASSIFICATION_EVENT,
+    IMAGE_MODEL_INTEROPERABILITY,
+    ImageDatasetName,
+    WorkloadContractError,
+    image_training_contract,
+)
 from py_mtlf.wire.ml_model_training import (
     NwdafMLModelTrainNotif,
     NwdafMLModelTrainSubsc,
@@ -77,6 +83,27 @@ def load_seed_bundle(tmp_path: Path, dataset: str, model_id: int = 1) -> LoadedB
     repository = ArtifactRepository(tmp_path / f"{dataset}-artifacts", ArtifactSettings())
     repository.open()
     return TrustedBundleLoader().load(repository.publish(bundle_path))
+
+
+@pytest.mark.parametrize("dataset", [ImageDatasetName.MNIST, ImageDatasetName.CIFAR10])
+def test_protocol_image_training_contract_selects_dataset(dataset):
+    contract = image_training_contract(
+        IMAGE_CLASSIFICATION_EVENT,
+        IMAGE_MODEL_INTEROPERABILITY[dataset],
+    )
+
+    assert contract.name is dataset
+
+
+def test_protocol_image_training_contract_rejects_unknown_interoperability():
+    with pytest.raises(WorkloadContractError, match="interoperability"):
+        image_training_contract(IMAGE_CLASSIFICATION_EVENT, "unknown")
+
+
+def test_image_seed_bundle_records_protocol_event(tmp_path):
+    bundle = load_seed_bundle(tmp_path, "mnist")
+
+    assert bundle.manifest["analytics_event"] == IMAGE_CLASSIFICATION_EVENT
 
 
 def image_round_request(model_url: str) -> NwdafMLModelTrainSubsc:

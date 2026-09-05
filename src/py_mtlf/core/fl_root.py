@@ -41,6 +41,7 @@ from py_mtlf.core.fl_orchestration import (
     TopLevelModelFamilyNotFoundError,
     TopLevelRequestConflictError,
 )
+from py_mtlf.core.fl_round_model_distribution import RoundModelDistribution
 from py_mtlf.core.fl_server import (
     FLClientCandidate,
     FLProcess,
@@ -48,12 +49,21 @@ from py_mtlf.core.fl_server import (
     FLServerState,
     HierarchyPreparationCollection,
     HierarchyPreparationTarget,
+    ProtocolPreparationTarget,
 )
 from py_mtlf.core.fl_topology import TopologyPlanner
 from py_mtlf.core.fl_workspace import FLWorkspace
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
 from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
 from py_mtlf.core.trainer import TrustedBundleLoader
+from py_mtlf.wire.ml_model import MLEventNotification
+from py_mtlf.wire.ml_model_training import (
+    FlPolicy,
+    FlReportAfter,
+    FlStrategy,
+    FlTopologyNode,
+    FlTopologyReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +184,7 @@ class _RootRequestRecord:
     published_model_id: int | None = None
     terminal_at: float | None = None
     terminal_deadline: float | None = None
+    workspace_retained: bool = False
     generation: int = 0
     future: Future | None = field(default=None, repr=False)
 
@@ -194,11 +205,17 @@ class FLRootCoordinator:
         policy: AccuracyPolicy,
         experiments: FLExperimentRegistry,
         loader: TrustedBundleLoader | None = None,
+        hierarchy_contract: str = "model_bundle",
+        round_model_distribution: RoundModelDistribution | None = None,
         terminal_status_ttl_seconds: int = 3600,
         clock=time.monotonic,
     ) -> None:
         if terminal_status_ttl_seconds <= 0:
             raise ValueError("terminal_status_ttl_seconds must be positive")
+        if hierarchy_contract not in {"model_bundle", "protocol"}:
+            raise ValueError("hierarchy_contract must be model_bundle or protocol")
+        if hierarchy_contract == "protocol" and round_model_distribution is None:
+            raise ValueError("protocol hierarchy requires round model distribution")
         self._strategy = FederatedStrategy(
             algorithm=FedProxAlgorithm(
                 name=strategy.algorithm.name,
@@ -219,6 +236,8 @@ class FLRootCoordinator:
         self._policy = policy
         self._experiments = experiments
         self._loader = loader or TrustedBundleLoader()
+        self._hierarchy_contract = hierarchy_contract
+        self._round_model_distribution = round_model_distribution
         self._terminal_status_ttl_seconds = terminal_status_ttl_seconds
         self._clock = clock
         self._condition = threading.Condition(threading.RLock())
@@ -341,6 +360,14 @@ class FLRootCoordinator:
                 self._retain_terminal_record_locked(active)
                 self._active_request_id = None
                 self._condition.notify_all()
+        with self._condition:
+            retained = tuple(
+                record for record in self._records.values() if record.workspace_retained
+            )
+            for record in retained:
+                record.workspace_retained = False
+        for record in retained:
+            self._release_retained_workspace(record)
         self._resolver.close()
 
     def abort_generation(self, reason: str) -> None:
@@ -353,9 +380,16 @@ class FLRootCoordinator:
                 else None
             )
             self._active_request_id = None
+            retained = tuple(
+                record for record in self._records.values() if record.workspace_retained
+            )
+            for record in retained:
+                record.workspace_retained = False
             self._records.clear()
             self._failure_latched = False
             self._condition.notify_all()
+        for record in retained:
+            self._release_retained_workspace(record)
         if active is None:
             return
         if active.server_process_id:
@@ -472,8 +506,15 @@ class FLRootCoordinator:
             if current is None:
                 raise RuntimeError("FL base model is no longer current")
             descriptor = current.descriptor
-            if descriptor.event != "UE_COMMUNICATION":
-                raise RuntimeError("hierarchical FL currently supports only UE_COMMUNICATION")
+            if self._hierarchy_contract == "model_bundle":
+                if descriptor.event != "UE_COMMUNICATION":
+                    raise RuntimeError(
+                        "legacy hierarchical FL currently supports only UE_COMMUNICATION"
+                    )
+            elif descriptor.event != "X_IMAGE_CLASSIFICATION":
+                raise RuntimeError(
+                    "protocol hierarchical FL requires X_IMAGE_CLASSIFICATION"
+                )
             if not descriptor.model_interoperability:
                 raise RuntimeError("FL base model has no model interoperability identifier")
             context = self._nwdaf_context.get()
@@ -511,6 +552,18 @@ class FLRootCoordinator:
             if latest is None or latest.artifact.key != current.artifact.key:
                 cause = RootFailureCause.VALIDATION_FAILED
                 raise RuntimeError("FL base model changed during hierarchy validation")
+
+            if self._hierarchy_contract == "protocol":
+                process = self._run_protocol_hierarchy(
+                    record=record,
+                    current=current,
+                    base=base,
+                    descriptor=descriptor,
+                    context=context,
+                    topology=topology,
+                    resolved_branches=tuple(resolved_branches),
+                )
+                return
 
             self._set_state(record, RootRequestState.DISPATCHING)
             cause = RootFailureCause.ASSIGNMENT_PUBLICATION_FAILED
@@ -670,6 +723,8 @@ class FLRootCoordinator:
                 cause = RootFailureCause.SHUTDOWN
             elif isinstance(error, RootPreparationError):
                 cause = error.cause
+            elif self._hierarchy_contract == "protocol":
+                cause = _protocol_failure_cause(record.state)
             elif (
                 process is not None
                 and getattr(process, "state", None) is FLServerState.PUBLISHING
@@ -823,6 +878,300 @@ class FLRootCoordinator:
             branches=tuple(admitted),
         )
 
+    def _run_protocol_hierarchy(
+        self,
+        *,
+        record: _RootRequestRecord,
+        current,
+        base,
+        descriptor,
+        context,
+        topology,
+        resolved_branches,
+    ) -> FLProcess:
+        distribution = self._round_model_distribution
+        if distribution is None:
+            raise RuntimeError("protocol hierarchy has no round model distribution owner")
+        self._set_state(record, RootRequestState.DISPATCHING)
+        targets = tuple(
+            ProtocolPreparationTarget(
+                participant_nf_instance_id=branch.nf_instance_id,
+                candidate=FLClientCandidate(
+                    target=resolved.target,
+                    tracking_areas=(),
+                ),
+                topology=self._protocol_branch_node(branch),
+            )
+            for branch, resolved in resolved_branches
+        )
+        process = self._server.start_protocol_preparation(
+            ml_correlation_id=record.initiation.plan_id,
+            reservation_id=record.reservation_id,
+            ml_event=descriptor.event,
+            ml_event_filter=descriptor.event_filter,
+            model_interoperability=descriptor.model_interoperability,
+            targets=targets,
+        )
+        with self._condition:
+            if self._active_request_id != record.initiation.request_id:
+                raise RuntimeError("Root request became stale during protocol dispatch")
+            record.server_process_id = process.process_id
+            record.state = RootRequestState.PREPARATION_WAITING
+            self._condition.notify_all()
+        collection = self._server.collect_hierarchy_preparation(process.process_id)
+        self._set_state(record, RootRequestState.PREPARATION_EVALUATING)
+        admission, reports = self._evaluate_protocol_preparation(
+            record=record,
+            process=process,
+            collection=collection,
+            topology=topology,
+        )
+        self._server.admit_hierarchy_preparation(process.process_id)
+        with self._condition:
+            if self._active_request_id != record.initiation.request_id:
+                raise RuntimeError("Root request became stale during protocol admission")
+            record.admission = admission
+            record.state = RootRequestState.ADMITTED
+            self._condition.notify_all()
+
+        expected_subordinates = {
+            branch_id: tuple(
+                child.nf_instance_id
+                for child in sorted(
+                    report.children or (),
+                    key=lambda item: item.nf_instance_id,
+                )
+                if child.status == "ACTIVE"
+            )
+            for branch_id, report in reports.items()
+        }
+        allowed_consumers = tuple(
+            sorted(
+                {
+                    participant_id
+                    for branch_id, report in reports.items()
+                    for participant_id in (
+                        branch_id,
+                        *_active_report_descendants(report),
+                    )
+                }
+            )
+        )
+        source = base
+        aggregate = None
+        for round_indicator in range(self._server_settings.round_count):
+            self._set_round_state(record, RootRequestState.ROUND_DISPATCH, round_indicator)
+            round_input = self._artifact_service.publish_round_input(
+                plan_id=record.initiation.plan_id,
+                base=source,
+                process_id=process.process_id,
+                server_nf_instance_id=context.nf_instance_id,
+                round_indicator=round_indicator,
+                epochs=self._server_settings.client_training.epochs,
+            )
+            round_metadata = ArtifactMetadata(
+                key=round_input.digest,
+                size_bytes=round_input.path.stat().st_size,
+                path=round_input.path,
+                url=round_input.url,
+            )
+            stored = distribution.store(
+                ml_correlation_id=record.initiation.plan_id,
+                round_indicator=round_indicator,
+                artifact=round_metadata,
+                allowed_consumer_ids=allowed_consumers,
+            )
+            try:
+                round_model = MLEventNotification(
+                    event=descriptor.event,
+                    modelUniqueId=stored.model_unique_id,
+                    mLModelAdrf=stored.wire_reference,
+                )
+                aggregate = self._server.execute_hierarchy_round(
+                    process_id=process.process_id,
+                    round_indicator=round_indicator,
+                    round_input_url=round_input.url,
+                    round_input_artifact=round_input,
+                    round_input_model=round_model,
+                    input_round_indicator=round_indicator,
+                    expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+                    expected_subordinates=expected_subordinates,
+                    state_observer=lambda state, current_round=round_indicator: (
+                        self._observe_server_round_state(record, current_round, state)
+                    ),
+                )
+            finally:
+                distribution.cleanup(record.initiation.plan_id, round_indicator)
+            self._ensure_active_generation(record)
+            source = self._loader.load(
+                ArtifactMetadata(
+                    key=aggregate.digest,
+                    size_bytes=aggregate.path.stat().st_size,
+                    path=aggregate.path,
+                    url=aggregate.url,
+                )
+            )
+            with self._condition:
+                if (
+                    self._closing
+                    or record.generation != self._generation
+                    or self._active_request_id != record.initiation.request_id
+                ):
+                    raise RootCoordinatorUnavailableError("Root coordinator is closing")
+                record.completed_rounds = round_indicator + 1
+                record.candidate_url = aggregate.url
+                record.candidate_digest = aggregate.digest
+                self._condition.notify_all()
+
+        if aggregate is None:
+            raise RuntimeError("protocol hierarchy completed without an aggregate")
+        handoff = self._workspace.republish_validation_candidate(
+            source=ArtifactMetadata(
+                key=aggregate.digest,
+                size_bytes=aggregate.path.stat().st_size,
+                path=aggregate.path,
+                url=aggregate.url,
+            ),
+            plan_id=record.initiation.plan_id,
+            participant_id=context.nf_instance_id,
+            round_indicator=self._server_settings.round_count,
+        )
+        with self._condition:
+            if (
+                self._closing
+                or record.generation != self._generation
+                or self._active_request_id != record.initiation.request_id
+            ):
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            record.candidate_url = handoff.url
+            record.candidate_digest = handoff.digest
+            self._condition.notify_all()
+        self._complete_protocol_training(record, process.process_id)
+        return process
+
+    def _protocol_branch_node(self, branch) -> FlTopologyNode:
+        strategy = FlStrategy(
+            method="fedProx",
+            aggregation="sampleWeighted",
+            methodParameters={"proximalMu": self._strategy.algorithm.proximal_mu},
+        )
+        child_count = len(branch.leaf_nf_instance_ids)
+        policy = FlPolicy(
+            allowAdditionalCandidates=False,
+            additionalCandidatePriority=0,
+            selectionMethod="priority",
+            minAvailableNodes=child_count,
+            fractionTrain=1.0,
+            minTrainNodes=child_count,
+            acceptFailures=False,
+            minCompletionRate=1.0,
+        )
+        children = [
+            FlTopologyNode(
+                nfInstanceId=leaf_id,
+                enabled=True,
+                priority=0,
+                strategy=strategy,
+                reportAfter=FlReportAfter(
+                    count=self._server_settings.client_training.epochs,
+                    unit="epoch",
+                ),
+            )
+            for leaf_id in branch.leaf_nf_instance_ids
+        ]
+        return FlTopologyNode(
+            nfInstanceId=branch.nf_instance_id,
+            enabled=True,
+            priority=0,
+            policy=policy,
+            strategy=strategy,
+            reportAfter=FlReportAfter(count=1, unit="round"),
+            children=children,
+        )
+
+    def _evaluate_protocol_preparation(
+        self,
+        *,
+        record: _RootRequestRecord,
+        process: FLProcess,
+        collection: HierarchyPreparationCollection,
+        topology,
+    ) -> tuple[RootAdmissionSnapshot, dict[str, FlTopologyReport]]:
+        if collection.plan_id != record.initiation.plan_id:
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "protocol preparation collection mlCorreId does not match",
+            )
+        if collection.process_id != process.process_id:
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "protocol preparation collection process does not match",
+            )
+        if collection.timed_out_participant_nf_instance_ids:
+            raise RootPreparationError(
+                RootFailureCause.PREPARATION_TIMEOUT,
+                "one or more protocol Branch callbacks timed out",
+            )
+        expected = {
+            branch.nf_instance_id: tuple(sorted(branch.leaf_nf_instance_ids))
+            for branch in topology.branches
+        }
+        outcomes = {
+            item.participant_nf_instance_id: item for item in collection.participants
+        }
+        if set(outcomes) != set(expected):
+            raise RootPreparationError(
+                RootFailureCause.RESULT_VALIDATION_FAILED,
+                "protocol preparation does not cover configured Branches",
+            )
+        admitted = []
+        reports = {}
+        for branch_id in sorted(expected):
+            outcome = outcomes[branch_id]
+            report = (
+                outcome.notification.fl_topology_report
+                if outcome.notification is not None
+                else None
+            )
+            if outcome.failure or report is None:
+                raise RootPreparationError(
+                    RootFailureCause.PREPARATION_FAILED,
+                    "Branch protocol preparation did not return a topology report",
+                )
+            if report.nf_instance_id != branch_id:
+                raise RootPreparationError(
+                    RootFailureCause.RESULT_VALIDATION_FAILED,
+                    "Branch topology report identity does not match",
+                )
+            active_children = tuple(
+                sorted(
+                    child.nf_instance_id
+                    for child in report.children or ()
+                    if child.status == "ACTIVE"
+                )
+            )
+            if active_children != expected[branch_id]:
+                raise RootPreparationError(
+                    RootFailureCause.ADMISSION_REJECTED,
+                    "Branch topology report does not contain all required active children",
+                )
+            reports[branch_id] = report
+            admitted.append(
+                AdmittedBranchSnapshot(
+                    branch_nf_instance_id=branch_id,
+                    prepared_leaf_nf_instance_ids=active_children,
+                    upper_resource_location=outcome.resource_location,
+                    result_digest="",
+                )
+            )
+        return (
+            RootAdmissionSnapshot(
+                plan_id=record.initiation.plan_id,
+                branches=tuple(admitted),
+            ),
+            reports,
+        )
+
     def _set_state(self, record: _RootRequestRecord, state: RootRequestState) -> None:
         with self._condition:
             if self._closing:
@@ -941,6 +1290,30 @@ class FLRootCoordinator:
             self._retain_terminal_record_locked(record)
             self._condition.notify_all()
 
+    def _complete_protocol_training(
+        self,
+        record: _RootRequestRecord,
+        process_id: str,
+    ) -> None:
+        self._server.close_hierarchy_training(
+            process_id,
+            retain_for_adoption=False,
+        )
+        self._release_reservation(record, RootRequestState.COMPLETE.value)
+        with self._condition:
+            if (
+                self._closing
+                or record.generation != self._generation
+                or self._active_request_id != record.initiation.request_id
+            ):
+                raise RootCoordinatorUnavailableError("Root coordinator is closing")
+            record.state = RootRequestState.COMPLETE
+            record.published_model_id = None
+            record.workspace_retained = True
+            self._active_request_id = None
+            self._retain_terminal_record_locked(record)
+            self._condition.notify_all()
+
     def _cleanup_attempt(
         self,
         record: _RootRequestRecord,
@@ -986,7 +1359,8 @@ class FLRootCoordinator:
             )
 
     def _retain_terminal_record_locked(self, record: _RootRequestRecord) -> None:
-        record.candidate_url = ""
+        if not record.workspace_retained:
+            record.candidate_url = ""
         if record.terminal_deadline is None:
             record.terminal_at = self._clock()
             record.terminal_deadline = (
@@ -995,11 +1369,29 @@ class FLRootCoordinator:
 
     def _prune_terminal_records_locked(self) -> None:
         now = self._clock()
+        expired = tuple(
+            record
+            for record in self._records.values()
+            if record.terminal_deadline is not None and record.terminal_deadline <= now
+        )
+        for record in expired:
+            if record.workspace_retained:
+                record.workspace_retained = False
+                self._release_retained_workspace(record)
         self._records = {
             request_id: record
             for request_id, record in self._records.items()
             if record.terminal_deadline is None or record.terminal_deadline > now
         }
+
+    def _release_retained_workspace(self, record: _RootRequestRecord) -> None:
+        try:
+            self._workspace.release_plan(record.initiation.plan_id)
+        except RuntimeError:
+            logger.exception(
+                "Failed to release retained protocol hierarchy workspace plan_id=%s",
+                record.initiation.plan_id,
+            )
 
     @staticmethod
     def _snapshot(record: _RootRequestRecord) -> RootRequestSnapshot:
@@ -1035,6 +1427,41 @@ def _uuid4_identity(value: str, name: str) -> str:
     if parsed.version != 4 or str(parsed) != value:
         raise ValueError(f"{name} must be a canonical UUIDv4")
     return value
+
+
+def _active_report_descendants(report: FlTopologyReport) -> tuple[str, ...]:
+    active = []
+    pending = list(report.children or ())
+    while pending:
+        node = pending.pop()
+        if node.status == "ACTIVE":
+            active.append(node.nf_instance_id)
+            pending.extend(node.children or ())
+    return tuple(sorted(active))
+
+
+def _protocol_failure_cause(state: RootRequestState) -> RootFailureCause:
+    if state in {
+        RootRequestState.DISPATCHING,
+        RootRequestState.PREPARATION_WAITING,
+    }:
+        return RootFailureCause.PREPARATION_DISPATCH_FAILED
+    if state is RootRequestState.PREPARATION_EVALUATING:
+        return RootFailureCause.RESULT_VALIDATION_FAILED
+    if state in {
+        RootRequestState.FINAL_VALIDATION_DISPATCH,
+        RootRequestState.FINAL_VALIDATION_WAITING,
+        RootRequestState.FINAL_VALIDATION_EVALUATING,
+        RootRequestState.VALIDATION_REJECTED,
+    }:
+        return RootFailureCause.FINAL_VALIDATION_FAILED
+    if state in {
+        RootRequestState.CANDIDATE_READY,
+        RootRequestState.PUBLISHING,
+        RootRequestState.CUTOVER_PENDING,
+    }:
+        return RootFailureCause.PUBLICATION_FAILED
+    return RootFailureCause.ROUND_FAILED
 
 
 def _public_failure_detail(cause: RootFailureCause) -> str:
