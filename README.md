@@ -41,6 +41,35 @@ non-empty `family_id`. Startup fails if a configured
 seed artifact is missing or its manifest identity does not match the
 descriptor.
 
+Controlled MNIST and CIFAR-10 source models are under
+`seed_models/image_classification/`. They use the same small-CNN architecture,
+separate initial weights, and no scaler. Import them without `--event`, for
+example:
+
+```bash
+uv run python tools/import_seed_model.py \
+  --config config/fl-client-image-classification.yaml \
+  --source seed_models/image_classification/mnist \
+  --model-id 1001 \
+  --model-interoperability image-classification-pytorch
+```
+
+Image clients read a deployment-mounted `.npz` shard containing only `images`
+and `labels`. The sample profile expects it at `/data/train.npz`; the runtime
+does not download or convert a dataset. An image-classification Branch that
+only aggregates subordinate results can omit `training_data`; any node that
+performs a local image update must configure the local shard.
+
+Evaluate a final image artifact after training with a held-out shard:
+
+```bash
+uv run python tools/evaluate_image_model.py \
+  --config config/fl-client-image-classification.yaml \
+  --artifact-path /path/to/final-model.tar.gz \
+  --test-data /data/held-out.npz \
+  --run-id experiment-001
+```
+
 ## Development
 
 ```bash
@@ -70,6 +99,9 @@ advertised FL capability:
 - `config/fl-server-client.yaml` enables both engines in one standard PyMTLF
   process. Hierarchy role is assigned by the Root at runtime; it is not a
   configuration mode.
+- `config/fl-client-image-classification.yaml` selects the controlled local
+  MNIST workload. Change `dataset` to `cifar10` and mount the matching shard at
+  the configured path to use CIFAR-10.
 
 The loader accepts only `local` and `federated` runtime modes. Federated mode
 requires at least one `federated_learning.server` or

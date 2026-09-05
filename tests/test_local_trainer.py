@@ -63,6 +63,7 @@ def bundle(model: TinyModel) -> LoadedBundle:
     scaler = StandardScaler().fit(np.log1p(np.arange(800).reshape(80, 10) + 1))
     return LoadedBundle(
         manifest={
+            "workload_profile": "ue_communication_forecasting",
             "model": {"input_size": 10, "output_size": 2},
             "inference": {
                 "feature_order": list(FEATURE_ORDER),

@@ -1,0 +1,39 @@
+# Controlled image-classification FL Client profile. Each deployment mounts a
+# different read-only shard at the same container path.
+server:
+  binding_host: "127.0.0.1"
+  port: 9093
+
+runtime:
+  mode: "federated"
+
+storage:
+  artifact_root: "data/artifacts"
+
+artifact:
+  public_base_url: "http://127.0.0.1:9093"
+
+federated_learning:
+  workspace_root: "data/fl-workspaces"
+  public_base_url: "http://127.0.0.1:9093"
+  artifact_download:
+    allowed_origins:
+      - "http://127.0.0.1:9092"
+  client:
+    workload:
+      profile: "image_classification"
+    training_data:
+      collection_trigger: "local"
+      dataset: "mnist"
+      shard_path: "/data/train.npz"
+    model_interoperability_ids:
+      - "image-classification-pytorch"
+    training:
+      device: "cpu"
+      batch_size: 32
+      learning_rate: 0.001
+      validation_ratio: 0.10
+      random_seed: 42
+
+log:
+  level: "INFO"

@@ -3848,6 +3848,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
             "training_scope": expected_scope.model_dump(mode="json"),
             "training_sample_count": 10,
             "dataset_evidence": {
+                "workload_profile": "ue_communication_forecasting",
                 "observation_count": 12,
                 "training_sample_count": 10,
                 "validation_sample_count": 1,

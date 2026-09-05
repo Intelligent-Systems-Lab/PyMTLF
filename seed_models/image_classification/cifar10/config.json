@@ -1,0 +1,19 @@
+{
+  "workload_profile": "image_classification",
+  "dataset": "cifar10",
+  "initialization_seed": 202,
+  "MODEL_PATH": "model.npy",
+  "MODEL_SCRIPT": "model.py",
+  "model": {
+    "input_channels": 3,
+    "num_classes": 10
+  },
+  "inference": {
+    "input_shape": [3, 32, 32],
+    "class_count": 10,
+    "normalization": "uint8_to_float32_div_255"
+  },
+  "training": {
+    "trainer": "federated"
+  }
+}

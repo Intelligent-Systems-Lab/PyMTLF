@@ -2035,7 +2035,7 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("stale_before_callback", [False, True])
-def test_branch_round_delegates_without_local_dataset_or_training(
+def test_image_branch_round_delegates_without_local_dataset_or_training(
     tmp_path,
     stale_before_callback,
 ):
@@ -2063,9 +2063,13 @@ def test_branch_round_delegates_without_local_dataset_or_training(
     branch.execute_round.return_value = Mock(
         url="http://branch.example/hierarchy-aggregate.tar.gz"
     )
+    branch_client_settings = FLClientSettings(
+        workload={"profile": "image_classification"},
+        model_interoperability_ids=("001122",),
+    )
     service = FLClientEngine(
         fl_settings(tmp_path),
-        client_settings(),
+        branch_client_settings,
         NotificationSettings(),
         Mock(),
         Mock(),
@@ -2104,7 +2108,7 @@ def test_branch_round_delegates_without_local_dataset_or_training(
             upper_resource_revision=resource.revision,
             upper_input_artifact_digest="4" * 64,
             upper_training_scope=resource.scope,
-            callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
+            callback_margin_seconds=branch_client_settings.callback_deadline_margin_seconds,
         )
         service._dataset_builder.build.assert_not_called()
         service._trainer.train.assert_not_called()

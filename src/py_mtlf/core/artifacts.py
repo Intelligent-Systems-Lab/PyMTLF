@@ -8,9 +8,14 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from py_mtlf.config import ArtifactSettings
+from py_mtlf.core.workloads import (
+    WorkloadContractError,
+    WorkloadProfile,
+    required_bundle_files,
+    validate_image_manifest,
+    workload_profile,
+)
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
-
-REQUIRED_BUNDLE_FILES = {"config.json", "model.py", "model.npy", "scaler.pkl"}
 
 
 class ArtifactError(RuntimeError):
@@ -199,13 +204,14 @@ class ArtifactRepository:
         except (tarfile.TarError, OSError) as exc:
             raise InvalidArtifactError("artifact is not a valid gzip tar archive") from exc
 
-        if names != REQUIRED_BUNDLE_FILES:
-            missing = sorted(REQUIRED_BUNDLE_FILES - names)
-            unexpected = sorted(names - REQUIRED_BUNDLE_FILES)
+        config = self._validate_manifest(config_bytes)
+        expected_files = required_bundle_files(config)
+        if names != expected_files:
+            missing = sorted(expected_files - names)
+            unexpected = sorted(names - expected_files)
             raise InvalidArtifactError(
                 f"artifact file set is invalid; missing={missing}, unexpected={unexpected}"
             )
-        self._validate_manifest(config_bytes)
 
     @staticmethod
     def _validate_member(member: tarfile.TarInfo, names: set[str]) -> None:
@@ -222,7 +228,7 @@ class ArtifactRepository:
             raise InvalidArtifactError("artifact contains an unsafe entry")
 
     @staticmethod
-    def _validate_manifest(config_bytes: bytes | None) -> None:
+    def _validate_manifest(config_bytes: bytes | None) -> dict[str, object]:
         if config_bytes is None:
             raise InvalidArtifactError("artifact is missing config.json")
         try:
@@ -231,28 +237,56 @@ class ArtifactRepository:
             raise InvalidArtifactError("config.json is not valid JSON") from exc
         if not isinstance(config, dict):
             raise InvalidArtifactError("config.json must contain a JSON object")
-        if "file_digests" in config:
-            raise InvalidArtifactError("unsupported manifest field: file_digests")
+        unsupported = sorted(
+            field for field in ("bundle_schema_version", "file_digests") if field in config
+        )
+        if unsupported:
+            raise InvalidArtifactError(f"unsupported manifest field: {unsupported[0]}")
         try:
             ModelIdentity.model_validate(config["model_identity"])
         except (KeyError, ValueError) as exc:
             raise InvalidArtifactError("bundle model identity is invalid") from exc
-        if not isinstance(config.get("analytics_event"), str) or not config["analytics_event"]:
-            raise InvalidArtifactError("bundle analytics_event is required")
         if not isinstance(config.get("runtime_compatibility"), dict):
             raise InvalidArtifactError("bundle runtime_compatibility is required")
-        inference = config.get("inference")
-        if not isinstance(inference, dict) or not inference.get("feature_order"):
-            raise InvalidArtifactError("bundle inference feature_order is required")
-        if not inference.get("output_fields") or not isinstance(inference.get("seq_length"), int):
-            raise InvalidArtifactError("bundle inference output_fields and seq_length are required")
-        expected_names = {
-            config.get("MODEL_SCRIPT"),
-            config.get("MODEL_PATH"),
-            config.get("SCALER_PATH"),
-        }
-        if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
-            raise InvalidArtifactError("bundle component filenames are invalid")
+        try:
+            profile = workload_profile(config)
+        except WorkloadContractError as exc:
+            raise InvalidArtifactError(str(exc)) from exc
+        if profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
+            if not isinstance(config.get("analytics_event"), str) or not config["analytics_event"]:
+                raise InvalidArtifactError("bundle analytics_event is required")
+            inference = config.get("inference")
+            if not isinstance(inference, dict) or not inference.get("feature_order"):
+                raise InvalidArtifactError("bundle inference feature_order is required")
+            if not inference.get("output_fields") or not isinstance(
+                inference.get("seq_length"), int
+            ):
+                raise InvalidArtifactError(
+                    "bundle inference output_fields and seq_length are required"
+                )
+            expected_names = {
+                config.get("MODEL_SCRIPT"),
+                config.get("MODEL_PATH"),
+                config.get("SCALER_PATH"),
+            }
+            if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
+                raise InvalidArtifactError("bundle component filenames are invalid")
+        else:
+            if "analytics_event" in config:
+                raise InvalidArtifactError(
+                    "image classification bundle must not declare analytics_event"
+                )
+            if config.get("MODEL_SCRIPT") != "model.py" or config.get("MODEL_PATH") != "model.npy":
+                raise InvalidArtifactError("bundle component filenames are invalid")
+            if "SCALER_PATH" in config:
+                raise InvalidArtifactError(
+                    "image classification bundle must not declare SCALER_PATH"
+                )
+            try:
+                validate_image_manifest(config)
+            except WorkloadContractError as exc:
+                raise InvalidArtifactError(str(exc)) from exc
+        return config
     @staticmethod
     def _fsync_directory(path: Path) -> None:
         try:

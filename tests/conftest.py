@@ -42,6 +42,7 @@ def build_bundle(
         "scaler.pkl": b"trusted-local-scaler",
     }
     config = {
+        "workload_profile": "ue_communication_forecasting",
         "model_identity": {"model_unique_id": 1},
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",

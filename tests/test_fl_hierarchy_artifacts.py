@@ -110,6 +110,7 @@ def base_bundle() -> LoadedBundle:
     joblib.dump(scaler, scaler_stream)
     return LoadedBundle(
         manifest={
+            "workload_profile": "ue_communication_forecasting",
             "model_identity": {"model_unique_id": 1},
             "analytics_event": "UE_COMMUNICATION",
             "model_interoperability": "001122",

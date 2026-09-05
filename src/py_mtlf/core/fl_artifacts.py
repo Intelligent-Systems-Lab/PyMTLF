@@ -111,10 +111,23 @@ class RoundLocalCommonMetadata(CommonFLMetadata):
         return str(UUID(value))
 
 
-class DatasetEvidence(ArtifactContractModel):
+class TrafficDatasetEvidence(ArtifactContractModel):
+    workload_profile: Literal["ue_communication_forecasting"]
     observation_count: int = Field(gt=0)
     training_sample_count: int = Field(gt=0)
     validation_sample_count: int = Field(gt=0)
+
+
+class ImageDatasetEvidence(ArtifactContractModel):
+    workload_profile: Literal["image_classification"]
+    dataset: Literal["mnist", "cifar10"]
+    training_sample_count: int = Field(gt=0)
+
+
+DatasetEvidence = Annotated[
+    TrafficDatasetEvidence | ImageDatasetEvidence,
+    Field(discriminator="workload_profile"),
+]
 
 
 class RoundLocalTrainingMetadata(RoundLocalCommonMetadata):

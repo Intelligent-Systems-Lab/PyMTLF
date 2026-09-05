@@ -48,6 +48,7 @@ def test_download_validation_rejects_invalid_artifact_role_contract(tmp_path):
 
 def test_model_compatibility_checks_typed_contract_and_parameter_shape():
     manifest = {
+        "workload_profile": "ue_communication_forecasting",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
@@ -65,6 +66,7 @@ def test_model_compatibility_checks_typed_contract_and_parameter_shape():
 
 def test_model_compatibility_compares_parameter_keys_without_ordering():
     manifest = {
+        "workload_profile": "ue_communication_forecasting",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
@@ -86,6 +88,7 @@ def test_model_compatibility_compares_parameter_keys_without_ordering():
 
 def test_model_compatibility_rejects_parameter_key_and_dtype_mismatch():
     manifest = {
+        "workload_profile": "ue_communication_forecasting",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},

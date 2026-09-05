@@ -79,6 +79,7 @@ def make_seed_bundle(path: Path) -> None:
         "scaler.pkl": scaler_stream.getvalue(),
     }
     manifest = {
+        "workload_profile": "ue_communication_forecasting",
         "model_identity": {"model_unique_id": 1},
         "model_generation": 1,
         "analytics_event": "UE_COMMUNICATION",

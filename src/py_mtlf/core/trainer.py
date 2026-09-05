@@ -18,6 +18,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from py_mtlf.config import FittingSettings, ValidationSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.training_data import ScopeTrainingData, TrainingDataError, TrainingDataset
+from py_mtlf.core.workloads import (
+    WorkloadProfile,
+    validate_image_manifest,
+    workload_profile,
+)
 
 
 class TrainingError(RuntimeError):
@@ -45,9 +50,13 @@ def resolve_device(value: str) -> torch.device:
 class LoadedBundle:
     manifest: dict[str, object]
     model: torch.nn.Module
-    scaler: StandardScaler
+    scaler: StandardScaler | None
     model_source: bytes
     scaler_source: bytes = b""
+
+    @property
+    def workload_profile(self) -> WorkloadProfile:
+        return workload_profile(self.manifest)
 
 
 @dataclass(frozen=True)
@@ -92,13 +101,21 @@ class TrustedBundleLoader:
             root = Path(temporary)
             self._extract(artifact.path, root)
             manifest = self._manifest(root / "config.json")
+            profile = workload_profile(manifest)
             model_source = (root / "model.py").read_bytes()
-            scaler_source = (root / "scaler.pkl").read_bytes()
             model_class = self._model_class(model_source, root / "model.py")
             model = self._instantiate(model_class, manifest)
             self._load_weights(model, root / "model.npy")
-            scaler = joblib.load(root / "scaler.pkl")
-        self._validate_scaler(scaler, manifest)
+            if profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
+                scaler_source = (root / "scaler.pkl").read_bytes()
+                scaler = joblib.load(root / "scaler.pkl")
+            else:
+                scaler_source = b""
+                scaler = None
+        if profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
+            self._validate_scaler(scaler, manifest)
+        else:
+            self._validate_image_model(model, manifest)
         model.to("cpu")
         model.eval()
         return LoadedBundle(
@@ -159,6 +176,8 @@ class TrustedBundleLoader:
                 "num_channels",
                 "kernel_size",
                 "dropout",
+                "input_channels",
+                "num_classes",
             )
             if name in signature.parameters and name in model_config
         }
@@ -187,6 +206,29 @@ class TrustedBundleLoader:
             raise TrainingError("trusted bundle scaler is not a StandardScaler")
         if not isinstance(features, list) or scaler.n_features_in_ != len(features):
             raise TrainingError("trusted bundle scaler shape is incompatible")
+
+    @staticmethod
+    def _validate_image_model(
+        model: torch.nn.Module,
+        manifest: dict[str, object],
+    ) -> None:
+        contract = validate_image_manifest(manifest)
+        batch_norm_types = (
+            torch.nn.BatchNorm1d,
+            torch.nn.BatchNorm2d,
+            torch.nn.BatchNorm3d,
+        )
+        if any(isinstance(module, batch_norm_types) for module in model.modules()):
+            raise TrainingError("image classification model must not use BatchNorm")
+        try:
+            with torch.no_grad():
+                output = model(torch.zeros((2, *contract.input_shape), dtype=torch.float32))
+        except Exception as error:
+            raise TrainingError(
+                "image classification model input contract is incompatible"
+            ) from error
+        if output.shape != (2, contract.class_count):
+            raise TrainingError("image classification model output contract is incompatible")
 
 
 class LocalTrainer:

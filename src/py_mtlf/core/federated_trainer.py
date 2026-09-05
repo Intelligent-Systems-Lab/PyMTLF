@@ -9,8 +9,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from py_mtlf.config import FittingRuntimeSettings
+from py_mtlf.core.image_classification import ImageClassificationDataset
 from py_mtlf.core.trainer import LoadedBundle, LocalTrainer, TrainingError, resolve_device
 from py_mtlf.core.training_data import TrainingDataset
+from py_mtlf.core.workloads import WorkloadProfile, validate_image_manifest
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,7 @@ class FederatedTrainer:
     def train(
         self,
         base: LoadedBundle,
-        dataset: TrainingDataset,
+        dataset: TrainingDataset | ImageClassificationDataset,
         *,
         epochs: int,
         proximal_mu: float | None = None,
@@ -43,7 +45,25 @@ class FederatedTrainer:
         np.random.seed(self._settings.random_seed)
         torch.manual_seed(self._settings.random_seed)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        inputs, targets = LocalTrainer._training_tensors(dataset, base.scaler)
+        if base.workload_profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
+            if not isinstance(dataset, TrainingDataset) or base.scaler is None:
+                raise TrainingError("traffic workload requires a traffic dataset and scaler")
+            inputs, targets = LocalTrainer._training_tensors(dataset, base.scaler)
+            loss_function: torch.nn.Module = torch.nn.HuberLoss()
+            training_sample_count = sum(
+                scope.training_sample_count for scope in dataset.training_scopes
+            )
+            classification_class_count = None
+        else:
+            if not isinstance(dataset, ImageClassificationDataset):
+                raise TrainingError("image classification requires a local image dataset")
+            contract = validate_image_manifest(base.manifest)
+            if dataset.dataset is not contract.name:
+                raise TrainingError("image dataset does not match the model bundle")
+            inputs, targets = dataset.inputs, dataset.targets
+            loss_function = torch.nn.CrossEntropyLoss()
+            training_sample_count = dataset.sample_count
+            classification_class_count = contract.class_count
         model = copy.deepcopy(base.model).to(self._device)
         global_reference = {
             name: value.detach().clone().to(self._device)
@@ -53,7 +73,6 @@ class FederatedTrainer:
         try:
             model.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=self._settings.learning_rate)
-            loss_function = torch.nn.HuberLoss()
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self._settings.random_seed)
             loader = DataLoader(
@@ -69,7 +88,12 @@ class FederatedTrainer:
                     expected = expected.to(self._device)
                     optimizer.zero_grad(set_to_none=True)
                     actual = model(features)
-                    if actual.shape != expected.shape:
+                    if classification_class_count is None and actual.shape != expected.shape:
+                        raise TrainingError("federated model output shape is incompatible")
+                    if classification_class_count is not None and actual.shape != (
+                        expected.shape[0],
+                        classification_class_count,
+                    ):
                         raise TrainingError("federated model output shape is incompatible")
                     loss = loss_function(actual, expected)
                     if proximal_mu is not None:
@@ -91,9 +115,7 @@ class FederatedTrainer:
         model.eval()
         return FederatedTrainingResult(
             model=model,
-            training_sample_count=sum(
-                scope.training_sample_count for scope in dataset.training_scopes
-            ),
+            training_sample_count=training_sample_count,
             final_loss=final_loss,
         )
 

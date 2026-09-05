@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from py_mtlf.config import ArtifactSettings, FederatedLearningSettings
-from py_mtlf.core.artifacts import REQUIRED_BUNDLE_FILES, ArtifactMetadata
+from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import (
     ArtifactRole,
     FLArtifactContract,
@@ -35,6 +35,12 @@ from py_mtlf.core.fl_hierarchy import (
     normalize_plan_id,
 )
 from py_mtlf.core.trainer import LoadedBundle
+from py_mtlf.core.workloads import (
+    WorkloadProfile,
+    required_bundle_files,
+    validate_image_manifest,
+    workload_profile,
+)
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
 
 
@@ -716,13 +722,17 @@ class FLWorkspace:
             raise FLArtifactIntegrityError(
                 "FL artifact is not a valid gzip tar archive"
             ) from error
-        if names != REQUIRED_BUNDLE_FILES:
-            missing = sorted(REQUIRED_BUNDLE_FILES - names)
-            unexpected = sorted(names - REQUIRED_BUNDLE_FILES)
+        manifest = _validated_manifest(manifest_bytes)
+        try:
+            expected_files = required_bundle_files(manifest)
+        except ValueError as error:
+            raise FLArtifactContractError(str(error)) from error
+        if names != expected_files:
+            missing = sorted(expected_files - names)
+            unexpected = sorted(names - expected_files)
             raise FLArtifactIntegrityError(
                 f"FL artifact file set is invalid; missing={missing}, unexpected={unexpected}"
             )
-        manifest = _validated_manifest(manifest_bytes)
         role = manifest.get("artifact_role")
         if role is None:
             try:
@@ -755,13 +765,15 @@ class FLWorkspace:
         weights[:] = [value.detach().cpu().numpy() for value in model.state_dict().values()]
         weights_stream = io.BytesIO()
         np.save(weights_stream, weights, allow_pickle=True)
-        if not base.scaler_source:
-            raise RuntimeError("FL base bundle has no preserved scaler source")
         components = {
             "model.py": base.model_source,
             "model.npy": weights_stream.getvalue(),
-            "scaler.pkl": base.scaler_source,
         }
+        expected_files = required_bundle_files(base.manifest)
+        if "scaler.pkl" in expected_files:
+            if not base.scaler_source:
+                raise RuntimeError("FL base bundle has no preserved scaler source")
+            components["scaler.pkl"] = base.scaler_source
         manifest = dict(base.manifest)
         for key in (
             "artifact_role",
@@ -1008,6 +1020,7 @@ class FLWorkspace:
 
 def validate_model_compatibility(base: LoadedBundle, candidate: LoadedBundle) -> None:
     contract_fields = (
+        "workload_profile",
         "analytics_event",
         "model_interoperability",
         "runtime_compatibility",
@@ -1114,10 +1127,15 @@ def _validated_manifest(manifest_bytes: bytes | None) -> dict[str, object]:
         raise FLArtifactContractError("FL artifact config.json is invalid") from error
     if not isinstance(manifest, dict):
         raise FLArtifactContractError("FL artifact config.json must contain an object")
-    if "file_digests" in manifest:
-        raise FLArtifactContractError("unsupported manifest field: file_digests")
-    if not isinstance(manifest.get("analytics_event"), str) or not manifest["analytics_event"]:
-        raise FLArtifactContractError("FL artifact analytics_event is required")
+    unsupported = sorted(
+        field for field in ("bundle_schema_version", "file_digests") if field in manifest
+    )
+    if unsupported:
+        raise FLArtifactContractError(f"unsupported manifest field: {unsupported[0]}")
+    try:
+        profile = workload_profile(manifest)
+    except ValueError as error:
+        raise FLArtifactContractError(str(error)) from error
     if (
         not isinstance(manifest.get("model_interoperability"), str)
         or not manifest["model_interoperability"].strip()
@@ -1129,11 +1147,29 @@ def _validated_manifest(manifest_bytes: bytes | None) -> dict[str, object]:
         raise FLArtifactContractError("FL artifact model contract is required")
     if not isinstance(manifest.get("inference"), dict):
         raise FLArtifactContractError("FL artifact inference contract is required")
-    expected_names = {
-        manifest.get("MODEL_SCRIPT"),
-        manifest.get("MODEL_PATH"),
-        manifest.get("SCALER_PATH"),
-    }
-    if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
-        raise FLArtifactContractError("FL artifact component filenames are invalid")
+    if profile is WorkloadProfile.UE_COMMUNICATION_FORECASTING:
+        if not isinstance(manifest.get("analytics_event"), str) or not manifest["analytics_event"]:
+            raise FLArtifactContractError("FL artifact analytics_event is required")
+        expected_names = {
+            manifest.get("MODEL_SCRIPT"),
+            manifest.get("MODEL_PATH"),
+            manifest.get("SCALER_PATH"),
+        }
+        if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
+            raise FLArtifactContractError("FL artifact component filenames are invalid")
+    else:
+        if "analytics_event" in manifest:
+            raise FLArtifactContractError(
+                "image classification artifact must not declare analytics_event"
+            )
+        if (
+            manifest.get("MODEL_SCRIPT") != "model.py"
+            or manifest.get("MODEL_PATH") != "model.npy"
+            or "SCALER_PATH" in manifest
+        ):
+            raise FLArtifactContractError("FL artifact component filenames are invalid")
+        try:
+            validate_image_manifest(manifest)
+        except ValueError as error:
+            raise FLArtifactContractError(str(error)) from error
     return manifest

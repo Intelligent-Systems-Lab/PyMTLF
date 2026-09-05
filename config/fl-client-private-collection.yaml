@@ -27,6 +27,8 @@ federated_learning:
     allowed_origins:
       - "http://127.0.0.1:9092"
   client:
+    workload:
+      profile: "ue_communication_forecasting"
     training_data:
       collection_trigger: "private_api"
       # This origin must be reachable by the UPF callback producer.

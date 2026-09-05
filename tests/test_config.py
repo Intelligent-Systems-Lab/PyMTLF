@@ -320,6 +320,71 @@ def test_fl_client_requires_explicit_training_data_collection_trigger(tmp_path):
         )
 
 
+def test_fl_client_accepts_only_matching_local_image_workload(tmp_path):
+    client = FLClientSettings.model_validate(
+        {
+            "workload": {"profile": "image_classification"},
+            "training_data": {
+                "collection_trigger": "local",
+                "dataset": "mnist",
+                "shard_path": str((tmp_path / "train.npz").resolve()),
+            },
+        }
+    )
+
+    assert client.workload.profile == "image_classification"
+    assert client.training_data.dataset == "mnist"
+
+    aggregation_only = FLClientSettings.model_validate(
+        {"workload": {"profile": "image_classification"}}
+    )
+    assert aggregation_only.training_data is None
+
+    with pytest.raises(ValidationError, match="must use the local source"):
+        FLClientSettings.model_validate(
+            {
+                "workload": {"profile": "image_classification"},
+                "training_data": {"collection_trigger": "consumer_subscription"},
+            }
+        )
+    with pytest.raises(ValidationError, match="requires consumer_subscription"):
+        FLClientSettings.model_validate(
+            {
+                "training_data": {
+                    "collection_trigger": "local",
+                    "dataset": "cifar10",
+                    "shard_path": str((tmp_path / "train.npz").resolve()),
+                },
+            }
+        )
+
+
+def test_load_settings_resolves_local_image_shard_path(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+runtime:
+  mode: federated
+federated_learning:
+  client:
+    workload:
+      profile: image_classification
+    training_data:
+      collection_trigger: local
+      dataset: cifar10
+      shard_path: datasets/client-01.npz
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.federated_learning.client is not None
+    assert settings.federated_learning.client.training_data.shard_path == (
+        tmp_path / "datasets" / "client-01.npz"
+    )
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -587,6 +652,7 @@ def test_federated_server_requires_single_active_process():
         ("fl-server.yaml", "federated"),
         ("fl-client.yaml", "federated"),
         ("fl-server-client.yaml", "federated"),
+        ("fl-client-image-classification.yaml", "federated"),
         ("fl-client-private-collection.yaml", "federated"),
         ("fl-server-client-private-collection.yaml", "federated"),
         ("fl-server-hierarchy.yaml", "federated"),

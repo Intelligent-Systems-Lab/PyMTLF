@@ -1,0 +1,19 @@
+{
+  "workload_profile": "image_classification",
+  "dataset": "mnist",
+  "initialization_seed": 101,
+  "MODEL_PATH": "model.npy",
+  "MODEL_SCRIPT": "model.py",
+  "model": {
+    "input_channels": 1,
+    "num_classes": 10
+  },
+  "inference": {
+    "input_shape": [1, 28, 28],
+    "class_count": 10,
+    "normalization": "uint8_to_float32_div_255"
+  },
+  "training": {
+    "trainer": "federated"
+  }
+}

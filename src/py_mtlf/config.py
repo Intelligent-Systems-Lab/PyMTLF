@@ -198,6 +198,24 @@ class ConsumerSubscriptionTrainingDataSettings(FrozenSettings):
     collection_trigger: Literal["consumer_subscription"]
 
 
+class LocalImageTrainingDataSettings(FrozenSettings):
+    collection_trigger: Literal["local"]
+    dataset: Literal["mnist", "cifar10"]
+    shard_path: Path
+
+    @field_validator("shard_path", mode="before")
+    @classmethod
+    def validate_shard_path(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)):
+            raise ValueError("local image shard_path must be a filesystem path")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("local image shard_path must not be blank")
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("local image shard_path must be resolved from config")
+        return path
+
+
 class PrivateCollectionConsentSettings(FrozenSettings):
     purpose: Literal["model_training"]
     policy: Literal["not_required_by_local_policy"]
@@ -393,13 +411,30 @@ class PrivateAPITrainingDataSettings(FrozenSettings):
 
 
 FLTrainingDataSettings = Annotated[
-    ConsumerSubscriptionTrainingDataSettings | PrivateAPITrainingDataSettings,
+    ConsumerSubscriptionTrainingDataSettings
+    | PrivateAPITrainingDataSettings
+    | LocalImageTrainingDataSettings,
     Field(discriminator="collection_trigger"),
 ]
 
 
+class UECommunicationWorkloadSettings(FrozenSettings):
+    profile: Literal["ue_communication_forecasting"] = "ue_communication_forecasting"
+
+
+class ImageClassificationWorkloadSettings(FrozenSettings):
+    profile: Literal["image_classification"]
+
+
+FLWorkloadSettings = Annotated[
+    UECommunicationWorkloadSettings | ImageClassificationWorkloadSettings,
+    Field(discriminator="profile"),
+]
+
+
 class FLClientSettings(FrozenSettings):
-    training_data: FLTrainingDataSettings
+    workload: FLWorkloadSettings = UECommunicationWorkloadSettings()
+    training_data: FLTrainingDataSettings | None = None
     callback_deadline_margin_seconds: int = Field(default=5, ge=1, le=300)
     callback_queue_size: int = Field(default=256, gt=0, le=100000)
     max_concurrent_jobs: int = Field(default=2, gt=0, le=32)
@@ -429,6 +464,17 @@ class FLClientSettings(FrozenSettings):
             raise ValueError("callback deadline margin must be shorter than FL timeouts")
         if self.callback_queue_size < self.max_concurrent_jobs:
             raise ValueError("callback_queue_size must not be smaller than max_concurrent_jobs")
+        image_workload = isinstance(self.workload, ImageClassificationWorkloadSettings)
+        local_data = isinstance(self.training_data, LocalImageTrainingDataSettings)
+        if image_workload and self.training_data is not None and not local_data:
+            raise ValueError(
+                "image_classification training data must use the local source"
+            )
+        if not image_workload and (self.training_data is None or local_data):
+            raise ValueError(
+                "ue_communication_forecasting training_data requires "
+                "consumer_subscription or private_api"
+            )
         return self
 
 
@@ -870,6 +916,13 @@ def load_settings(path: str | Path) -> Settings:
                         candidate = Path(state_directory)
                         if not candidate.is_absolute():
                             training_data["state_directory"] = str(
+                                (config_path.parent / candidate).resolve()
+                            )
+                    shard_path = training_data.get("shard_path")
+                    if isinstance(shard_path, str) and shard_path.strip():
+                        candidate = Path(shard_path)
+                        if not candidate.is_absolute():
+                            training_data["shard_path"] = str(
                                 (config_path.parent / candidate).resolve()
                             )
     return Settings.model_validate(raw)

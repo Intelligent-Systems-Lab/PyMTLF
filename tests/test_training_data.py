@@ -281,13 +281,14 @@ def test_dataset_evidence_tracks_explicit_observation_and_split_counts():
     ).validation_sample_count
 
 
-def test_dataset_evidence_contains_only_counts():
+def test_dataset_evidence_identifies_the_traffic_workload_and_counts():
     evidence = dataset_evidence(
         TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
     )
     payload = evidence.as_dict()
 
     assert set(payload) == {
+        "workload_profile",
         "observation_count",
         "training_sample_count",
         "validation_sample_count",

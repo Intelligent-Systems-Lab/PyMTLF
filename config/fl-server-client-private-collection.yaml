@@ -31,6 +31,8 @@ federated_learning:
     round_count: 2
     max_active_processes: 1
   client:
+    workload:
+      profile: "ue_communication_forecasting"
     training_data:
       collection_trigger: "private_api"
       callback_base_uri: "http://127.0.0.1:9092"

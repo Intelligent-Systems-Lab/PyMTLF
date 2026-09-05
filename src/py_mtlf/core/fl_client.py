@@ -12,7 +12,13 @@ from uuid import uuid4
 
 import httpx
 
-from py_mtlf.config import FederatedLearningSettings, FLClientSettings, NotificationSettings
+from py_mtlf.config import (
+    FederatedLearningSettings,
+    FLClientSettings,
+    ImageClassificationWorkloadSettings,
+    LocalImageTrainingDataSettings,
+    NotificationSettings,
+)
 from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
@@ -46,6 +52,7 @@ from py_mtlf.core.fl_workspace import (
     ValidatedHierarchyArtifact,
     validate_model_compatibility,
 )
+from py_mtlf.core.image_classification import ImageDatasetLoader
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
 from py_mtlf.core.trainer import (
     LoadedBundle,
@@ -56,6 +63,10 @@ from py_mtlf.core.trainer import (
 )
 from py_mtlf.core.training_data import TrainingDatasetBuilder, dataset_evidence
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
+from py_mtlf.core.workloads import (
+    WorkloadProfile,
+    validate_image_manifest,
+)
 from py_mtlf.wire.adrf import TimeWindow as AdrfTimeWindow
 from py_mtlf.wire.features import (
     HIERARCHICAL_FL_ORCHESTRATION_FEATURE,
@@ -218,6 +229,7 @@ class FLClientEngine:
         self._trainer = FederatedTrainer(client_settings.training)
         self._device = resolve_device(client_settings.training.device)
         self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
+        self._image_dataset_loader = ImageDatasetLoader()
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds,
@@ -882,10 +894,7 @@ class FLClientEngine:
                     self._release_work_slot(subscription_id, revision)
                     return
             base = self._loader.load(artifact)
-            if base.manifest.get("analytics_event") != event.ml_event:
-                raise RuntimeError("FL preparation base model analytics event is incompatible")
-            if base.manifest.get("model_interoperability") != event.model_interoperability:
-                raise RuntimeError("FL preparation base model interoperability is incompatible")
+            self._validate_workload_bundle(base, event.ml_event, event.model_interoperability)
             with self._lock:
                 current = self._resources.get(subscription_id)
                 if current is None or current.revision != revision:
@@ -893,6 +902,28 @@ class FLClientEngine:
                     return
                 current.preparation_base_artifact = artifact
                 current.hierarchy_assignment = hierarchy_assignment
+            if isinstance(self._client_settings.training_data, LocalImageTrainingDataSettings):
+                with self._lock:
+                    current = self._resources.get(subscription_id)
+                    if current is None or current.revision != revision:
+                        self._release_work_slot(subscription_id, revision)
+                        return
+                    current.state = FLClientState.PREPARATION_RESULT_PENDING
+                    self._cancel_delay(subscription_id)
+                    notification = NwdafMLModelTrainNotif(
+                        notifCorreId=current.representation.notification_correlation_id,
+                        mlCorreId=current.representation.ml_correlation_id,
+                        mLModelInfos=[
+                            current.representation.ml_model_infos[0].model_copy(deep=True)
+                        ],
+                    )
+                self._enqueue_delivery(current, notification, FLClientState.PREPARED)
+                self._release_work_slot(subscription_id, revision)
+                return
+            if self._client_settings.training_data is None:
+                raise RuntimeError(
+                    "image classification local training data is not configured"
+                )
             collection_trigger = self._client_settings.training_data.collection_trigger
             self._datasets.validate_external_scope(intent, collection_trigger)
             job_id = self._datasets.submit_external(
@@ -1076,14 +1107,35 @@ class FLClientEngine:
                     self._cancel_delay(subscription_id)
                 self._enqueue_delivery(current, notification, FLClientState.READY)
                 return
-            if snapshot is None:
-                raise RuntimeError("FL round has no prepared ADRF dataset")
-            dataset = self._dataset_builder.build(snapshot, base.manifest)
-            training_sample_count = sum(
-                scope.training_sample_count for scope in dataset.training_scopes
-            )
-            if training_sample_count != resource.prepared_training_sample_count:
-                raise RuntimeError("FL round dataset changed after preparation")
+            local_image = self._client_settings.training_data
+            if isinstance(local_image, LocalImageTrainingDataSettings):
+                dataset = self._image_dataset_loader.load(
+                    local_image.shard_path,
+                    local_image.dataset,
+                )
+                training_sample_count = dataset.sample_count
+                evidence = {
+                    "workload_profile": "image_classification",
+                    "dataset": local_image.dataset,
+                    "training_sample_count": training_sample_count,
+                }
+            else:
+                if isinstance(
+                    self._client_settings.workload,
+                    ImageClassificationWorkloadSettings,
+                ):
+                    raise RuntimeError(
+                        "image classification local training data is not configured"
+                    )
+                if snapshot is None:
+                    raise RuntimeError("FL round has no prepared ADRF dataset")
+                dataset = self._dataset_builder.build(snapshot, base.manifest)
+                training_sample_count = sum(
+                    scope.training_sample_count for scope in dataset.training_scopes
+                )
+                if training_sample_count != resource.prepared_training_sample_count:
+                    raise RuntimeError("FL round dataset changed after preparation")
+                evidence = dataset_evidence(dataset).as_dict()
             proximal_mu = None
             epochs = round_input.fl_metadata.client_training.epochs
             if resource.client_local_work is not None:
@@ -1099,8 +1151,7 @@ class FLClientEngine:
                 epochs=epochs,
                 proximal_mu=proximal_mu,
             )
-            evidence = dataset_evidence(dataset)
-            if evidence.training_sample_count != result.training_sample_count:
+            if training_sample_count != result.training_sample_count:
                 raise RuntimeError("local training sample count does not match dataset evidence")
             with self._lock:
                 current = self._resources.get(subscription_id)
@@ -1119,7 +1170,7 @@ class FLClientEngine:
                         mode="json",
                     ),
                     "training_sample_count": result.training_sample_count,
-                    "dataset_evidence": evidence.as_dict(),
+                    "dataset_evidence": evidence,
                 },
             }
             published = self._workspace.publish(
@@ -1169,6 +1220,37 @@ class FLClientEngine:
                 self._enqueue_delivery(resource, _termination(resource), FLClientState.FAILED)
         finally:
             self._release_work_slot(subscription_id, revision)
+
+    def _validate_workload_bundle(
+        self,
+        bundle: LoadedBundle,
+        ml_event: str,
+        model_interoperability: str,
+    ) -> None:
+        if bundle.manifest.get("model_interoperability") != model_interoperability:
+            raise RuntimeError("FL preparation base model interoperability is incompatible")
+        image_workload = isinstance(
+            self._client_settings.workload,
+            ImageClassificationWorkloadSettings,
+        )
+        if bundle.workload_profile is WorkloadProfile.IMAGE_CLASSIFICATION:
+            if not image_workload:
+                raise RuntimeError("FL preparation model workload is incompatible")
+            if not isinstance(
+                self._client_settings.training_data,
+                LocalImageTrainingDataSettings,
+            ):
+                raise RuntimeError(
+                    "image classification local training data is not configured"
+                )
+            contract = validate_image_manifest(bundle.manifest)
+            if contract.name.value != self._client_settings.training_data.dataset:
+                raise RuntimeError("FL preparation image dataset is incompatible")
+            return
+        if image_workload:
+            raise RuntimeError("FL preparation model workload is incompatible")
+        if bundle.manifest.get("analytics_event") != ml_event:
+            raise RuntimeError("FL preparation base model analytics event is incompatible")
 
     def _run_validation(self, subscription_id: str, revision: int) -> None:
         try:

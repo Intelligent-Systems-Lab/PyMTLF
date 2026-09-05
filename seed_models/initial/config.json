@@ -1,4 +1,5 @@
 {
+  "workload_profile": "ue_communication_forecasting",
   "TID": "initial-local-8c15371e",
   "MODEL_PATH": "model.npy",
   "SCALER_PATH": "scaler.pkl",

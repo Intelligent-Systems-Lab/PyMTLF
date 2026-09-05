@@ -93,8 +93,9 @@ class TrainingDatasetEvidence:
     training_sample_count: int
     validation_sample_count: int
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | str]:
         return {
+            "workload_profile": "ue_communication_forecasting",
             "observation_count": self.observation_count,
             "training_sample_count": self.training_sample_count,
             "validation_sample_count": self.validation_sample_count,

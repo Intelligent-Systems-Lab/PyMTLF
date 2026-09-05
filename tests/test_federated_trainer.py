@@ -28,6 +28,7 @@ def bundle(*, fill: float | None = None) -> LoadedBundle:
     scaler = StandardScaler().fit(np.arange(800, dtype=float).reshape(80, 10))
     return LoadedBundle(
         manifest={
+            "workload_profile": "ue_communication_forecasting",
             "model": {"input_size": 10, "output_size": 2},
             "inference": {
                 "feature_order": list(FEATURE_ORDER),

@@ -54,6 +54,8 @@ federated_learning:
       - "http://127.0.0.1:9092"
     timeout_seconds: 300
   client:
+    workload:
+      profile: "ue_communication_forecasting"
     training_data:
       collection_trigger: "consumer_subscription"
     # Send a delay request before the Server-provided deadline reaches this margin.

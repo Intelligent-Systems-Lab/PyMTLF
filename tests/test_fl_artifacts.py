@@ -40,6 +40,7 @@ def common_metadata() -> dict[str, object]:
 
 def dataset_evidence(training_sample_count: int = 120) -> dict[str, object]:
     return {
+        "workload_profile": "ue_communication_forecasting",
         "observation_count": 400,
         "training_sample_count": training_sample_count,
         "validation_sample_count": 34,
