@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, call
 
 import pytest
+from conftest import training_scope_descriptor
 
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import (
@@ -49,14 +50,7 @@ def _assignment(tmp_path) -> ValidatedHierarchyArtifact:
     contract = HierarchyAssignmentArtifact.model_validate(
         {
             "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "hierarchy_metadata": {
-                "contract_version": "1.0",
                 "message_type": "BRANCH_ASSIGNMENT",
                 "plan_id": PLAN,
                 "publisher_nf_instance_id": ROOT,
@@ -173,20 +167,9 @@ def _lower_global(tmp_path, round_indicator: int):
     contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "lower-process",
                 "round_ind": round_indicator,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": LEAF_A,
@@ -471,7 +454,7 @@ def test_parent_cancellation_after_upper_validation_fences_lower_round_publicati
                 upper_client_subscription_id="upper-resource",
                 upper_resource_revision=2,
                 upper_input_artifact_digest="3" * 64,
-                upper_scope_digest="7" * 64,
+                upper_training_scope=training_scope_descriptor(),
                 callback_margin_seconds=5,
             )
         except Exception as error:
@@ -510,20 +493,9 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
     lower_contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "lower-process",
                 "round_ind": 0,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": LEAF_A,
@@ -581,7 +553,7 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
         upper_client_subscription_id="upper-resource",
         upper_resource_revision=2,
         upper_input_artifact_digest="3" * 64,
-        upper_scope_digest="7" * 64,
+        upper_training_scope=training_scope_descriptor(),
         callback_margin_seconds=5,
     )
     replay = coordinator.execute_round(
@@ -591,7 +563,7 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
         upper_client_subscription_id="upper-resource",
         upper_resource_revision=2,
         upper_input_artifact_digest="3" * 64,
-        upper_scope_digest="7" * 64,
+        upper_training_scope=training_scope_descriptor(),
         callback_margin_seconds=5,
     )
 
@@ -623,7 +595,7 @@ def test_branch_round_preserves_root_epochs_and_maps_upper_to_lower(tmp_path):
             upper_client_subscription_id="upper-resource",
             upper_resource_revision=2,
             upper_input_artifact_digest="8" * 64,
-            upper_scope_digest="7" * 64,
+            upper_training_scope=training_scope_descriptor(),
             callback_margin_seconds=5,
         )
     assert (PLAN, "root-process", 4) not in coordinator._rounds
@@ -674,7 +646,7 @@ def test_branch_report_after_runs_sequential_lower_rounds_before_upper_report(tm
         upper_client_subscription_id="upper-resource",
         upper_resource_revision=2,
         upper_input_artifact_digest="3" * 64,
-        upper_scope_digest="7" * 64,
+        upper_training_scope=training_scope_descriptor(),
         callback_margin_seconds=6,
         local_work=IntermediateLocalWork(lower_round_count=3),
     )
@@ -738,7 +710,7 @@ def test_branch_report_after_failure_does_not_publish_earlier_partial_aggregate(
             upper_client_subscription_id="upper-resource",
             upper_resource_revision=2,
             upper_input_artifact_digest="3" * 64,
-            upper_scope_digest="7" * 64,
+            upper_training_scope=training_scope_descriptor(),
             callback_margin_seconds=6,
             local_work=IntermediateLocalWork(lower_round_count=3),
         )
@@ -772,12 +744,10 @@ def test_branch_validation_republishes_before_lower_dispatch_and_returns_leaf_ev
     summaries = tuple(
         ValidationSummary(
             participant_nf_instance_id=leaf_id,
-            scope_digest=str(index) * 64,
+            training_scope=training_scope_descriptor(f"scope-{index}"),
             evaluation_sample_count=10,
             start_time=start,
             end_time=start + timedelta(minutes=1),
-            base_model_weights_digest="4" * 64,
-            candidate_weights_digest="5" * 64,
             base=WapeComponents(
                 absolute_error_sum=10,
                 absolute_actual_sum=100,
@@ -823,7 +793,7 @@ def test_branch_validation_republishes_before_lower_dispatch_and_returns_leaf_ev
         upper_candidate_artifact=candidate_artifact,
         upper_client_subscription_id="upper-resource",
         upper_resource_revision=3,
-        upper_scope_digest="6" * 64,
+        upper_training_scope=training_scope_descriptor(),
         callback_margin_seconds=5,
     )
     replay = coordinator.execute_validation(
@@ -833,7 +803,7 @@ def test_branch_validation_republishes_before_lower_dispatch_and_returns_leaf_ev
         upper_candidate_artifact=candidate_artifact,
         upper_client_subscription_id="upper-resource",
         upper_resource_revision=3,
-        upper_scope_digest="6" * 64,
+        upper_training_scope=training_scope_descriptor(),
         callback_margin_seconds=5,
     )
 
@@ -894,7 +864,7 @@ def test_branch_validation_republish_failure_does_not_dispatch_leaves(tmp_path):
             upper_candidate_artifact=candidate_artifact,
             upper_client_subscription_id="upper-resource",
             upper_resource_revision=3,
-            upper_scope_digest="6" * 64,
+            upper_training_scope=training_scope_descriptor(),
             callback_margin_seconds=5,
         )
 
@@ -966,7 +936,7 @@ def test_branch_cancellation_during_validation_fences_late_lower_result(tmp_path
                 upper_candidate_artifact=candidate_artifact,
                 upper_client_subscription_id="upper-resource",
                 upper_resource_revision=3,
-                upper_scope_digest="6" * 64,
+                upper_training_scope=training_scope_descriptor(),
                 callback_margin_seconds=5,
             )
         except Exception as error:
@@ -999,20 +969,9 @@ def test_concurrent_exact_branch_round_replay_waits_for_one_lower_execution(tmp_
     lower_contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "lower-process",
                 "round_ind": 0,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": LEAF_A,
@@ -1078,7 +1037,7 @@ def test_concurrent_exact_branch_round_replay_waits_for_one_lower_execution(tmp_
                     upper_client_subscription_id="upper-resource",
                     upper_resource_revision=2,
                     upper_input_artifact_digest="3" * 64,
-                    upper_scope_digest="7" * 64,
+                    upper_training_scope=training_scope_descriptor(),
                     callback_margin_seconds=5,
                 )
             )
@@ -1109,20 +1068,9 @@ def test_branch_shutdown_wakes_lower_round_waiter_and_fences_upper_callback(tmp_
     lower_contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "lower-process",
                 "round_ind": 0,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": LEAF_A,
@@ -1190,7 +1138,7 @@ def test_branch_shutdown_wakes_lower_round_waiter_and_fences_upper_callback(tmp_
                 upper_client_subscription_id="upper-resource",
                 upper_resource_revision=2,
                 upper_input_artifact_digest="3" * 64,
-                upper_scope_digest="7" * 64,
+                upper_training_scope=training_scope_descriptor(),
                 callback_margin_seconds=5,
             )
         except Exception as error:

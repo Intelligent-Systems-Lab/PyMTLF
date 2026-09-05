@@ -35,6 +35,7 @@ from py_mtlf.core.fl_server import (
 from py_mtlf.core.fl_workspace import FLWorkspaceArtifact, ValidatedHierarchyArtifact
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
+from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainSubsc
 
 
@@ -68,7 +69,7 @@ class BranchRoundExecution:
     upper_ml_corre_id: str
     upper_round_indicator: int
     upper_input_artifact_digest: str
-    upper_scope_digest: str
+    upper_training_scope: TrainingScopeDescriptor
     lower_server_process_id: str
     lower_ml_corre_id: str
     lower_round_indicator: int
@@ -86,7 +87,7 @@ class BranchValidationExecution:
     upper_ml_corre_id: str
     upper_round_indicator: int
     upper_candidate_artifact_digest: str
-    upper_scope_digest: str
+    upper_training_scope: TrainingScopeDescriptor
     lower_server_process_id: str
     lower_validation_round: int
     republished_candidate: FLWorkspaceArtifact | None = None
@@ -370,7 +371,7 @@ class FLBranchPreparationCoordinator:
         upper_client_subscription_id: str,
         upper_resource_revision: int,
         upper_input_artifact_digest: str,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
         callback_margin_seconds: int,
         local_work: IntermediateLocalWork | None = None,
     ) -> FLWorkspaceArtifact:
@@ -420,7 +421,7 @@ class FLBranchPreparationCoordinator:
                         upper_ml_corre_id=upper_process_id,
                         upper_round_indicator=upper_round,
                         upper_input_artifact_digest=upper_input_artifact_digest,
-                        upper_scope_digest=upper_scope_digest,
+                        upper_training_scope=upper_training_scope,
                         lower_server_process_id=execution.process_id,
                         lower_ml_corre_id=execution.process_id,
                         lower_round_indicator=lower_round,
@@ -431,7 +432,7 @@ class FLBranchPreparationCoordinator:
                     upper_client_subscription_id=upper_client_subscription_id,
                     upper_resource_revision=upper_resource_revision,
                     upper_input_artifact_digest=upper_input_artifact_digest,
-                    upper_scope_digest=upper_scope_digest,
+                    upper_training_scope=upper_training_scope,
                 ):
                     conflicting = True
                     break
@@ -511,7 +512,7 @@ class FLBranchPreparationCoordinator:
                     upper_process_id=upper_process_id,
                     branch_nf_instance_id=context.nf_instance_id,
                     upper_round_indicator=upper_round,
-                    upper_scope_digest=upper_scope_digest,
+                    upper_training_scope=upper_training_scope,
                 )
                 self._rounds[key] = replace(
                     current,
@@ -541,7 +542,7 @@ class FLBranchPreparationCoordinator:
         upper_candidate_artifact: ArtifactMetadata,
         upper_client_subscription_id: str,
         upper_resource_revision: int,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
         callback_margin_seconds: int,
     ) -> FLWorkspaceArtifact:
         metadata = assignment.contract.hierarchy_metadata
@@ -582,7 +583,7 @@ class FLBranchPreparationCoordinator:
                         upper_ml_corre_id=upper_process_id,
                         upper_round_indicator=upper_round,
                         upper_candidate_artifact_digest=upper_candidate_artifact.key,
-                        upper_scope_digest=upper_scope_digest,
+                        upper_training_scope=upper_training_scope,
                         lower_server_process_id=preparation.process_id,
                         lower_validation_round=lower_round,
                     )
@@ -592,7 +593,7 @@ class FLBranchPreparationCoordinator:
                     upper_client_subscription_id=upper_client_subscription_id,
                     upper_resource_revision=upper_resource_revision,
                     upper_candidate_artifact_digest=upper_candidate_artifact.key,
-                    upper_scope_digest=upper_scope_digest,
+                    upper_training_scope=upper_training_scope,
                 ):
                     conflicting = True
                     break
@@ -649,7 +650,7 @@ class FLBranchPreparationCoordinator:
                     upper_process_id=upper_process_id,
                     branch_nf_instance_id=context.nf_instance_id,
                     upper_round_indicator=upper_round,
-                    upper_scope_digest=upper_scope_digest,
+                    upper_training_scope=upper_training_scope,
                     subordinate_summaries=collection.validation_summaries,
                 )
                 self._validations[key] = replace(
@@ -806,13 +807,13 @@ def _same_round_command(
     upper_client_subscription_id: str,
     upper_resource_revision: int,
     upper_input_artifact_digest: str,
-    upper_scope_digest: str,
+    upper_training_scope: TrainingScopeDescriptor,
 ) -> bool:
     return (
         execution.upper_client_subscription_id == upper_client_subscription_id
         and execution.upper_resource_revision == upper_resource_revision
         and execution.upper_input_artifact_digest == upper_input_artifact_digest
-        and execution.upper_scope_digest == upper_scope_digest
+        and execution.upper_training_scope == upper_training_scope
     )
 
 
@@ -822,12 +823,12 @@ def _same_validation_command(
     upper_client_subscription_id: str,
     upper_resource_revision: int,
     upper_candidate_artifact_digest: str,
-    upper_scope_digest: str,
+    upper_training_scope: TrainingScopeDescriptor,
 ) -> bool:
     return (
         execution.upper_client_subscription_id == upper_client_subscription_id
         and execution.upper_resource_revision == upper_resource_revision
         and execution.upper_candidate_artifact_digest
         == upper_candidate_artifact_digest
-        and execution.upper_scope_digest == upper_scope_digest
+        and execution.upper_training_scope == upper_training_scope
     )

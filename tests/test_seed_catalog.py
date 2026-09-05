@@ -198,7 +198,6 @@ def test_catalog_restore_serves_completed_federated_revision_to_new_consumer(
     )
     created_at = datetime.now(UTC)
     catalog_record = ModelCatalogRecord(
-        schema_version="1.0",
         latest_model_id=2,
         next_model_id=3,
         revisions=(
@@ -238,7 +237,6 @@ def test_catalog_restore_serves_completed_federated_revision_to_new_consumer(
     restored.open()
     restored.restore(
         DurableModelState(
-            schema_version="2.0",
             last_allocated_model_id=2,
             families={descriptor.family_id: catalog_record},
         )

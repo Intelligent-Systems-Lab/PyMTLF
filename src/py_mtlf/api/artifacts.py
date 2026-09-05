@@ -28,7 +28,6 @@ async def get_artifact(artifact_key: str, request: Request) -> Response:
         media_type=metadata.media_type,
         headers={
             "ETag": f'"sha256:{metadata.key}"',
-            "X-Artifact-SHA256": metadata.key,
             "Cache-Control": "public, max-age=31536000, immutable",
             "X-Content-Type-Options": "nosniff",
         },
@@ -66,7 +65,6 @@ async def get_fl_artifact(
         media_type="application/gzip",
         headers={
             "ETag": f'"sha256:{digest}"',
-            "X-Artifact-SHA256": digest,
             "Cache-Control": "public, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": "inline",

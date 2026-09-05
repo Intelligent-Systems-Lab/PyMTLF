@@ -554,14 +554,9 @@ def _configure_branch_result(
     registry,
     outcome: PreparationOutcome,
 ):
-    file_digests = {
-        "model.py": "1" * 64,
-        "model.npy": "2" * 64,
-        "scaler.pkl": "3" * 64,
-    }
     artifacts.publish_branch_assignment.return_value = SimpleNamespace(
         url="http://root.example/assignments/branch",
-        contract=SimpleNamespace(file_digests=file_digests),
+        contract=SimpleNamespace(),
     )
     result_url = "http://branch.example/artifacts/" + "d" * 64
 
@@ -616,10 +611,7 @@ def _configure_branch_result(
         contract = HierarchyPreparationResultArtifact.model_validate(
             {
                 "artifact_role": "HIERARCHY_PREPARATION_RESULT",
-                "bundle_schema_version": "1.0",
-                "file_digests": file_digests,
                 "hierarchy_metadata": {
-                    "contract_version": "1.0",
                     "message_type": "PREPARATION_RESULT",
                     "plan_id": plan_id,
                     "publisher_nf_instance_id": BRANCH_ID,

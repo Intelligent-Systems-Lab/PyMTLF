@@ -32,7 +32,6 @@ def strategy() -> dict[str, object]:
 
 def branch_assignment() -> dict[str, object]:
     return {
-        "contract_version": "1.0",
         "message_type": "BRANCH_ASSIGNMENT",
         "plan_id": PLAN,
         "publisher_nf_instance_id": ROOT,
@@ -43,7 +42,7 @@ def branch_assignment() -> dict[str, object]:
     }
 
 
-def test_fedprox_strategy_accepts_only_first_version_values() -> None:
+def test_fedprox_strategy_accepts_only_supported_values() -> None:
     value = FederatedStrategy.model_validate(strategy())
     assert value.algorithm.name == "fedprox"
     assert value.algorithm.proximal_mu == 0.01
@@ -113,7 +112,6 @@ def test_branch_assignment_rejects_invalid_plan_and_leaf_partition() -> None:
 
 def test_leaf_assignment_requires_branch_publisher_and_forbids_unknown_fields() -> None:
     value = {
-        "contract_version": "1.0",
         "message_type": "LEAF_ASSIGNMENT",
         "plan_id": PLAN,
         "publisher_nf_instance_id": BRANCH,
@@ -134,7 +132,6 @@ def test_leaf_assignment_requires_branch_publisher_and_forbids_unknown_fields() 
 
 def test_preparation_result_accepts_ready_and_failed_partitions() -> None:
     common = {
-        "contract_version": "1.0",
         "message_type": "PREPARATION_RESULT",
         "plan_id": PLAN,
         "publisher_nf_instance_id": BRANCH,
@@ -211,7 +208,6 @@ def test_preparation_result_rejects_invalid_failed_partitions(
     changes: dict[str, object],
 ) -> None:
     value = {
-        "contract_version": "1.0",
         "message_type": "PREPARATION_RESULT",
         "plan_id": PLAN,
         "publisher_nf_instance_id": BRANCH,
@@ -226,7 +222,6 @@ def test_preparation_result_rejects_invalid_failed_partitions(
 
 def test_preparation_result_rejects_unknown_cause_and_noncanonical_lists() -> None:
     value = {
-        "contract_version": "1.0",
         "message_type": "PREPARATION_RESULT",
         "plan_id": PLAN,
         "publisher_nf_instance_id": BRANCH,
@@ -262,5 +257,3 @@ def test_hierarchy_metadata_union_is_discriminated_and_fail_closed() -> None:
     assert isinstance(validate_hierarchy_metadata(branch_assignment()), BranchAssignmentMetadata)
     with pytest.raises(ValidationError):
         validate_hierarchy_metadata({**branch_assignment(), "message_type": "UNKNOWN"})
-    with pytest.raises(ValidationError):
-        validate_hierarchy_metadata({**branch_assignment(), "contract_version": "2.0"})

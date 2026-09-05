@@ -7,7 +7,6 @@ import threading
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -98,7 +97,6 @@ class CompletedRevision(DurableRecord):
 
 
 class ModelCatalogRecord(DurableRecord):
-    schema_version: Literal["1.0"]
     latest_model_id: int = Field(ge=0)
     next_model_id: int = Field(ge=0)
     revisions: tuple[CompletedRevision, ...] = Field(min_length=1)
@@ -137,7 +135,6 @@ class ModelCatalogRecord(DurableRecord):
 
 
 class PendingPublication(DurableRecord):
-    schema_version: Literal["1.0"]
     publication_id: str = Field(min_length=1)
     state: PublicationState
     ml_corre_id: str = Field(min_length=1)
@@ -210,7 +207,6 @@ class PendingPublication(DurableRecord):
 
 
 class DurableModelState(DurableRecord):
-    schema_version: Literal["2.0"]
     last_allocated_model_id: int = Field(ge=0)
     families: dict[str, ModelCatalogRecord] = Field(default_factory=dict)
     pending_publications: tuple[PendingPublication, ...] = ()
@@ -325,7 +321,7 @@ class DurableModelStateRepository:
             os.close(descriptor)
 
 
-def migrate_seed_catalog(
+def initialize_seed_catalog(
     *,
     model_unique_id: int,
     artifact_key: str,
@@ -341,7 +337,6 @@ def migrate_seed_catalog(
         created_at=created_at,
     )
     return ModelCatalogRecord(
-        schema_version="1.0",
         latest_model_id=model_unique_id,
         next_model_id=model_unique_id + 1,
         revisions=(seed,),

@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import re
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -174,7 +173,6 @@ class ArtifactRepository:
         names: set[str] = set()
         extracted_size = 0
         config_bytes: bytes | None = None
-        component_hashes: dict[str, str] = {}
         try:
             with tarfile.open(path, "r:gz") as archive:
                 members = archive.getmembers()
@@ -198,8 +196,6 @@ class ArtifactRepository:
                         )
                     if member.name == "config.json":
                         config_bytes = content
-                    else:
-                        component_hashes[member.name] = hashlib.sha256(content).hexdigest()
         except (tarfile.TarError, OSError) as exc:
             raise InvalidArtifactError("artifact is not a valid gzip tar archive") from exc
 
@@ -209,7 +205,7 @@ class ArtifactRepository:
             raise InvalidArtifactError(
                 f"artifact file set is invalid; missing={missing}, unexpected={unexpected}"
             )
-        self._validate_manifest(config_bytes, component_hashes)
+        self._validate_manifest(config_bytes)
 
     @staticmethod
     def _validate_member(member: tarfile.TarInfo, names: set[str]) -> None:
@@ -226,10 +222,7 @@ class ArtifactRepository:
             raise InvalidArtifactError("artifact contains an unsafe entry")
 
     @staticmethod
-    def _validate_manifest(
-        config_bytes: bytes | None,
-        component_hashes: dict[str, str],
-    ) -> None:
+    def _validate_manifest(config_bytes: bytes | None) -> None:
         if config_bytes is None:
             raise InvalidArtifactError("artifact is missing config.json")
         try:
@@ -238,8 +231,8 @@ class ArtifactRepository:
             raise InvalidArtifactError("config.json is not valid JSON") from exc
         if not isinstance(config, dict):
             raise InvalidArtifactError("config.json must contain a JSON object")
-        if config.get("bundle_schema_version") != "1.0":
-            raise InvalidArtifactError("unsupported bundle schema version")
+        if "file_digests" in config:
+            raise InvalidArtifactError("unsupported manifest field: file_digests")
         try:
             ModelIdentity.model_validate(config["model_identity"])
         except (KeyError, ValueError) as exc:
@@ -260,18 +253,6 @@ class ArtifactRepository:
         }
         if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
             raise InvalidArtifactError("bundle component filenames are invalid")
-        declared = config.get("file_digests")
-        if not isinstance(declared, dict) or set(declared) != set(component_hashes):
-            raise InvalidArtifactError("bundle component digest inventory is invalid")
-        for name, actual_digest in component_hashes.items():
-            declared_digest = declared.get(name)
-            if not isinstance(declared_digest, str) or not re.fullmatch(
-                r"[0-9a-f]{64}", declared_digest
-            ):
-                raise InvalidArtifactError("bundle component digest is invalid")
-            if declared_digest != actual_digest:
-                raise InvalidArtifactError("bundle component digest mismatch")
-
     @staticmethod
     def _fsync_directory(path: Path) -> None:
         try:

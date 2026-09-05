@@ -92,13 +92,15 @@ def test_publish_rejects_duplicate_entry(settings, bundle_path, tmp_path):
         repository.publish(duplicate)
 
 
-def test_publish_rejects_manifest_digest_mismatch(settings, tmp_path):
-    path = tmp_path / "bad-digest.tar.gz"
-    build_bundle(path, mutate_manifest={"file_digests": {}})
+def test_publish_rejects_removed_manifest_digest_inventory(
+    settings, tmp_path
+):
+    path = tmp_path / "removed-digest.tar.gz"
+    build_bundle(path, mutate_manifest={"file_digests": {"model.py": "invalid"}})
     repository = ArtifactRepository(settings.storage.artifact_root, settings.artifact)
     repository.open()
 
-    with pytest.raises(InvalidArtifactError, match="digest inventory"):
+    with pytest.raises(InvalidArtifactError, match="unsupported manifest field"):
         repository.publish(path)
 
 

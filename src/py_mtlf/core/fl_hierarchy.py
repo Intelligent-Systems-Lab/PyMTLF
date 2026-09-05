@@ -83,7 +83,6 @@ class CompleteRequiredAdmission(HierarchyContractModel):
 
 
 class CommonHierarchyMetadata(HierarchyContractModel):
-    contract_version: Literal["1.0"]
     message_type: HierarchyMessageType
     plan_id: str
     publisher_nf_instance_id: str

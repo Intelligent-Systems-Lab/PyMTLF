@@ -36,9 +36,6 @@ from py_mtlf.core.fl_workspace import (
     DownloadedArchive,
     ValidatedArchive,
     ValidatedHierarchyArtifact,
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
 )
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
@@ -139,7 +136,6 @@ def round_training_dataset(sample_count: int = 10) -> TrainingDataset:
     )
     scope = ScopeTrainingData(
         scope_key="scope-a",
-        scope_digest="a" * 64,
         observation_count=observation_count,
         observation_timestamps=tuple(
             datetime(2026, 8, 26, tzinfo=UTC) + timedelta(seconds=index)
@@ -180,26 +176,16 @@ def client_settings() -> FLClientSettings:
 def round_input_bundle(*, epochs: int = 7):
     model = torch.nn.Linear(2, 1)
     manifest = {
-        "bundle_schema_version": "1.0",
         "artifact_role": "ROUND_INPUT",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
         "model": {"input_size": 2, "output_size": 1},
         "inference": {"feature_order": ["uplink", "downlink"]},
-        "file_digests": {
-            "model.py": "1" * 64,
-            "model.npy": "2" * 64,
-            "scaler.pkl": "3" * 64,
-        },
     }
     manifest["fl_metadata"] = {
-        "contract_version": "1.0",
         "ml_corre_id": "fl-process-001",
         "round_ind": 2,
-        "model_contract_digest": model_contract_digest(manifest),
-        "preprocessing_contract_digest": preprocessing_contract_digest(manifest),
-        "weights_digest": weights_digest(model),
         "client_training": {"epochs": epochs},
     }
     return Mock(manifest=manifest, model=model)
@@ -208,28 +194,16 @@ def round_input_bundle(*, epochs: int = 7):
 def round_global_bundle():
     model = torch.nn.Linear(2, 1)
     manifest = {
-        "bundle_schema_version": "1.0",
         "artifact_role": "ROUND_GLOBAL",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
         "model": {"input_size": 2, "output_size": 1},
         "inference": {"feature_order": ["uplink", "downlink"]},
-        "file_digests": {
-            "model.py": "1" * 64,
-            "model.npy": "2" * 64,
-            "scaler.pkl": "3" * 64,
-        },
     }
-    digest = weights_digest(model)
     manifest["fl_metadata"] = {
-        "contract_version": "1.0",
         "ml_corre_id": "fl-process-001",
         "round_ind": 1,
-        "model_contract_digest": model_contract_digest(manifest),
-        "preprocessing_contract_digest": preprocessing_contract_digest(manifest),
-        "base_weights_digest": digest,
-        "weights_digest": digest,
         "participants": [
             {
                 "participant_nf_instance_id": (
@@ -249,7 +223,6 @@ def hierarchy_assignment(tmp_path, *, branch: bool) -> ValidatedHierarchyArtifac
     branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     hierarchy_metadata = {
-        "contract_version": "1.0",
         "message_type": (
             HierarchyMessageType.BRANCH_ASSIGNMENT
             if branch
@@ -277,12 +250,6 @@ def hierarchy_assignment(tmp_path, *, branch: bool) -> ValidatedHierarchyArtifac
     contract = HierarchyAssignmentArtifact.model_validate(
         {
             "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "hierarchy_metadata": hierarchy_metadata,
         }
     )
@@ -973,8 +940,6 @@ def test_preparation_uses_trainable_samples_instead_of_raw_records(tmp_path, cap
             resource.revision,
             job,
             {"analytics_event": "UE_COMMUNICATION"},
-            "model-contract",
-            "preprocessing-contract",
         )
 
         updated = service.get(resource.subscription_id)
@@ -1018,8 +983,6 @@ def test_preparation_success_returns_validated_input_model_url(tmp_path, caplog)
             resource.revision,
             job,
             {"analytics_event": "UE_COMMUNICATION"},
-            "model-contract",
-            "preprocessing-contract",
         )
 
         notification = service._enqueue_delivery.call_args.args[1]
@@ -1147,7 +1110,6 @@ def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
     workspace.download_archive.return_value = DownloadedArchive(
         metadata=artifact,
         validated=ValidatedArchive(manifest={}, contract=None),
-        response_digest_headers=(),
     )
     base_manifest = {
         "analytics_event": "UE_COMMUNICATION",
@@ -1160,11 +1122,6 @@ def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
             "feature_order": list(FEATURE_ORDER),
             "output_fields": ["ul_vol", "dl_vol"],
             "preprocessing": "log1p_standard_scaler",
-        },
-        "file_digests": {
-            "model.py": "1" * 64,
-            "model.npy": "2" * 64,
-            "scaler.pkl": "3" * 64,
         },
     }
     service = FLClientEngine(
@@ -1227,14 +1184,7 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(
     contract = HierarchyAssignmentArtifact.model_validate(
         {
             "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "hierarchy_metadata": {
-                "contract_version": "1.0",
                 "message_type": HierarchyMessageType.LEAF_ASSIGNMENT,
                 "plan_id": plan_id,
                 "publisher_nf_instance_id": branch_id,
@@ -1278,7 +1228,6 @@ def test_leaf_assignment_binds_plan_before_local_data_preparation(
     workspace.download_archive.return_value = DownloadedArchive(
         metadata=generic,
         validated=ValidatedArchive(manifest=manifest, contract=contract),
-        response_digest_headers=("a" * 64,),
     )
     workspace.admit_assignment.return_value = admitted
     context_client = Mock()
@@ -1374,7 +1323,6 @@ def test_hierarchy_assignment_bind_failure_releases_adopted_plan_artifact(tmp_pa
             manifest=assignment.manifest,
             contract=assignment.contract,
         ),
-        response_digest_headers=(assignment.metadata.key,),
     )
     workspace.admit_assignment.return_value = assignment
     context = Mock()
@@ -1444,14 +1392,7 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
     contract = HierarchyAssignmentArtifact.model_validate(
         {
             "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "hierarchy_metadata": {
-                "contract_version": "1.0",
                 "message_type": HierarchyMessageType.BRANCH_ASSIGNMENT,
                 "plan_id": plan_id,
                 "publisher_nf_instance_id": root_id,
@@ -1494,7 +1435,6 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
     workspace.download_archive.return_value = DownloadedArchive(
         metadata=generic,
         validated=ValidatedArchive(manifest=admitted.manifest, contract=contract),
-        response_digest_headers=("a" * 64,),
     )
     workspace.admit_assignment.return_value = admitted
     context = Mock()
@@ -1550,12 +1490,7 @@ def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
         assert active.assigned_role is ExperimentRole.BRANCH
         assert updated.branch_process_id == "lower-process"
         assert updated.hierarchy_assignment == admitted
-        assert updated.expected_model_contract_digest == model_contract_digest(
-            admitted.manifest
-        )
-        assert updated.expected_preprocessing_contract_digest == (
-            preprocessing_contract_digest(admitted.manifest)
-        )
+        assert updated.preparation_base_artifact == admitted.metadata
         branch.prepare.assert_called_once_with(
             assignment=admitted,
             representation=value,
@@ -1723,8 +1658,6 @@ def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
         ),
         dataset_snapshot=Mock(),
         prepared_training_sample_count=10,
-        expected_model_contract_digest="a" * 64,
-        expected_preprocessing_contract_digest="b" * 64,
         preparation_base_artifact=Mock(),
     )
     service._resources[resource.subscription_id] = resource
@@ -1810,17 +1743,14 @@ def test_final_validation_uses_configured_training_device(
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
         dataset_snapshot=snapshot,
         prepared_training_sample_count=10,
-        expected_model_contract_digest="a" * 64,
-        expected_preprocessing_contract_digest="b" * 64,
         preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
     )
     service._resources[resource.subscription_id] = resource
-    base = Mock(manifest={"bundle": "base"}, model=Mock(), scaler=Mock())
     candidate = round_global_bundle()
+    base = candidate
     if hierarchy_leaf:
         candidate.manifest["fl_metadata"]["ml_corre_id"] = "root-process"
-    candidate.manifest["fl_metadata"]["weights_digest"] = "c" * 64
     candidate.scaler = Mock()
     service._loader = Mock()
     service._loader.load.side_effect = [base, candidate]
@@ -1838,13 +1768,6 @@ def test_final_validation_uses_configured_training_device(
         side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
     )
     monkeypatch.setattr(LocalTrainer, "_predict", predict)
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_client.model_contract_digest", lambda _: "a" * 64
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_client.preprocessing_contract_digest", lambda _: "b" * 64
-    )
-    monkeypatch.setattr("py_mtlf.core.fl_client.weights_digest", lambda _: "c" * 64)
     assert service._capacity.acquire(blocking=False)
     try:
         service._run_validation(resource.subscription_id, resource.revision)
@@ -1901,16 +1824,8 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
         workspace,
     )
     service._loader = Mock()
-    service._loader.load.side_effect = (base, base, candidate)
-    training_scope = Mock(
-        training_sample_count=10,
-        validation_sample_count=2,
-        validation_targets=np.asarray([2.0, 4.0]),
-    )
-    dataset = Mock(
-        training_scopes=(training_scope,),
-        evaluation_scopes=(training_scope,),
-    )
+    service._loader.load.side_effect = (base, base, base, candidate)
+    dataset = round_training_dataset(10)
     service._dataset_builder = Mock(return_value=dataset)
     service._dataset_builder.build.return_value = dataset
     result_model = torch.nn.Linear(2, 1)
@@ -1921,7 +1836,7 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
     )
     service._enqueue_delivery = Mock()
     predict = Mock(
-        side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
+        side_effect=(np.asarray([[1.0, 3.0]]), np.asarray([[2.0, 3.0]]))
     )
     monkeypatch.setattr(LocalTrainer, "_predict", predict)
     snapshot = Mock()
@@ -1934,10 +1849,6 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
         scope=TrainingScopeDescriptor.from_training_request(round_value, 0),
         dataset_snapshot=snapshot,
         prepared_training_sample_count=10,
-        expected_model_contract_digest=model_contract_digest(base.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            base.manifest
-        ),
         preparation_base_artifact=Mock(name="preparation-base"),
     )
     service._resources[resource.subscription_id] = resource
@@ -2171,10 +2082,7 @@ def test_branch_round_delegates_without_local_dataset_or_training(
         representation=value,
         state=FLClientState.ROUND_RUNNING,
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        expected_model_contract_digest=model_contract_digest(base.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            base.manifest
-        ),
+        preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
     )
     service._resources[resource.subscription_id] = resource
@@ -2195,7 +2103,7 @@ def test_branch_round_delegates_without_local_dataset_or_training(
             upper_client_subscription_id=resource.subscription_id,
             upper_resource_revision=resource.revision,
             upper_input_artifact_digest="4" * 64,
-            upper_scope_digest=resource.scope.scope_digest,
+            upper_training_scope=resource.scope,
             callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
         )
         service._dataset_builder.build.assert_not_called()
@@ -2237,7 +2145,7 @@ def test_branch_validation_delegates_without_local_dataset_or_local_metrics(
     )
     value = NwdafMLModelTrainSubsc.model_validate(payload)
     candidate = round_global_bundle()
-    base = Mock(manifest=candidate.manifest, model=Mock())
+    base = Mock(manifest=candidate.manifest, model=candidate.model)
     assignment = hierarchy_assignment(tmp_path, branch=True)
     candidate_artifact = Mock(key="4" * 64)
     workspace = Mock()
@@ -2265,10 +2173,6 @@ def test_branch_validation_delegates_without_local_dataset_or_local_metrics(
         representation=value,
         state=FLClientState.VALIDATION_RUNNING,
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        expected_model_contract_digest=model_contract_digest(candidate.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            candidate.manifest
-        ),
         preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
     )
@@ -2293,7 +2197,7 @@ def test_branch_validation_delegates_without_local_dataset_or_local_metrics(
             upper_candidate_artifact=candidate_artifact,
             upper_client_subscription_id=resource.subscription_id,
             upper_resource_revision=dispatched_revision,
-            upper_scope_digest=resource.scope.scope_digest,
+            upper_training_scope=resource.scope,
             callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
         )
         service._dataset_builder.build.assert_not_called()
@@ -2332,7 +2236,7 @@ def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_pa
     )
     value = NwdafMLModelTrainSubsc.model_validate(payload)
     candidate = round_global_bundle()
-    base = Mock(manifest=candidate.manifest, model=Mock())
+    base = Mock(manifest=candidate.manifest, model=candidate.model)
     assignment = hierarchy_assignment(tmp_path, branch=True)
     metadata = assignment.contract.hierarchy_metadata
     plan_id = metadata.plan_id
@@ -2410,10 +2314,6 @@ def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_pa
         representation=value,
         state=FLClientState.VALIDATION_RUNNING,
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        expected_model_contract_digest=model_contract_digest(candidate.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            candidate.manifest
-        ),
         preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
         experiment_reservation_id=reservation.reservation_id,
@@ -2515,10 +2415,7 @@ def test_leaf_round_uses_resolved_or_legacy_local_work(
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
         dataset_snapshot=Mock(),
         prepared_training_sample_count=10,
-        expected_model_contract_digest=model_contract_digest(base.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            base.manifest
-        ),
+        preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
         client_local_work=local_work,
     )
@@ -2607,10 +2504,7 @@ def test_go_generation_reset_drops_leaf_result_published_during_abort(tmp_path):
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
         dataset_snapshot=Mock(),
         prepared_training_sample_count=10,
-        expected_model_contract_digest=model_contract_digest(base.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            base.manifest
-        ),
+        preparation_base_artifact=Mock(),
         hierarchy_assignment=assignment,
         experiment_reservation_id=reservation.reservation_id,
     )
@@ -2691,10 +2585,7 @@ def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_pat
         scope=TrainingScopeDescriptor.from_training_request(value, 0),
         dataset_snapshot=Mock(),
         prepared_training_sample_count=10,
-        expected_model_contract_digest=model_contract_digest(base.manifest),
-        expected_preprocessing_contract_digest=preprocessing_contract_digest(
-            base.manifest
-        ),
+        preparation_base_artifact=Mock(),
     )
     service._resources[resource.subscription_id] = resource
     assert service._capacity.acquire(blocking=False)

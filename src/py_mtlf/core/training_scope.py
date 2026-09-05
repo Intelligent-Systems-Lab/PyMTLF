@@ -1,5 +1,3 @@
-import hashlib
-import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +17,6 @@ class TrainingScopeDescriptor(BaseModel):
         default_factory=list,
         alias="requestedTimeWindows",
     )
-    scope_digest: str = Field(alias="scopeDigest", pattern=r"^[0-9a-f]{64}$")
 
     @classmethod
     def from_training_request(
@@ -52,34 +49,8 @@ class TrainingScopeDescriptor(BaseModel):
                     )
                 )
 
-        canonical = {
-            "eventSubscription": event_subscription,
-            "requestedTimeWindows": requested_time_windows,
-        }
-        if target_reporting_ue is not None:
-            canonical["targetReportingUe"] = target_reporting_ue
-        digest = hashlib.sha256(_canonical_json(canonical)).hexdigest()
         return cls(
             eventSubscription=event_subscription,
             targetReportingUe=target_reporting_ue,
             requestedTimeWindows=requested_time_windows,
-            scopeDigest=digest,
         )
-
-    def canonical_payload(self) -> bytes:
-        value = {
-            "eventSubscription": self.event_subscription,
-            "requestedTimeWindows": self.requested_time_windows,
-        }
-        if self.target_reporting_ue is not None:
-            value["targetReportingUe"] = self.target_reporting_ue
-        return _canonical_json(value)
-
-
-def _canonical_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()

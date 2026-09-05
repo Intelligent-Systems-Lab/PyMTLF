@@ -16,9 +16,7 @@ from py_mtlf.core.artifacts import ArtifactMetadata, ArtifactRepository
 from py_mtlf.core.fl_artifacts import HierarchyValidation, ValidationSummary
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
+    validate_model_compatibility,
 )
 from py_mtlf.core.model_records import (
     AdrfReference,
@@ -256,7 +254,6 @@ class PublicationCoordinator:
                 family.next_model_id,
             )
             created = PendingPublication(
-                schemaVersion="1.0",
                 publicationId=str(uuid4()),
                 state=PublicationState.RESERVED,
                 mlCorreId=candidate.process_id,
@@ -307,7 +304,7 @@ class PublicationCoordinator:
             url="",
         )
         candidate_bundle = self._loader.load(candidate_metadata)
-        candidate_weights = weights_digest(candidate_bundle.model)
+        validate_model_compatibility(base_bundle, candidate_bundle)
         created_at = datetime.now(UTC)
         final = self._workspace.publish(
             process_id=publication.ml_corre_id,
@@ -322,14 +319,7 @@ class PublicationCoordinator:
                 "model_generation": publication.expected_generation + 1,
                 "created_at": created_at.isoformat(),
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": publication.ml_corre_id,
-                    "model_contract_digest": model_contract_digest(base_bundle.manifest),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(
-                        base_bundle.manifest
-                    ),
-                    "base_weights_digest": weights_digest(base_bundle.model),
-                    "weights_digest": candidate_weights,
                     "previous_model_unique_id": publication.previous_model_id,
                     "participants": [
                         {
@@ -338,7 +328,6 @@ class PublicationCoordinator:
                         }
                         for item in publication.participants_and_sample_counts
                     ],
-                    "final_candidate_digest": candidate_weights,
                     "validation_summary": [
                         item.model_dump(mode="json") for item in publication.validation_evidence
                     ],
@@ -565,7 +554,6 @@ class PublicationCoordinator:
             ):
                 raise RuntimeError("durable catalog base changed before publication commit")
             updated_family = ModelCatalogRecord(
-                schemaVersion="1.0",
                 latestModelId=publication.reserved_model_id,
                 nextModelId=max(family.next_model_id, publication.reserved_model_id + 1),
                 revisions=(*family.revisions, revision),

@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import logging
 import threading
@@ -11,6 +10,7 @@ from unittest.mock import Mock, call
 import httpx
 import pytest
 import torch
+from conftest import training_scope_descriptor
 from nwdaf_context import context_client
 
 from py_mtlf.config import FederatedLearningSettings, FLServerSettings
@@ -44,11 +44,6 @@ from py_mtlf.core.fl_server import (
     HierarchyPreparationTarget,
     HierarchyValidationCollection,
     _assign,
-)
-from py_mtlf.core.fl_workspace import (
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
 )
 from py_mtlf.wire.ml_model_training import NwdafMLModelTrainNotif
 from py_mtlf.wire.private import SelectedTarget
@@ -143,12 +138,10 @@ def validation_summary(
     start = datetime(2026, 8, 20, tzinfo=UTC)
     return ValidationSummary(
         participant_nf_instance_id=participant_id,
-        scope_digest="a" * 64,
+        training_scope=training_scope_descriptor(),
         evaluation_sample_count=10,
         start_time=start,
         end_time=start + timedelta(minutes=1),
-        base_model_weights_digest="b" * 64,
-        candidate_weights_digest="c" * 64,
         base=WapeComponents(
             absolute_error_sum=base_error,
             absolute_actual_sum=100,
@@ -842,46 +835,28 @@ def test_final_validation_rejects_owned_candidate_url_mismatch_without_download(
 )
 def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
     tmp_path,
-    monkeypatch,
     trigger_source,
     triggering_scope_key,
     candidate_error,
     expected_reasons,
 ):
     participant_id = "11111111-1111-4111-8111-111111111111"
-    base_digest = "b" * 64
-    candidate_digest = "c" * 64
-    model_digest = "d" * 64
-    preprocessing_digest = "e" * 64
     start = datetime(2026, 8, 20, tzinfo=UTC)
+    expected_scope = training_scope_descriptor()
     local_contract = RoundLocalArtifact.model_validate(
         {
-            "bundle_schema_version": "1.0",
             "artifact_role": "ROUND_LOCAL",
             "result_type": "ACCURACY_CHECK",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "process-1",
                 "round_ind": 2,
                 "participant_nf_instance_id": participant_id,
-                "scope_digest": "a" * 64,
-                "input_global_weights_digest": candidate_digest,
-                "model_contract_digest": model_digest,
-                "preprocessing_contract_digest": preprocessing_digest,
-                "base_weights_digest": candidate_digest,
-                "weights_digest": candidate_digest,
+                "training_scope": expected_scope.model_dump(mode="json"),
                 "evaluation": {
                     "evaluation_stage": "FINAL_VALIDATION",
                     "evaluation_sample_count": 10,
                     "start_time": start,
                     "end_time": start + timedelta(minutes=1),
-                    "base_model_weights_digest": base_digest,
-                    "candidate_weights_digest": candidate_digest,
                     "base": {
                         "absolute_error_sum": 10,
                         "absolute_actual_sum": 100,
@@ -899,7 +874,7 @@ def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
         scope=scope("scope-a", "000001", participant_id),
         candidate=candidate(participant_id, "000001"),
         notification_correlation_id="validation-client-a",
-        expected_scope_digest="a" * 64,
+        expected_training_scope=expected_scope,
         notification=NwdafMLModelTrainNotif.model_validate(
             {
                 "notifCorreId": "validation-client-a",
@@ -932,7 +907,7 @@ def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
                 participants=(
                     FlatParticipantScope.from_monitor_scope(participant.scope),
                 ),
-                topology_digest="f" * 64,
+                topology_version=1,
             ),
             required_cutover_scope_keys=(
                 (triggering_scope_key,) if triggering_scope_key is not None else ()
@@ -956,26 +931,24 @@ def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
         client=Mock(),
     )
     orchestrator._loader = Mock()
+    contract_fields = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 1},
+        "inference": {"seq_length": 1},
+    }
+    models = [Mock(), Mock(), Mock()]
+    for model in models:
+        model.state_dict.return_value = {}
     orchestrator._loader.load.side_effect = [
-        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=base_digest)),
-        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=candidate_digest)),
+        SimpleNamespace(manifest=contract_fields, model=models[0]),
+        SimpleNamespace(manifest=contract_fields, model=models[1]),
         SimpleNamespace(
-            manifest=local_contract.model_dump(mode="json"),
-            model=SimpleNamespace(digest=candidate_digest),
+            manifest={**contract_fields, **local_contract.model_dump(mode="json")},
+            model=models[2],
         ),
     ]
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.weights_digest",
-        lambda model: model.digest,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.model_contract_digest",
-        lambda _manifest: model_digest,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.preprocessing_contract_digest",
-        lambda _manifest: preprocessing_digest,
-    )
     try:
         orchestrator._evaluate_final_validation(
             process,
@@ -1217,7 +1190,7 @@ def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_pat
         orchestrator.close()
 
 
-def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_path):
+def test_delay_callback_uses_stage_state_without_body_digest(tmp_path):
     owner_id = "11111111-1111-4111-8111-111111111111"
     participant = FLParticipant(
         scope=scope("scope-a", "000001", owner_id),
@@ -1257,14 +1230,13 @@ def test_duplicate_delay_callback_is_acknowledged_without_second_extension(tmp_p
     )
     try:
         orchestrator.receive_notification(notification)
-        first_digest = participant.accepted_delay_notification_digest
         orchestrator.receive_notification(notification)
         process.state = FLServerState.READY
-        orchestrator.receive_notification(notification)
+        with pytest.raises(ValueError, match="outside the expected stage"):
+            orchestrator.receive_notification(notification)
 
         assert participant.requested_extension == 30
-        assert participant.accepted_delay_notification_digest == first_digest
-        assert process.failure == ""
+        assert process.failure == "delay callback arrived outside the expected stage"
     finally:
         orchestrator.close()
 
@@ -1579,28 +1551,17 @@ def test_hierarchy_validation_uses_existing_resources_and_next_round(tmp_path):
         orchestrator.close()
 
 
-def test_multiround_hierarchy_candidate_keeps_last_round_base_digest(
-    tmp_path, monkeypatch
+def test_multiround_hierarchy_candidate_preserves_process_round_and_model_contract(
+    tmp_path,
 ):
     candidate_path = tmp_path / "candidate.tar.gz"
     candidate_path.write_bytes(b"candidate")
     contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "root-process",
                 "round_ind": 1,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": (
@@ -1620,8 +1581,15 @@ def test_multiround_hierarchy_candidate_keeps_last_round_base_digest(
         path=candidate_path,
         url="http://root.example/candidate",
     )
-    base_bundle = Mock(manifest={"kind": "same"}, model="initial")
-    candidate_bundle = Mock(manifest={"kind": "same"}, model="candidate")
+    manifest = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 1},
+        "inference": {"seq_length": 1},
+    }
+    base_bundle = Mock(manifest=manifest, model=torch.nn.Linear(1, 1))
+    candidate_bundle = Mock(manifest=manifest, model=torch.nn.Linear(1, 1))
     loader = Mock()
     loader.load.side_effect = [base_bundle, candidate_bundle]
     orchestrator = FLServerEngine(
@@ -1634,18 +1602,6 @@ def test_multiround_hierarchy_candidate_keeps_last_round_base_digest(
         Mock(),
     )
     orchestrator._loader = loader
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.weights_digest",
-        lambda model: {"initial": "a" * 64, "candidate": "7" * 64}[model],
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.model_contract_digest",
-        lambda _manifest: "4" * 64,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.preprocessing_contract_digest",
-        lambda _manifest: "5" * 64,
-    )
     try:
         validated = orchestrator._validate_hierarchy_candidate(
             candidate=candidate,
@@ -1654,8 +1610,7 @@ def test_multiround_hierarchy_candidate_keeps_last_round_base_digest(
             expected_candidate_round=1,
         )
 
-        assert validated.base_weights_digest == "a" * 64
-        assert validated.candidate_weights_digest == "7" * 64
+        assert validated.artifact.key == "9" * 64
     finally:
         orchestrator.close()
 
@@ -1712,7 +1667,6 @@ def test_hierarchy_validation_rejects_invalid_candidate_before_branch_dispatch(
 
 def test_hierarchy_validation_rejects_mismatched_candidate_identity_before_dispatch(
     tmp_path,
-    monkeypatch,
 ):
     branch_id = "11111111-1111-4111-8111-111111111111"
     participant = FLParticipant(
@@ -1733,20 +1687,9 @@ def test_hierarchy_validation_rejects_mismatched_candidate_identity_before_dispa
     contract = RoundGlobalArtifact.model_validate(
         {
             "artifact_role": "ROUND_GLOBAL",
-            "bundle_schema_version": "1.0",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "different-process",
                 "round_ind": 1,
-                "model_contract_digest": "4" * 64,
-                "preprocessing_contract_digest": "5" * 64,
-                "base_weights_digest": "6" * 64,
-                "weights_digest": "7" * 64,
                 "participants": [
                     {
                         "participant_nf_instance_id": branch_id,
@@ -1787,18 +1730,6 @@ def test_hierarchy_validation_rejects_mismatched_candidate_identity_before_dispa
             model=SimpleNamespace(digest="7" * 64),
         ),
     ]
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.model_contract_digest",
-        lambda _manifest: "4" * 64,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.preprocessing_contract_digest",
-        lambda _manifest: "5" * 64,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.weights_digest",
-        lambda model: model.digest,
-    )
     try:
         with pytest.raises(RuntimeError, match="identity does not match"):
             orchestrator.execute_hierarchy_validation(
@@ -1878,45 +1809,28 @@ def test_hierarchy_validation_deadline_records_every_missing_participant(tmp_pat
 
 def test_root_rejects_branch_validation_evidence_for_unassigned_leaf(
     tmp_path,
-    monkeypatch,
 ):
     branch_id = "11111111-1111-4111-8111-111111111111"
     admitted_leaf = "22222222-2222-4222-8222-222222222222"
     wrong_leaf = "33333333-3333-4333-8333-333333333333"
-    base_digest = "b" * 64
-    candidate_digest = "c" * 64
-    model_digest = "d" * 64
-    preprocessing_digest = "e" * 64
     archive_digest = "f" * 64
     start = datetime(2026, 8, 20, tzinfo=UTC)
+    expected_scope = training_scope_descriptor()
     subordinate = ValidationSummary(
         participant_nf_instance_id=wrong_leaf,
-        scope_digest="1" * 64,
+        training_scope=training_scope_descriptor("wrong-leaf"),
         evaluation_sample_count=10,
         start_time=start,
         end_time=start + timedelta(minutes=1),
-        base_model_weights_digest=base_digest,
-        candidate_weights_digest=candidate_digest,
         base=WapeComponents(absolute_error_sum=10, absolute_actual_sum=100),
         candidate=WapeComponents(absolute_error_sum=5, absolute_actual_sum=100),
     )
     candidate_contract = RoundGlobalArtifact.model_validate(
         {
-            "bundle_schema_version": "1.0",
             "artifact_role": "ROUND_GLOBAL",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "root-process",
                 "round_ind": 1,
-                "model_contract_digest": model_digest,
-                "preprocessing_contract_digest": preprocessing_digest,
-                "base_weights_digest": base_digest,
-                "weights_digest": candidate_digest,
                 "participants": [
                     {
                         "participant_nf_instance_id": branch_id,
@@ -1930,32 +1844,18 @@ def test_root_rejects_branch_validation_evidence_for_unassigned_leaf(
     )
     local_contract = RoundLocalArtifact.model_validate(
         {
-            "bundle_schema_version": "1.0",
             "artifact_role": "ROUND_LOCAL",
             "result_type": "ACCURACY_CHECK",
-            "file_digests": {
-                "model.py": "1" * 64,
-                "model.npy": "2" * 64,
-                "scaler.pkl": "3" * 64,
-            },
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "root-process",
                 "round_ind": 2,
                 "participant_nf_instance_id": branch_id,
-                "scope_digest": "a" * 64,
-                "input_global_weights_digest": candidate_digest,
-                "model_contract_digest": model_digest,
-                "preprocessing_contract_digest": preprocessing_digest,
-                "base_weights_digest": candidate_digest,
-                "weights_digest": candidate_digest,
+                "training_scope": expected_scope.model_dump(mode="json"),
                 "evaluation": {
                     "evaluation_stage": "FINAL_VALIDATION",
                     "evaluation_sample_count": 10,
                     "start_time": start,
                     "end_time": start + timedelta(minutes=1),
-                    "base_model_weights_digest": base_digest,
-                    "candidate_weights_digest": candidate_digest,
                     "base": {
                         "absolute_error_sum": 10,
                         "absolute_actual_sum": 100,
@@ -1983,7 +1883,7 @@ def test_root_rejects_branch_validation_evidence_for_unassigned_leaf(
         scope=scope("branch-a", "000001", branch_id),
         candidate=candidate(branch_id, "000001"),
         notification_correlation_id="validation-branch-a",
-        expected_scope_digest="a" * 64,
+        expected_training_scope=expected_scope,
         notification=NwdafMLModelTrainNotif.model_validate(
             {
                 "notifCorreId": "validation-branch-a",
@@ -2019,26 +1919,25 @@ def test_root_rejects_branch_validation_evidence_for_unassigned_leaf(
         client=Mock(),
     )
     orchestrator._loader = Mock()
+    contract_fields = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 1},
+        "inference": {"seq_length": 1},
+    }
+    models = [Mock(), Mock(), Mock()]
+    for model in models:
+        model.state_dict.return_value = {}
     orchestrator._loader.load.side_effect = [
-        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=base_digest)),
-        SimpleNamespace(manifest={}, model=SimpleNamespace(digest=candidate_digest)),
+        SimpleNamespace(manifest=contract_fields, model=models[0]),
+        SimpleNamespace(manifest=contract_fields, model=models[1]),
+        SimpleNamespace(manifest=contract_fields, model=models[1]),
         SimpleNamespace(
-            manifest=local_contract.model_dump(mode="json"),
-            model=SimpleNamespace(digest=candidate_digest),
+            manifest={**contract_fields, **local_contract.model_dump(mode="json")},
+            model=models[2],
         ),
     ]
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.weights_digest",
-        lambda model: model.digest,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.model_contract_digest",
-        lambda _manifest: model_digest,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.fl_server.preprocessing_contract_digest",
-        lambda _manifest: preprocessing_digest,
-    )
     try:
         with pytest.raises(RuntimeError, match="subordinate set"):
             orchestrator._collect_hierarchy_validation(
@@ -2652,15 +2551,17 @@ def test_hierarchy_round_timeout_can_accept_completed_selected_subset(tmp_path):
             ]
             == participant_ids[:1]
         )
-        with pytest.raises(ValueError, match="after the active stage"):
-            orchestrator.receive_notification(
-                NwdafMLModelTrainNotif(
-                    notifCorreId=participants[1].notification_correlation_id,
-                    mlCorreId=process.process_id,
-                    roundInd=2,
-                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
-                )
+        prior_failure = participants[1].round_failure
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif(
+                notifCorreId=participants[1].notification_correlation_id,
+                mlCorreId=process.process_id,
+                roundInd=2,
+                termTrainReq="NOT_AVAILABLE_ML_TRAIN",
             )
+        )
+        assert participants[1].round_failure == prior_failure
+        assert process.state is FLServerState.READY
     finally:
         thread.join(timeout=2)
         orchestrator.close()
@@ -3316,7 +3217,7 @@ def test_hierarchy_wrong_round_records_failure_but_still_collects_other_outcomes
     "active_state",
     [FLServerState.ROUND_DISPATCH, FLServerState.FINAL_VALIDATION_DISPATCH],
 )
-def test_hierarchy_callback_during_dispatch_is_idempotent_but_conflict_fails(
+def test_hierarchy_callback_during_dispatch_keeps_first_terminal_outcome(
     tmp_path,
     active_state,
 ):
@@ -3373,9 +3274,9 @@ def test_hierarchy_callback_during_dispatch_is_idempotent_but_conflict_fails(
 
         assert participant.round_complete is True
         assert participant.round_failure == ""
-        with pytest.raises(ValueError, match="conflicting duplicate round callback"):
-            orchestrator.receive_notification(conflicting)
-        assert participant.round_failure == "conflicting duplicate round callback"
+        orchestrator.receive_notification(conflicting)
+        assert participant.notification == accepted
+        assert participant.round_failure == ""
     finally:
         orchestrator.close()
 
@@ -3431,9 +3332,11 @@ def test_last_callback_accepted_at_deadline_wins_before_timeout(tmp_path, monkey
     "evaluating_state",
     [FLServerState.ROUND_EVALUATING, FLServerState.FINAL_VALIDATION_EVALUATING],
 )
-def test_callback_after_collection_freeze_allows_exact_duplicate_only(
+@pytest.mark.parametrize("hierarchical", [False, True], ids=("flat", "hierarchical"))
+def test_callback_after_collection_freeze_ignores_terminal_retries(
     tmp_path,
     evaluating_state,
+    hierarchical,
 ):
     owner_id = "11111111-1111-4111-8111-111111111111"
     participant = FLParticipant(
@@ -3459,17 +3362,12 @@ def test_callback_after_collection_freeze_allows_exact_duplicate_only(
     )
     participant.notification = accepted
     participant.round_complete = True
-    participant.accepted_notification_digest = hashlib.sha256(
-        json.dumps(
-            accepted.model_dump(by_alias=True, exclude_none=True, mode="json"),
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
     process = FLProcess(
         process_id="process-1",
         intent=None,
-        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        hierarchy_plan_id=(
+            "11111111-1111-4111-8111-111111111112" if hierarchical else ""
+        ),
         state=evaluating_state,
         participants=[participant],
     )
@@ -3496,14 +3394,75 @@ def test_callback_after_collection_freeze_allows_exact_duplicate_only(
     conflicting = NwdafMLModelTrainNotif.model_validate(conflicting_payload)
     try:
         orchestrator.receive_notification(accepted)
-        with pytest.raises(ValueError, match="after the active stage"):
-            orchestrator.receive_notification(conflicting)
+        orchestrator.receive_notification(conflicting)
 
         assert process.state is evaluating_state
         assert participant.notification == accepted
         assert participant.round_failure == ""
     finally:
-        process.hierarchy_cleanup_complete = True
+        if hierarchical:
+            process.hierarchy_cleanup_complete = True
+        orchestrator.close()
+
+
+def test_flat_round_termination_freezes_first_terminal_outcome(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="round-client-a",
+        expected_round=3,
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        execution=flat_execution("ue-communication-default", (participant.scope,)),
+        state=FLServerState.ROUND_WAITING,
+        participants=[participant],
+    )
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=Mock(),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    termination = NwdafMLModelTrainNotif(
+        notifCorreId=participant.notification_correlation_id,
+        mlCorreId=process.process_id,
+        roundInd=3,
+        termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+    )
+    later_model = NwdafMLModelTrainNotif.model_validate(
+        {
+            "notifCorreId": participant.notification_correlation_id,
+            "mlCorreId": process.process_id,
+            "roundInd": 3,
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {
+                        "mLModelUrl": "http://leaf.example/local-result.tar.gz"
+                    },
+                }
+            ],
+        }
+    )
+    try:
+        orchestrator.receive_notification(termination)
+        failure = process.failure
+        orchestrator.receive_notification(later_model)
+
+        assert participant.round_complete is True
+        assert participant.notification == termination
+        assert process.failure == failure
+        assert "NOT_AVAILABLE_ML_TRAIN" in process.failure
+    finally:
         orchestrator.close()
 
 
@@ -3667,7 +3626,10 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         "33333333-3333-4333-8333-333333333333",
         "44444444-4444-4444-8444-444444444444",
     )
-    scope_digests = ("a" * 64, "b" * 64)
+    training_scopes = (
+        training_scope_descriptor("branch-1"),
+        training_scope_descriptor("branch-2"),
+    )
 
     def model_with_weight(value: float) -> torch.nn.Module:
         model = torch.nn.Linear(1, 1, bias=False)
@@ -3678,46 +3640,28 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
 
     base_model = model_with_weight(0)
     branch_models = (model_with_weight(2), model_with_weight(10))
-    base_weights_digest = weights_digest(base_model)
-    file_digests = {
-        "model.py": "1" * 64,
-        "model.npy": "2" * 64,
-        "scaler.pkl": "3" * 64,
-    }
     base_manifest = {
-        "bundle_schema_version": "1.0",
         "artifact_role": "ROUND_INPUT",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
         "model": {"input_size": 1},
         "inference": {"seq_length": 1},
-        "file_digests": file_digests,
         "fl_metadata": {
-            "contract_version": "1.0",
             "ml_corre_id": "process-1",
             "round_ind": 0,
-            "model_contract_digest": "0" * 64,
-            "preprocessing_contract_digest": "0" * 64,
-            "weights_digest": base_weights_digest,
             "client_training": {"epochs": 2},
         },
     }
-    base_manifest["fl_metadata"]["model_contract_digest"] = model_contract_digest(
-        base_manifest
-    )
-    base_manifest["fl_metadata"][
-        "preprocessing_contract_digest"
-    ] = preprocessing_contract_digest(base_manifest)
     base = SimpleNamespace(manifest=base_manifest, model=base_model)
 
     branch_bundles = []
     sample_counts = (1, 3)
-    for index, (branch_id, leaf_id, scope_digest, model, sample_count) in enumerate(
+    for index, (branch_id, leaf_id, training_scope, model, sample_count) in enumerate(
         zip(
             branch_ids,
             leaf_ids,
-            scope_digests,
+            training_scopes,
             branch_models,
             sample_counts,
             strict=True,
@@ -3725,23 +3669,18 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         start=1,
     ):
         manifest = {
-            "bundle_schema_version": "1.0",
             "artifact_role": "ROUND_LOCAL",
             "result_type": "HIERARCHY_AGGREGATE",
-            "file_digests": file_digests,
+            "analytics_event": "UE_COMMUNICATION",
+            "model_interoperability": "001122",
+            "runtime_compatibility": {"framework": "torch"},
+            "model": {"input_size": 1},
+            "inference": {"seq_length": 1},
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "process-1",
                 "round_ind": 0,
                 "participant_nf_instance_id": branch_id,
-                "scope_digest": scope_digest,
-                "model_contract_digest": model_contract_digest(base_manifest),
-                "preprocessing_contract_digest": preprocessing_contract_digest(
-                    base_manifest
-                ),
-                "input_global_weights_digest": base_weights_digest,
-                "base_weights_digest": base_weights_digest,
-                "weights_digest": weights_digest(model),
+                "training_scope": training_scope.model_dump(mode="json"),
                 "training_sample_count": sample_count,
                 "lower_round_ind": 9 + index,
                 "lower_global_artifact_digest": str(index + 5) * 64,
@@ -3757,8 +3696,8 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         branch_bundles.append(SimpleNamespace(manifest=manifest, model=model))
 
     participants = []
-    for index, (branch_id, scope_digest) in enumerate(
-        zip(branch_ids, scope_digests, strict=True),
+    for index, (branch_id, training_scope) in enumerate(
+        zip(branch_ids, training_scopes, strict=True),
         start=1,
     ):
         participants.append(
@@ -3766,7 +3705,7 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
                 scope=scope(f"branch-{index}", f"00000{index}", branch_id),
                 candidate=candidate(branch_id, f"00000{index}"),
                 notification_correlation_id=f"round-branch-{index}",
-                expected_scope_digest=scope_digest,
+                expected_training_scope=training_scope,
                 notification=NwdafMLModelTrainNotif.model_validate(
                     {
                         "notifCorreId": f"round-branch-{index}",
@@ -3880,63 +3819,35 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
 
 def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_path):
     participant_id = "11111111-1111-4111-8111-111111111111"
-    scope_digest = "a" * 64
-    base_weights_digest = hashlib.sha256(b"").hexdigest()
+    expected_scope = training_scope_descriptor()
     base_manifest = {
-        "bundle_schema_version": "1.0",
         "artifact_role": "ROUND_INPUT",
         "analytics_event": "UE_COMMUNICATION",
         "model_interoperability": "001122",
         "runtime_compatibility": {"framework": "torch"},
         "model": {"input_size": 10},
         "inference": {"seq_length": 30},
-        "file_digests": {
-            "model.py": "1" * 64,
-            "model.npy": "2" * 64,
-            "scaler.pkl": "3" * 64,
-        },
         "fl_metadata": {
-            "contract_version": "1.0",
             "ml_corre_id": "process-1",
             "round_ind": 0,
-            "model_contract_digest": "0" * 64,
-            "preprocessing_contract_digest": "1" * 64,
-            "weights_digest": base_weights_digest,
             "client_training": {"epochs": 1},
         },
     }
-    base_manifest["fl_metadata"]["model_contract_digest"] = model_contract_digest(
-        base_manifest
-    )
-    base_manifest["fl_metadata"][
-        "preprocessing_contract_digest"
-    ] = preprocessing_contract_digest(base_manifest)
     local_manifest = {
-        "bundle_schema_version": "1.0",
-        "file_digests": {
-            "model.py": "1" * 64,
-            "model.npy": "4" * 64,
-            "scaler.pkl": "3" * 64,
-        },
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 11},
+        "inference": {"seq_length": 30},
         "artifact_role": "ROUND_LOCAL",
         "result_type": "TRAINING",
         "fl_metadata": {
-            "contract_version": "1.0",
             "ml_corre_id": "process-1",
-            "model_contract_digest": "f" * 64,
-            "preprocessing_contract_digest": preprocessing_contract_digest(base_manifest),
-            "base_weights_digest": base_weights_digest,
-            "weights_digest": "5" * 64,
             "round_ind": 0,
             "participant_nf_instance_id": participant_id,
-            "scope_digest": scope_digest,
-            "input_global_weights_digest": base_weights_digest,
+            "training_scope": expected_scope.model_dump(mode="json"),
             "training_sample_count": 10,
             "dataset_evidence": {
-                "contract_digest": "a" * 64,
-                "observation_digest": "b" * 64,
-                "training_tensor_digest": "c" * 64,
-                "validation_tensor_digest": "d" * 64,
                 "observation_count": 12,
                 "training_sample_count": 10,
                 "validation_sample_count": 1,
@@ -3972,7 +3883,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
         scope=scope("scope-a", "000001", participant_id),
         candidate=candidate(participant_id, "000001"),
         notification_correlation_id="round-a",
-        expected_scope_digest=scope_digest,
+        expected_training_scope=expected_scope,
         notification=NwdafMLModelTrainNotif.model_validate(
             {
                 "notifCorreId": "round-a",
@@ -4018,7 +3929,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
             }
         )
         orchestrator._loader.load.side_effect = [base, local]
-        with pytest.raises(RuntimeError, match="identity does not match"):
+        with pytest.raises(RuntimeError, match="model contract is incompatible"):
             orchestrator._aggregate_round(
                 process,
                 round_input.url,

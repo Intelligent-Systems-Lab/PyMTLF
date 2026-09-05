@@ -20,14 +20,14 @@ from py_mtlf.core.fl_hierarchy import (
     normalize_nf_instance_id,
 )
 from py_mtlf.core.fl_workspace import (
+    FLArtifactContractError,
     FLWorkspace,
     FLWorkspaceArtifact,
     ValidatedHierarchyArtifact,
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
+    validate_model_compatibility,
 )
 from py_mtlf.core.trainer import LoadedBundle, TrustedBundleLoader
+from py_mtlf.core.training_scope import TrainingScopeDescriptor
 
 type HierarchyArtifactSource = FLWorkspaceArtifact | ValidatedHierarchyArtifact
 
@@ -56,7 +56,6 @@ class HierarchyArtifactService:
         strategy: FederatedStrategy,
     ) -> FLWorkspaceArtifact:
         metadata = BranchAssignmentMetadata(
-            contract_version="1.0",
             message_type=HierarchyMessageType.BRANCH_ASSIGNMENT,
             plan_id=plan_id,
             publisher_nf_instance_id=publisher_nf_instance_id,
@@ -95,7 +94,7 @@ class HierarchyArtifactService:
         upper_process_id: str,
         branch_nf_instance_id: str,
         upper_round_indicator: int,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
     ) -> FLWorkspaceArtifact:
         if not isinstance(lower_global.contract, RoundGlobalArtifact):
             raise HierarchyArtifactOperationError(
@@ -111,18 +110,12 @@ class HierarchyArtifactService:
         )
 
         lower_metadata = lower_global.contract.fl_metadata
-        base_digest = weights_digest(upper_input.model)
-        if (
-            lower_metadata.model_contract_digest
-            != model_contract_digest(upper_input.manifest)
-            or lower_metadata.preprocessing_contract_digest
-            != preprocessing_contract_digest(upper_input.manifest)
-            or lower_metadata.base_weights_digest != base_digest
-            or lower_metadata.weights_digest != weights_digest(lower_bundle.model)
-        ):
+        try:
+            validate_model_compatibility(upper_input, lower_bundle)
+        except FLArtifactContractError as error:
             raise HierarchyArtifactOperationError(
                 "lower ROUND_GLOBAL does not match the upper round input"
-            )
+            ) from error
         return self._workspace.publish(
             process_id=upper_process_id,
             participant_id=branch_nf_instance_id,
@@ -135,18 +128,13 @@ class HierarchyArtifactService:
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "HIERARCHY_AGGREGATE",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": upper_process_id,
                     "round_ind": upper_round_indicator,
                     "participant_nf_instance_id": branch_nf_instance_id,
-                    "scope_digest": upper_scope_digest,
-                    "input_global_weights_digest": base_digest,
-                    "model_contract_digest": model_contract_digest(upper_input.manifest),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(
-                        upper_input.manifest
+                    "training_scope": upper_training_scope.model_dump(
+                        by_alias=True,
+                        mode="json",
                     ),
-                    "base_weights_digest": base_digest,
-                    "weights_digest": weights_digest(lower_bundle.model),
                     "training_sample_count": lower_metadata.aggregated_training_sample_count,
                     "lower_round_ind": lower_metadata.round_ind,
                     "lower_global_artifact_digest": lower_global.digest,
@@ -181,15 +169,13 @@ class HierarchyArtifactService:
         upper_process_id: str,
         branch_nf_instance_id: str,
         upper_round_indicator: int,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
         subordinate_summaries: tuple[ValidationSummary, ...],
     ) -> FLWorkspaceArtifact:
         if not subordinate_summaries:
             raise HierarchyArtifactOperationError(
                 "hierarchy validation result requires subordinate evidence"
             )
-        candidate_digest = weights_digest(upper_candidate.model)
-        base_digest = subordinate_summaries[0].base_model_weights_digest
         return self._workspace.publish(
             process_id=upper_process_id,
             participant_id=branch_nf_instance_id,
@@ -202,20 +188,13 @@ class HierarchyArtifactService:
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "ACCURACY_CHECK",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": upper_process_id,
                     "round_ind": upper_round_indicator,
                     "participant_nf_instance_id": branch_nf_instance_id,
-                    "scope_digest": upper_scope_digest,
-                    "input_global_weights_digest": candidate_digest,
-                    "model_contract_digest": model_contract_digest(
-                        upper_candidate.manifest
+                    "training_scope": upper_training_scope.model_dump(
+                        by_alias=True,
+                        mode="json",
                     ),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(
-                        upper_candidate.manifest
-                    ),
-                    "base_weights_digest": candidate_digest,
-                    "weights_digest": candidate_digest,
                     "evaluation": {
                         "evaluation_stage": "FINAL_VALIDATION",
                         "evaluation_sample_count": sum(
@@ -228,8 +207,6 @@ class HierarchyArtifactService:
                         "end_time": max(
                             item.end_time for item in subordinate_summaries
                         ).isoformat(),
-                        "base_model_weights_digest": base_digest,
-                        "candidate_weights_digest": candidate_digest,
                         "base": {
                             "absolute_error_sum": sum(
                                 item.base.absolute_error_sum
@@ -280,7 +257,6 @@ class HierarchyArtifactService:
 
         base = self._loader.load(_artifact_metadata(parent))
         metadata = LeafAssignmentMetadata(
-            contract_version="1.0",
             message_type=HierarchyMessageType.LEAF_ASSIGNMENT,
             plan_id=assignment.plan_id,
             publisher_nf_instance_id=branch_id,
@@ -309,7 +285,6 @@ class HierarchyArtifactService:
 
         base = self._loader.load(_artifact_metadata(parent))
         metadata = PreparationResultMetadata(
-            contract_version="1.0",
             message_type=HierarchyMessageType.PREPARATION_RESULT,
             plan_id=assignment.plan_id,
             publisher_nf_instance_id=branch_id,

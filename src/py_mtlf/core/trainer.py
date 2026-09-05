@@ -59,7 +59,7 @@ class WapeMetric:
 
 @dataclass(frozen=True)
 class ScopeEvaluation:
-    scope_digest: str
+    scope_key: str
     triggering_scope: bool
     current: WapeMetric
     candidate: WapeMetric
@@ -349,7 +349,7 @@ class LocalTrainer:
             candidate_actual += candidate_metric.actual_sum
             evaluations.append(
                 ScopeEvaluation(
-                    scope_digest=scope.scope_digest,
+                    scope_key=scope.scope_key,
                     triggering_scope=scope.scope_key == dataset.triggering_scope_key,
                     current=current_metric,
                     candidate=candidate_metric,
@@ -372,7 +372,7 @@ class LocalTrainer:
                     not item.triggering_scope
                     and item.delta > self._validation_settings.max_scope_wape_regression
                 ):
-                    reasons.append(f"scope_regression_exceeded:{item.scope_digest}")
+                    reasons.append(f"scope_regression_exceeded:{item.scope_key}")
         return CandidateEvaluation(
             scopes=tuple(evaluations),
             aggregate_current=aggregate_current,

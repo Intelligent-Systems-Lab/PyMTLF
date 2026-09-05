@@ -33,7 +33,6 @@ def training_dataset() -> TrainingDataset:
     validation_targets = targets[:10]
     scope = ScopeTrainingData(
         scope_key="scope-a",
-        scope_digest="a" * 64,
         observation_count=80,
         observation_timestamps=tuple(
             datetime(2026, 8, 26, tzinfo=UTC) + timedelta(seconds=index)
@@ -207,7 +206,6 @@ def test_per_scope_regression_rejects_candidate_even_when_aggregate_improves(
     peer = replace(
         trigger,
         scope_key="scope-b",
-        scope_digest="b" * 64,
     )
     dataset = replace(base, scopes=(trigger, peer))
     current = bundle(TinyModel())
@@ -229,7 +227,7 @@ def test_per_scope_regression_rejects_candidate_even_when_aggregate_improves(
 
     assert evaluation.aggregate_candidate.value < evaluation.aggregate_current.value
     assert not evaluation.accepted
-    assert evaluation.rejection_reasons == (f"scope_regression_exceeded:{'b' * 64}",)
+    assert evaluation.rejection_reasons == ("scope_regression_exceeded:scope-b",)
 
 
 def test_disabled_performance_gate_keeps_evaluation_but_accepts_regression(

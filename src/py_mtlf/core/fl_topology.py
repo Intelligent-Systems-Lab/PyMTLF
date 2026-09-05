@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID
@@ -156,7 +154,7 @@ class StaticFlatClientAssignment(TopologyContractModel):
 
 class StaticFlatTopologyAssignment(TopologyContractModel):
     server_nf_instance_id: str
-    topology_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    topology_version: int = Field(ge=1)
     clients: tuple[StaticFlatClientAssignment, ...] = Field(min_length=2)
 
 
@@ -217,30 +215,6 @@ class StaticTopologyPlanner:
 class StaticFlatTopologyPlanner:
     def __init__(self, topology: StaticFlatTopologyFile) -> None:
         self._topology = topology
-        canonical_clients = [
-            {
-                "nf_instance_id": client.nf_instance_id,
-                "tracking_areas": [
-                    {
-                        "mcc": tracking_area.plmn_id.mcc,
-                        "mnc": tracking_area.plmn_id.mnc,
-                        "tac": tracking_area.tac,
-                    }
-                    for tracking_area in sorted(
-                        client.scope.tracking_areas,
-                        key=lambda item: item.key,
-                    )
-                ],
-            }
-            for client in sorted(topology.clients, key=lambda item: item.nf_instance_id)
-        ]
-        self._topology_digest = hashlib.sha256(
-            json.dumps(
-                {"version": topology.version, "clients": canonical_clients},
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
 
     @classmethod
     def load(cls, path: str | Path) -> StaticFlatTopologyPlanner:
@@ -267,7 +241,7 @@ class StaticFlatTopologyPlanner:
             )
         return StaticFlatTopologyAssignment(
             server_nf_instance_id=server_id,
-            topology_digest=self._topology_digest,
+            topology_version=self._topology.version,
             clients=tuple(
                 StaticFlatClientAssignment(
                     nf_instance_id=client.nf_instance_id,

@@ -1,5 +1,4 @@
 import gzip
-import hashlib
 import io
 import json
 import tarfile
@@ -66,7 +65,7 @@ class CandidateBundleBuilder:
             },
             "scopes": [
                 {
-                    "scope_key_sha256": item.scope_digest,
+                    "scope_key": item.scope_key,
                     "triggering_scope": item.triggering_scope,
                     "current_wape": item.current.value,
                     "candidate_wape": item.candidate.value,
@@ -79,9 +78,6 @@ class CandidateBundleBuilder:
             "model.py": model_source_path.read_bytes(),
             "model.npy": model_path.read_bytes(),
             "scaler.pkl": scaler_path.read_bytes(),
-        }
-        manifest["file_digests"] = {
-            name: hashlib.sha256(content).hexdigest() for name, content in components.items()
         }
         files = {
             "config.json": json.dumps(

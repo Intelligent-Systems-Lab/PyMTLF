@@ -50,7 +50,6 @@ def training_dataset() -> TrainingDataset:
     targets = np.asarray([observations[index + 4, [1, 2]] for index in range(60)])
     scope = ScopeTrainingData(
         scope_key="scope-a",
-        scope_digest="a" * 64,
         observation_count=80,
         observation_timestamps=tuple(
             datetime(2026, 9, 4, tzinfo=UTC) + timedelta(seconds=index)

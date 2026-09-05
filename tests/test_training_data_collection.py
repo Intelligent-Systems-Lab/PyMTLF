@@ -374,8 +374,10 @@ def test_callback_is_durable_before_ack_and_storage_publishes_private_descriptor
         "2026-08-26T10:00:00+00:00"
     )
     assert not list((tmp_path / "collection-state" / "inbox").glob("*.json"))
-    assert owner.accept_callback(notification(correlation_id)) is False
-    assert relay.store_calls == 1
+    assert owner.accept_callback(notification(correlation_id)) is True
+    collecting = wait_for_record_count(owner, value.request_id, 2)
+    assert collecting.record_count == 2
+    assert relay.store_calls == 2
     owner.shutdown()
 
 
@@ -568,12 +570,11 @@ def test_recovery_does_not_restore_inbox_already_committed_in_ledger(tmp_path):
     accepted = notification(correlation_id)
     owner.accept_callback(accepted)
     wait_for_record_count(owner, value.request_id, 1)
-    digest = next(iter(owner._stored_inbox_digests))
-    inbox = tmp_path / "collection-state" / "inbox" / f"{digest}.json"
+    inbox_id = next(iter(owner._stored_inbox_ids))
+    inbox = tmp_path / "collection-state" / "inbox" / f"{inbox_id}.json"
     owner._atomic_json_write(
         inbox,
         {
-            "schemaVersion": owner._LEDGER_VERSION,
             "requestIds": [value.request_id],
             "correlationId": correlation_id,
             "notification": accepted.model_dump(
@@ -942,7 +943,7 @@ def test_corrupt_ledger_fails_closed_without_discarding_file(tmp_path):
     state = tmp_path / "collection-state"
     state.mkdir()
     ledger = state / "ledger.json"
-    ledger.write_text('{"schemaVersion":999,"requests":[]}', encoding="utf-8")
+    ledger.write_text('{"requests":[]}', encoding="utf-8")
     owner = TrainingDataCollectionManager(
         private_settings(state),
         context_client(),
@@ -957,7 +958,7 @@ def test_corrupt_ledger_fails_closed_without_discarding_file(tmp_path):
     owner.shutdown()
 
 
-def test_ledger_persists_and_verifies_request_profile_digests_and_retry_attempt(
+def test_ledger_persists_typed_request_profile_and_retry_attempt(
     tmp_path,
 ):
     owner, _, _ = manager(tmp_path, context_client())
@@ -970,8 +971,10 @@ def test_ledger_persists_and_verifies_request_profile_digests_and_retry_attempt(
         item for item in payload["requests"] if item["request"]["requestId"] == value.request_id
     )
 
-    assert len(stored["requestDigest"]) == 64
-    assert len(stored["profileDigest"]) == 64
+    assert "requestDigest" not in stored
+    assert "profileDigest" not in stored
+    assert stored["request"] == value.model_dump(by_alias=True, mode="json")
+    assert stored["profile"]["profile_id"] == value.collection_profile_id
     assert stored["retryAttempt"] == 0
     assert stored["resources"][0]["referenced"] is True
     owner.shutdown()

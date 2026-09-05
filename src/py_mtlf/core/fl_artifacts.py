@@ -21,6 +21,7 @@ from py_mtlf.core.fl_hierarchy import (
     PreparationResultMetadata,
     normalize_plan_id,
 )
+from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
 
 Sha256 = Annotated[str, Field(pattern=SHA256_PATTERN.pattern)]
@@ -70,12 +71,10 @@ class RoundParticipant(ParticipantSample):
 
 class ValidationSummary(ArtifactContractModel):
     participant_nf_instance_id: str
-    scope_digest: Sha256
+    training_scope: TrainingScopeDescriptor
     evaluation_sample_count: int = Field(gt=0)
     start_time: AwareDatetime
     end_time: AwareDatetime
-    base_model_weights_digest: Sha256
-    candidate_weights_digest: Sha256
     base: WapeComponents
     candidate: WapeComponents
 
@@ -92,47 +91,27 @@ class ValidationSummary(ArtifactContractModel):
 
 
 class CommonFLMetadata(ArtifactContractModel):
-    contract_version: Literal["1.0"]
     ml_corre_id: str = Field(min_length=1)
-    model_contract_digest: Sha256
-    preprocessing_contract_digest: Sha256
-    base_weights_digest: Sha256
-    weights_digest: Sha256
 
 
 class RoundInputMetadata(ArtifactContractModel):
-    contract_version: Literal["1.0"]
     ml_corre_id: str = Field(min_length=1)
     round_ind: int = Field(ge=0)
-    model_contract_digest: Sha256
-    preprocessing_contract_digest: Sha256
-    weights_digest: Sha256
     client_training: ClientTrainingDirective
 
 
 class RoundLocalCommonMetadata(CommonFLMetadata):
     round_ind: int = Field(ge=0)
     participant_nf_instance_id: str
-    scope_digest: Sha256
-    input_global_weights_digest: Sha256
+    training_scope: TrainingScopeDescriptor
 
     @field_validator("participant_nf_instance_id")
     @classmethod
     def normalize_nf_instance_id(cls, value: str) -> str:
         return str(UUID(value))
 
-    @model_validator(mode="after")
-    def validate_base_digest(self) -> RoundLocalCommonMetadata:
-        if self.input_global_weights_digest != self.base_weights_digest:
-            raise ValueError("input global weights digest must match base weights digest")
-        return self
-
 
 class DatasetEvidence(ArtifactContractModel):
-    contract_digest: Sha256
-    observation_digest: Sha256
-    training_tensor_digest: Sha256
-    validation_tensor_digest: Sha256
     observation_count: int = Field(gt=0)
     training_sample_count: int = Field(gt=0)
     validation_sample_count: int = Field(gt=0)
@@ -177,8 +156,6 @@ class AccuracyCheckEvaluation(ArtifactContractModel):
     evaluation_sample_count: int = Field(gt=0)
     start_time: AwareDatetime
     end_time: AwareDatetime
-    base_model_weights_digest: Sha256
-    candidate_weights_digest: Sha256
     base: WapeComponents
     candidate: WapeComponents
 
@@ -198,14 +175,6 @@ class RoundLocalAccuracyCheckMetadata(RoundLocalCommonMetadata):
 
     @model_validator(mode="after")
     def validate_unchanged_candidate(self) -> RoundLocalAccuracyCheckMetadata:
-        if self.weights_digest != self.input_global_weights_digest:
-            raise ValueError(
-                "accuracy-check output weights digest must match input global weights digest"
-            )
-        if self.evaluation.candidate_weights_digest != self.weights_digest:
-            raise ValueError(
-                "accuracy-check candidate weights digest must match artifact weights digest"
-            )
         if self.subordinate_validation_summaries is not None:
             _validate_subordinate_validation_summaries(
                 self.participant_nf_instance_id,
@@ -290,7 +259,6 @@ class HierarchyValidation(ArtifactContractModel):
 class FinalModelMetadata(CommonFLMetadata):
     previous_model_unique_id: int | None = Field(default=None, ge=0)
     participants: tuple[ParticipantSample, ...] = Field(min_length=1)
-    final_candidate_digest: Sha256
     validation_summary: tuple[ValidationSummary, ...] = Field(min_length=1)
     hierarchy_validation: HierarchyValidation | None = None
     global_gate_accepted: bool
@@ -310,17 +278,6 @@ class FinalModelMetadata(CommonFLMetadata):
             raise ValueError(
                 "validation summary must cover every participant once in canonical order"
             )
-        if self.final_candidate_digest != self.weights_digest:
-            raise ValueError("final candidate digest must match artifact weights digest")
-        for summary in self.validation_summary:
-            if summary.base_model_weights_digest != self.base_weights_digest:
-                raise ValueError(
-                    "validation summary base model digest must match final model base digest"
-                )
-            if summary.candidate_weights_digest != self.final_candidate_digest:
-                raise ValueError(
-                    "validation summary candidate digest must match final candidate digest"
-                )
         if self.hierarchy_validation is not None:
             branch_ids = tuple(
                 item.branch_nf_instance_id
@@ -368,15 +325,6 @@ def _validate_subordinate_validation_summaries(
         raise ValueError("aggregate start time must cover subordinate validation summaries")
     if aggregate.end_time != max(item.end_time for item in summaries):
         raise ValueError("aggregate end time must cover subordinate validation summaries")
-    for item in summaries:
-        if item.base_model_weights_digest != aggregate.base_model_weights_digest:
-            raise ValueError(
-                "subordinate validation base digest must match aggregate evidence"
-            )
-        if item.candidate_weights_digest != aggregate.candidate_weights_digest:
-            raise ValueError(
-                "subordinate validation candidate digest must match aggregate evidence"
-            )
     for label in ("base", "candidate"):
         aggregate_components = getattr(aggregate, label)
         subordinate_error = sum(
@@ -401,25 +349,12 @@ def _validate_subordinate_validation_summaries(
             )
 
 
-class ArtifactContractBase(ArtifactContractModel):
-    bundle_schema_version: Literal["1.0"]
-    file_digests: dict[str, Sha256]
-
-    @field_validator("file_digests")
-    @classmethod
-    def validate_file_digests(cls, value: dict[str, Sha256]) -> dict[str, Sha256]:
-        expected = {"model.py", "model.npy", "scaler.pkl"}
-        if set(value) != expected:
-            raise ValueError("file_digests must cover the exact model bundle components")
-        return value
-
-
-class RoundInputArtifact(ArtifactContractBase):
+class RoundInputArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.ROUND_INPUT]
     fl_metadata: RoundInputMetadata
 
 
-class RoundLocalArtifact(ArtifactContractBase):
+class RoundLocalArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.ROUND_LOCAL]
     result_type: RoundLocalResultType
     fl_metadata: (
@@ -440,23 +375,23 @@ class RoundLocalArtifact(ArtifactContractBase):
         return self
 
 
-class RoundGlobalArtifact(ArtifactContractBase):
+class RoundGlobalArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.ROUND_GLOBAL]
     fl_metadata: RoundGlobalMetadata
 
 
-class FinalModelArtifact(ArtifactContractBase):
+class FinalModelArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.FINAL_MODEL]
     model_identity: ModelIdentity
     fl_metadata: FinalModelMetadata
 
 
-class HierarchyAssignmentArtifact(ArtifactContractBase):
+class HierarchyAssignmentArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.HIERARCHY_ASSIGNMENT]
     hierarchy_metadata: AssignmentMetadata
 
 
-class HierarchyPreparationResultArtifact(ArtifactContractBase):
+class HierarchyPreparationResultArtifact(ArtifactContractModel):
     artifact_role: Literal[ArtifactRole.HIERARCHY_PREPARATION_RESULT]
     hierarchy_metadata: PreparationResultMetadata
 
@@ -488,7 +423,7 @@ def fl_artifact_projection(manifest: Mapping[str, object]) -> dict[str, object]:
     except (KeyError, ValueError) as error:
         raise ValueError("FL artifact role is missing or unsupported") from error
 
-    base_fields = {"bundle_schema_version", "file_digests", "artifact_role"}
+    base_fields = {"artifact_role"}
     role_fields = {
         ArtifactRole.ROUND_INPUT: {"fl_metadata"},
         ArtifactRole.ROUND_LOCAL: {"result_type", "fl_metadata"},
@@ -531,7 +466,6 @@ class TensorStateEntry(ArtifactContractModel):
     shape: tuple[int, ...]
     dtype: str = Field(min_length=1)
     floating: bool
-    value_digest: Sha256
 
 
 def validate_tensor_compatibility(
@@ -554,5 +488,3 @@ def validate_tensor_compatibility(
             or base_entry.floating != candidate_entry.floating
         ):
             raise ValueError("candidate tensor contract does not match the base model")
-        if not base_entry.floating and base_entry.value_digest != candidate_entry.value_digest:
-            raise ValueError("non-floating tensor state must remain identical to the base model")

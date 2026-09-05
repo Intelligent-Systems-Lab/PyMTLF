@@ -555,14 +555,12 @@ def _initial_model_state(catalog: SeedCatalog) -> DurableModelState:
             generation=model.generation,
         )
         families[model.descriptor.family_id] = ModelCatalogRecord(
-            schemaVersion="1.0",
             latestModelId=model.model_id,
             nextModelId=model.model_id + 1,
             revisions=(revision,),
         )
         allocated = max(allocated, model.model_id)
     return DurableModelState(
-        schemaVersion="2.0",
         lastAllocatedModelId=allocated,
         families=families,
     )

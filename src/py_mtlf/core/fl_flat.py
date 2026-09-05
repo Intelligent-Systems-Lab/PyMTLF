@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import logging
 import threading
 import time
@@ -269,21 +267,9 @@ class FlatFLCoordinator:
             participant_filter["networkArea"] = {
                 "tais": [tracking_area.wire_value() for tracking_area in client.tracking_areas]
             }
-            scope_payload = {
-                "family": model_family_id,
-                "participant": client.nf_instance_id,
-                "event": current.descriptor.event,
-                "filter": participant_filter,
-                "target": current.descriptor.target_ue,
-                "topology": assignment.topology_digest,
-            }
-            scope_key = "static:" + hashlib.sha256(
-                json.dumps(
-                    scope_payload,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode()
-            ).hexdigest()
+            scope_key = (
+                f"static:{assignment.topology_version}:{client.nf_instance_id}"
+            )
             participants.append(
                 FlatParticipantScope(
                     scope_key=scope_key,
@@ -300,7 +286,7 @@ class FlatFLCoordinator:
             )
         return StaticParticipantSelection(
             participants=tuple(participants),
-            topology_digest=assignment.topology_digest,
+            topology_version=assignment.topology_version,
         )
 
     def _refresh_locked(self) -> None:

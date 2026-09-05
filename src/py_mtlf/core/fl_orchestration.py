@@ -48,7 +48,7 @@ class MonitorParticipantSelection:
 @dataclass(frozen=True)
 class StaticParticipantSelection:
     participants: tuple[FlatParticipantScope, ...]
-    topology_digest: str
+    topology_version: int
     source: ParticipantSource = ParticipantSource.STATIC
 
 

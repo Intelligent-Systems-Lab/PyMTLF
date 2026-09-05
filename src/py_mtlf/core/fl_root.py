@@ -473,7 +473,7 @@ class FLRootCoordinator:
                 raise RuntimeError("FL base model is no longer current")
             descriptor = current.descriptor
             if descriptor.event != "UE_COMMUNICATION":
-                raise RuntimeError("hierarchical FL V1 only supports UE_COMMUNICATION")
+                raise RuntimeError("hierarchical FL currently supports only UE_COMMUNICATION")
             if not descriptor.model_interoperability:
                 raise RuntimeError("FL base model has no model interoperability identifier")
             context = self._nwdaf_context.get()
@@ -573,7 +573,6 @@ class FLRootCoordinator:
                 process=process,
                 collection=collection,
                 topology=topology,
-                assignments=branch_assignments,
                 root_nf_instance_id=context.nf_instance_id,
                 ml_event=descriptor.event,
                 base_artifact_key=current.artifact.key,
@@ -705,7 +704,6 @@ class FLRootCoordinator:
         process: FLProcess,
         collection: HierarchyPreparationCollection,
         topology,
-        assignments: dict[str, object],
         root_nf_instance_id: str,
         ml_event: str,
         base_artifact_key: str,
@@ -775,12 +773,6 @@ class FLRootCoordinator:
                 raise RootPreparationError(
                     RootFailureCause.RESULT_VALIDATION_FAILED,
                     "Branch result artifact contract is invalid",
-                )
-            assignment = assignments[branch_id]
-            if contract.file_digests != assignment.contract.file_digests:
-                raise RootPreparationError(
-                    RootFailureCause.RESULT_VALIDATION_FAILED,
-                    "Branch result changed the assigned model bundle",
                 )
             if metadata.assigned_client_nf_instance_ids != expected[branch_id]:
                 raise RootPreparationError(

@@ -746,6 +746,6 @@ def test_hierarchy_configuration_requires_server_strategy_and_topology_together(
         },
     ],
 )
-def test_first_version_hierarchy_strategy_rejects_unsupported_values(strategy):
+def test_hierarchy_strategy_rejects_unsupported_values(strategy):
     with pytest.raises(ValidationError):
         FederatedStrategySettings.model_validate(strategy)

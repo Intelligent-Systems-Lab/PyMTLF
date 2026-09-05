@@ -8,7 +8,7 @@ from py_mtlf.core.model_records import (
     DurableModelStateRepository,
     ModelCatalogRecord,
     PendingPublication,
-    migrate_seed_catalog,
+    initialize_seed_catalog,
     validate_catalog_publications,
 )
 
@@ -34,20 +34,22 @@ def validation_evidence() -> list[dict[str, object]]:
     return [
         {
             "participant_nf_instance_id": CLIENT_A,
-            "scope_digest": DIGEST_A,
+            "training_scope": {
+                "event_subscription": {"mLEvent": "UE_COMMUNICATION"},
+                "target_reporting_ue": {"intGroupIds": ["group-G"]},
+                "requested_time_windows": [],
+            },
             "evaluation_sample_count": 10,
             "start_time": now,
             "end_time": now + timedelta(seconds=1),
-            "base_model_weights_digest": DIGEST_A,
-            "candidate_weights_digest": DIGEST_A,
             "base": {"absolute_error_sum": 1, "absolute_actual_sum": 10},
             "candidate": {"absolute_error_sum": 1, "absolute_actual_sum": 10},
         }
     ]
 
 
-def test_seed_migration_builds_first_durable_revision() -> None:
-    catalog = migrate_seed_catalog(
+def test_seed_initialization_builds_first_durable_revision() -> None:
+    catalog = initialize_seed_catalog(
         model_unique_id=3,
         artifact_key=DIGEST_A,
         created_at=datetime.now(UTC),
@@ -58,11 +60,11 @@ def test_seed_migration_builds_first_durable_revision() -> None:
     assert ModelCatalogRecord.model_validate_json(catalog.model_dump_json()) == catalog
 
 
-def test_catalog_rejects_unknown_schema_and_revision_cycle() -> None:
-    with pytest.raises(ValidationError):
+def test_catalog_rejects_removed_schema_marker_and_revision_cycle() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ModelCatalogRecord.model_validate(
             {
-                "schemaVersion": "2.0",
+                "schemaVersion": "1.0",
                 "latestModelId": 1,
                 "nextModelId": 2,
                 "revisions": [seed_revision(1)],
@@ -72,7 +74,6 @@ def test_catalog_rejects_unknown_schema_and_revision_cycle() -> None:
     with pytest.raises(ValidationError, match="cycle"):
         ModelCatalogRecord.model_validate(
             {
-                "schemaVersion": "1.0",
                 "latestModelId": 2,
                 "nextModelId": 3,
                 "revisions": revisions,
@@ -84,7 +85,6 @@ def test_catalog_rejects_revision_outside_latest_linear_lineage() -> None:
     with pytest.raises(ValidationError, match="linear lineage"):
         ModelCatalogRecord.model_validate(
             {
-                "schemaVersion": "1.0",
                 "latestModelId": 2,
                 "nextModelId": 4,
                 "revisions": [
@@ -110,7 +110,6 @@ def test_federated_revision_requires_adrf_reference() -> None:
     with pytest.raises(ValidationError, match="ADRF reference"):
         ModelCatalogRecord.model_validate(
             {
-                "schemaVersion": "1.0",
                 "latestModelId": 2,
                 "nextModelId": 3,
                 "revisions": [seed_revision(1), revision],
@@ -123,7 +122,6 @@ def test_federated_revision_requires_adrf_reference() -> None:
     }
     catalog = ModelCatalogRecord.model_validate(
         {
-            "schemaVersion": "1.0",
             "latestModelId": 2,
             "nextModelId": 3,
             "revisions": [seed_revision(1), revision],
@@ -134,7 +132,6 @@ def test_federated_revision_requires_adrf_reference() -> None:
 
 def test_store_accepted_journal_requires_record_locators() -> None:
     values = {
-        "schemaVersion": "1.0",
         "publicationId": "publication-1",
         "state": "STORE_ACCEPTED",
         "mlCorreId": "fl-process-001",
@@ -161,7 +158,7 @@ def test_store_accepted_journal_requires_record_locators() -> None:
     publication = PendingPublication.model_validate(values)
     assert publication.state == "STORE_ACCEPTED"
 
-    catalog = migrate_seed_catalog(
+    catalog = initialize_seed_catalog(
         model_unique_id=1,
         artifact_key=DIGEST_A,
         created_at=datetime.now(UTC),
@@ -176,13 +173,12 @@ def test_store_accepted_journal_requires_record_locators() -> None:
 
 
 def test_durable_model_state_repository_atomically_survives_restart(tmp_path) -> None:
-    catalog = migrate_seed_catalog(
+    catalog = initialize_seed_catalog(
         model_unique_id=3,
         artifact_key=DIGEST_A,
         created_at=datetime.now(UTC),
     )
     initial = DurableModelState(
-        schemaVersion="2.0",
         lastAllocatedModelId=3,
         families={"family-a": catalog},
     )
@@ -202,7 +198,6 @@ def test_durable_publication_preserves_hierarchy_validation_evidence(tmp_path) -
     leaf_evidence = {**direct_evidence, "participant_nf_instance_id": LEAF_A}
     publication = PendingPublication.model_validate(
         {
-            "schemaVersion": "1.0",
             "publicationId": "publication-hierarchy",
             "state": "RESERVED",
             "mlCorreId": "root-process",
@@ -230,13 +225,12 @@ def test_durable_publication_preserves_hierarchy_validation_evidence(tmp_path) -
             "updatedAt": datetime.now(UTC),
         }
     )
-    catalog = migrate_seed_catalog(
+    catalog = initialize_seed_catalog(
         model_unique_id=3,
         artifact_key=DIGEST_A,
         created_at=datetime.now(UTC),
     ).model_copy(update={"next_model_id": 5})
     initial = DurableModelState(
-        schemaVersion="2.0",
         lastAllocatedModelId=4,
         families={"family-a": catalog},
         pendingPublications=(publication,),

@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import threading
@@ -38,7 +37,7 @@ class CollectionManagerError(RuntimeError):
 
 @dataclass
 class CollectionResource:
-    key: str
+    key: "CollectionResourceIdentity"
     subscription: AcceptedSubscription
     references: set[str] = field(default_factory=set)
     cleanup_pending: bool = False
@@ -48,8 +47,6 @@ class CollectionResource:
 class CollectionRequestRecord:
     request: TrainingDataCollectionRequest
     profile: PrivateCollectionProfileSettings
-    request_digest: str
-    profile_digest: str
     state: CollectionRequestState
     created_at: datetime
     updated_at: datetime
@@ -74,8 +71,53 @@ class CollectionRequestRecord:
         return f"{self.request.request_id}/{self.request.collection_profile_id}"
 
 
+@dataclass(frozen=True)
+class CollectionResourceIdentity:
+    supi: str
+    smf_nf_instance_id: str
+    api_root: str
+    pdu_session_id: int
+    dnn: str
+    snssai: str
+    sampling_interval_seconds: int
+    ml_event_filter: str
+    network_area: str
+
+
 class TrainingDataCollectionManager:
-    _LEDGER_VERSION = 2
+    _INBOX_FIELDS = {"requestIds", "correlationId", "notification"}
+    _LEDGER_FIELDS = {"storedInboxIds", "requests"}
+    _RECORD_FIELDS = {
+        "request",
+        "profile",
+        "state",
+        "createdAt",
+        "updatedAt",
+        "processGeneration",
+        "resolvedUeCount",
+        "storageTransport",
+        "storedStart",
+        "storedStop",
+        "recordCount",
+        "observationCount",
+        "adrfInstanceId",
+        "observedCorrelations",
+        "descriptorState",
+        "failureCause",
+        "failureDetail",
+        "retainUntil",
+        "retryAttempt",
+        "resources",
+    }
+    _RESOURCE_FIELDS = {
+        "correlationId",
+        "subscriptionId",
+        "location",
+        "target",
+        "representation",
+        "cleanupPending",
+        "referenced",
+    }
     _ACTIVE_STATES = {
         CollectionRequestState.PENDING,
         CollectionRequestState.RESOLVING,
@@ -106,9 +148,9 @@ class TrainingDataCollectionManager:
         self._lock = threading.RLock()
         self._peer_lock = threading.Lock()
         self._requests: dict[str, CollectionRequestRecord] = {}
-        self._resources: dict[str, CollectionResource] = {}
+        self._resources: dict[CollectionResourceIdentity, CollectionResource] = {}
         self._correlations: dict[str, set[str]] = {}
-        self._stored_inbox_digests: set[str] = set()
+        self._stored_inbox_ids: set[str] = set()
         self._closing = threading.Event()
         self._admission_ready = threading.Event()
         self._work = ThreadPoolExecutor(
@@ -161,7 +203,6 @@ class TrainingDataCollectionManager:
                     "PROFILE_NOT_FOUND",
                     "collection profile was not found",
                 )
-            profile_digest = self._profile_digest(profile)
             if any(
                 resource.cleanup_pending
                 and self._collection_key(profile, resource.subscription.target)
@@ -177,8 +218,6 @@ class TrainingDataCollectionManager:
             record = CollectionRequestRecord(
                 request=request,
                 profile=profile,
-                request_digest=self._request_digest(request),
-                profile_digest=profile_digest,
                 state=CollectionRequestState.PENDING,
                 created_at=now,
                 updated_at=now,
@@ -225,9 +264,8 @@ class TrainingDataCollectionManager:
         if not self.admission_ready:
             raise CollectionManagerError(503, "SERVICE_UNAVAILABLE", "callback admission is fenced")
         raw = notification.model_dump(by_alias=True, exclude_none=True, mode="json")
-        encoded = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
-        digest = hashlib.sha256(encoded).hexdigest()
-        inbox_path = self._inbox_directory / f"{digest}.json"
+        inbox_id = str(uuid4())
+        inbox_path = self._inbox_directory / f"{inbox_id}.json"
         with self._lock:
             request_ids = self._correlations.get(notification.correlation_id, set())
             active_request_ids = sorted(
@@ -243,12 +281,9 @@ class TrainingDataCollectionManager:
                     "SUBSCRIPTION_NOT_FOUND",
                     "correlationId does not identify an active collection resource",
                 )
-            if digest in self._stored_inbox_digests or inbox_path.exists():
-                return False
             if not self._storage_slots.acquire(blocking=False):
                 raise CollectionManagerError(503, "QUEUE_FULL", "callback storage queue is full")
             envelope = {
-                "schemaVersion": self._LEDGER_VERSION,
                 "requestIds": active_request_ids,
                 "correlationId": notification.correlation_id,
                 "notification": raw,
@@ -354,13 +389,12 @@ class TrainingDataCollectionManager:
     def _store_inbox(self, inbox_path: Path, attempt: int = 0) -> None:
         try:
             with self._lock:
-                already_stored = inbox_path.stem in self._stored_inbox_digests
+                already_stored = inbox_path.stem in self._stored_inbox_ids
             if already_stored:
                 inbox_path.unlink(missing_ok=True)
                 return
             envelope = self._read_json(inbox_path)
-            if envelope.get("schemaVersion") != self._LEDGER_VERSION:
-                raise RuntimeError("unsupported durable inbox version")
+            self._require_exact_fields(envelope, self._INBOX_FIELDS, "durable inbox")
             request_ids = tuple(str(item) for item in envelope["requestIds"])
             correlation_id = str(envelope["correlationId"])
             notification = NotificationData.model_validate(envelope["notification"])
@@ -423,7 +457,7 @@ class TrainingDataCollectionManager:
                         subscription,
                         receipt.adrf_instance_id,
                     )
-                self._stored_inbox_digests.add(inbox_path.stem)
+                self._stored_inbox_ids.add(inbox_path.stem)
                 self._persist_locked()
             inbox_path.unlink(missing_ok=True)
         except CollectionRelayError as error:
@@ -668,11 +702,12 @@ class TrainingDataCollectionManager:
     def _recover_inbox(self) -> None:
         for path in sorted(self._inbox_directory.glob("*.json")):
             envelope = self._read_json(path)
+            self._require_exact_fields(envelope, self._INBOX_FIELDS, "durable inbox")
             with self._lock:
                 attempt = max(
                     (
                         self._requests[str(request_id)].retry_attempt
-                        for request_id in envelope.get("requestIds", [])
+                        for request_id in envelope["requestIds"]
                         if str(request_id) in self._requests
                     ),
                     default=0,
@@ -739,25 +774,26 @@ class TrainingDataCollectionManager:
     def _collection_key(
         profile: PrivateCollectionProfileSettings,
         target: ServingSmfTarget,
-    ) -> str:
-        value = {
-            "supi": target.supi,
-            "smfNfInstanceId": target.smf_nf_instance_id,
-            "apiRoot": target.api_root,
-            "pduSessionId": target.pdu_session_id,
-            "dnn": target.dnn,
-            "snssai": target.snssai,
-            "samplingIntervalSeconds": profile.sampling_interval_seconds,
-            "requiredMeasurements": [
-                "VOLUME_MEASUREMENT",
-                "THROUGHPUT_MEASUREMENT",
-            ],
-            "mlEventFilter": profile.ml_event_filter,
-            "networkArea": profile.network_area.wire_value(),
-        }
-        return hashlib.sha256(
-            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+    ) -> CollectionResourceIdentity:
+        return CollectionResourceIdentity(
+            supi=target.supi,
+            smf_nf_instance_id=target.smf_nf_instance_id,
+            api_root=target.api_root,
+            pdu_session_id=target.pdu_session_id,
+            dnn=target.dnn,
+            snssai=json.dumps(target.snssai, sort_keys=True, separators=(",", ":")),
+            sampling_interval_seconds=profile.sampling_interval_seconds,
+            ml_event_filter=json.dumps(
+                profile.ml_event_filter,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            network_area=json.dumps(
+                profile.network_area.wire_value(),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
 
     def _transition_locked(
         self,
@@ -841,19 +877,6 @@ class TrainingDataCollectionManager:
                 "containing NWDAF generation is unavailable",
             ) from error
 
-    def _profile_digest(self, profile: PrivateCollectionProfileSettings) -> str:
-        payload = profile.model_dump(by_alias=True, exclude_none=True, mode="json")
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    @staticmethod
-    def _request_digest(request: TrainingDataCollectionRequest) -> str:
-        payload = request.model_dump(by_alias=True, exclude_none=True, mode="json")
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
     def _submit(self, function, *args) -> None:
         try:
             future = self._work.submit(function, *args)
@@ -912,8 +935,7 @@ class TrainingDataCollectionManager:
 
     def _persist_locked(self) -> None:
         payload = {
-            "schemaVersion": self._LEDGER_VERSION,
-            "storedInboxDigests": sorted(self._stored_inbox_digests),
+            "storedInboxIds": sorted(self._stored_inbox_ids),
             "requests": [self._serialize(record) for record in self._requests.values()],
         }
         self._atomic_json_write(self._ledger_path, payload, mode=0o600)
@@ -922,17 +944,15 @@ class TrainingDataCollectionManager:
         if not self._ledger_path.exists():
             return
         payload = self._read_json(self._ledger_path)
-        if payload.get("schemaVersion") != self._LEDGER_VERSION or not isinstance(
-            payload.get("requests"), list
-        ):
+        if set(payload) != self._LEDGER_FIELDS or not isinstance(payload["requests"], list):
             raise RuntimeError("unsupported or corrupt training-data collection ledger")
         try:
-            stored_digests = payload.get("storedInboxDigests", [])
-            if not isinstance(stored_digests, list) or any(
-                not isinstance(item, str) or len(item) != 64 for item in stored_digests
+            stored_ids = payload["storedInboxIds"]
+            if not isinstance(stored_ids, list) or any(
+                not isinstance(item, str) or not item for item in stored_ids
             ):
-                raise ValueError("stored inbox digests are malformed")
-            self._stored_inbox_digests = set(stored_digests)
+                raise ValueError("stored inbox identifiers are malformed")
+            self._stored_inbox_ids = set(stored_ids)
             for value in payload["requests"]:
                 record = self._deserialize(value)
                 self._requests[record.request.request_id] = record
@@ -948,8 +968,6 @@ class TrainingDataCollectionManager:
         return {
             "request": record.request.model_dump(by_alias=True, mode="json"),
             "profile": record.profile.model_dump(by_alias=True, mode="json"),
-            "requestDigest": record.request_digest,
-            "profileDigest": record.profile_digest,
             "state": record.state,
             "createdAt": record.created_at.isoformat(),
             "updatedAt": record.updated_at.isoformat(),
@@ -969,7 +987,6 @@ class TrainingDataCollectionManager:
             "retryAttempt": record.retry_attempt,
             "resources": [
                 {
-                    "resourceKey": item.key,
                     "correlationId": item.subscription.correlation_id,
                     "subscriptionId": item.subscription.subscription_id,
                     "location": item.subscription.location,
@@ -983,25 +1000,24 @@ class TrainingDataCollectionManager:
         }
 
     def _deserialize(self, value: dict) -> CollectionRequestRecord:
+        self._require_exact_fields(value, self._RECORD_FIELDS, "collection ledger record")
         request = TrainingDataCollectionRequest.model_validate(value["request"])
         profile = PrivateCollectionProfileSettings.model_validate(value["profile"])
-        request_digest = str(value["requestDigest"])
-        profile_digest = str(value["profileDigest"])
-        request_mismatch = request_digest != self._request_digest(request)
-        profile_mismatch = profile_digest != self._profile_digest(profile)
-        if request_mismatch or profile_mismatch:
-            raise ValueError("collection ledger digest mismatch")
-        retry_attempt = int(value.get("retryAttempt", 0))
+        configured_profile = self._profiles.get(request.collection_profile_id)
+        if configured_profile is None or configured_profile != profile:
+            raise ValueError("collection ledger profile does not match current configuration")
+        retry_attempt = int(value["retryAttempt"])
         if retry_attempt < 0 or retry_attempt > 3:
             raise ValueError("collection ledger retry attempt is invalid")
         state = CollectionRequestState(value["state"])
-        observed_correlations = value.get("observedCorrelations", [])
+        observed_correlations = value["observedCorrelations"]
         if not isinstance(observed_correlations, list) or any(
             not isinstance(item, str) or not item for item in observed_correlations
         ):
             raise ValueError("collection ledger observed correlations are malformed")
         resources = {}
-        for item in value.get("resources", []):
+        for item in value["resources"]:
+            self._require_exact_fields(item, self._RESOURCE_FIELDS, "collection ledger resource")
             target = ServingSmfTarget(**item["target"])
             subscription = AcceptedSubscription(
                 item["subscriptionId"],
@@ -1010,7 +1026,7 @@ class TrainingDataCollectionManager:
                 item["correlationId"],
                 item["representation"],
             )
-            key = str(item["resourceKey"])
+            key = self._collection_key(profile, target)
             referenced = item["referenced"]
             if not isinstance(referenced, bool):
                 raise ValueError("collection ledger resource reference is invalid")
@@ -1020,7 +1036,7 @@ class TrainingDataCollectionManager:
                     key,
                     subscription,
                     set(),
-                    bool(item.get("cleanupPending")),
+                    bool(item["cleanupPending"]),
                 )
                 self._resources[key] = resource
             if referenced:
@@ -1035,33 +1051,36 @@ class TrainingDataCollectionManager:
         return CollectionRequestRecord(
             request=request,
             profile=profile,
-            request_digest=request_digest,
-            profile_digest=profile_digest,
             state=state,
             created_at=datetime.fromisoformat(value["createdAt"]),
             updated_at=datetime.fromisoformat(value["updatedAt"]),
             process_generation=str(value["processGeneration"]),
             resources=resources,
-            resolved_ue_count=int(value.get("resolvedUeCount", 0)),
-            storage_transport=str(value.get("storageTransport", "unavailable")),
+            resolved_ue_count=int(value["resolvedUeCount"]),
+            storage_transport=str(value["storageTransport"]),
             stored_start=(
                 datetime.fromisoformat(value["storedStart"]) if value.get("storedStart") else None
             ),
             stored_stop=(
                 datetime.fromisoformat(value["storedStop"]) if value.get("storedStop") else None
             ),
-            record_count=int(value.get("recordCount", 0)),
-            observation_count=int(value.get("observationCount", 0)),
-            adrf_instance_id=str(value.get("adrfInstanceId", "")),
+            record_count=int(value["recordCount"]),
+            observation_count=int(value["observationCount"]),
+            adrf_instance_id=str(value["adrfInstanceId"]),
             observed_correlations=set(observed_correlations),
-            descriptor_state=DescriptorState(value.get("descriptorState", "NONE")),
-            failure_cause=str(value.get("failureCause", "")),
-            failure_detail=str(value.get("failureDetail", "")),
+            descriptor_state=DescriptorState(value["descriptorState"]),
+            failure_cause=str(value["failureCause"]),
+            failure_detail=str(value["failureDetail"]),
             retain_until=(
                 datetime.fromisoformat(value["retainUntil"]) if value.get("retainUntil") else None
             ),
             retry_attempt=retry_attempt,
         )
+
+    @staticmethod
+    def _require_exact_fields(value: object, expected: set[str], label: str) -> None:
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError(f"{label} fields do not match the current schema")
 
     @staticmethod
     def _read_json(path: Path) -> dict:

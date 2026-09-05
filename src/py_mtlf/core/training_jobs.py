@@ -1,4 +1,3 @@
-import hashlib
 import logging
 import queue
 import tempfile
@@ -222,8 +221,8 @@ class TrainingCoordinator:
                 logger.warning(
                     "Training scope drift model=%s added=%s removed=%s",
                     snapshot.family_key,
-                    self._scope_digests(current_scopes - snapshot_scopes),
-                    self._scope_digests(snapshot_scopes - current_scopes),
+                    sorted(current_scopes - snapshot_scopes),
+                    sorted(snapshot_scopes - current_scopes),
                 )
             if (
                 self._policy.scope_reference(
@@ -331,7 +330,7 @@ class TrainingCoordinator:
             evaluation.rejection_reasons,
             [
                 {
-                    "scope": item.scope_digest,
+                    "scope": item.scope_key,
                     "triggering": item.triggering_scope,
                     "current": item.current.value,
                     "candidate": item.candidate.value,
@@ -340,10 +339,6 @@ class TrainingCoordinator:
                 for item in evaluation.scopes
             ],
         )
-
-    @staticmethod
-    def _scope_digests(scope_keys: set[str]) -> list[str]:
-        return sorted(hashlib.sha256(scope.encode()).hexdigest() for scope in scope_keys)
 
     @staticmethod
     def _copy(job: TrainingJob) -> TrainingJob:

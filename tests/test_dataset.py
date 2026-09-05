@@ -969,7 +969,7 @@ def test_private_dataset_selection_rejects_ambiguous_collection_groups():
     coordinator.shutdown()
 
 
-def test_private_dataset_records_deduplicate_notification_content_not_transport_ids():
+def test_private_dataset_records_use_native_record_identity_without_content_hashing():
     policy, intent = retrain_intent()
     coordinator = DatasetCoordinator(
         DatasetSettings(), context_client(), policy, Mock(close=Mock())
@@ -1011,5 +1011,5 @@ def test_private_dataset_records_deduplicate_notification_content_not_transport_
     coordinator._append_record(job, resource, first, "mongodb", window.start_time, "row-a")
     coordinator._append_record(job, resource, second, "adrf", window.start_time, "row-b")
 
-    assert len(job.records) == 1
+    assert len(job.records) == 2
     coordinator.shutdown()

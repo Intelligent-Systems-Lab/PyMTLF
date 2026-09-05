@@ -1,5 +1,3 @@
-import hashlib
-import json
 import logging
 import threading
 import time
@@ -903,25 +901,10 @@ class DatasetCoordinator:
         if not record.data_notif.upf_event_notifs:
             return
         payload = record.model_dump(by_alias=True, exclude_none=True, mode="json")
-        if resource.descriptor_origin is DescriptorOrigin.PRIVATE_API:
-            notifications = payload["dataNotif"]["upfEventNotifs"]
-            canonical = self._without_transport_correlation(notifications)
-            identity = hashlib.sha256(
-                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-        else:
-            identity = (
-                native_id
-                or hashlib.sha256(
-                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest()
-            )
+        identity = native_id or str(uuid4())
         if any(
             item.identity == identity
-            and (
-                resource.descriptor_origin is DescriptorOrigin.PRIVATE_API
-                or item.source == source
-            )
+            and item.source == source
             for item in job.records
         ):
             return
@@ -936,20 +919,6 @@ class DatasetCoordinator:
                 payload,
             )
         )
-
-    @staticmethod
-    def _without_transport_correlation(value: object) -> object:
-        if isinstance(value, dict):
-            return {
-                key: DatasetCoordinator._without_transport_correlation(item)
-                for key, item in value.items()
-                if key != "correlationId"
-            }
-        if isinstance(value, list):
-            return [
-                DatasetCoordinator._without_transport_correlation(item) for item in value
-            ]
-        return value
 
     def _complete(self, job: DatasetJob) -> None:
         counts = {

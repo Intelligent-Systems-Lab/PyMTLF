@@ -52,9 +52,7 @@ from py_mtlf.core.fl_workspace import (
     FLArtifactUnavailableError,
     FLWorkspace,
     FLWorkspaceError,
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
+    validate_model_compatibility,
 )
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
@@ -112,7 +110,6 @@ def base_bundle() -> LoadedBundle:
     joblib.dump(scaler, scaler_stream)
     return LoadedBundle(
         manifest={
-            "bundle_schema_version": "1.0",
             "model_identity": {"model_unique_id": 1},
             "analytics_event": "UE_COMMUNICATION",
             "model_interoperability": "001122",
@@ -189,7 +186,6 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
         assert isinstance(lower_input.contract, RoundInputArtifact)
         assert lower_input.contract.fl_metadata.client_training.epochs == 7
 
-        base_digest = weights_digest(upper.model)
         lower_global = branch_workspace.publish(
             process_id="lower-process",
             participant_id=BRANCH,
@@ -200,15 +196,8 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
             metadata={
                 "artifact_role": "ROUND_GLOBAL",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": "lower-process",
                     "round_ind": 4,
-                    "model_contract_digest": model_contract_digest(upper.manifest),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(
-                        upper.manifest
-                    ),
-                    "base_weights_digest": base_digest,
-                    "weights_digest": base_digest,
                     "participants": [
                         {
                             "participant_nf_instance_id": LEAF_A,
@@ -232,7 +221,9 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
             upper_process_id="upper-process",
             branch_nf_instance_id=BRANCH,
             upper_round_indicator=2,
-            upper_scope_digest="3" * 64,
+            upper_training_scope=TrainingScopeDescriptor(
+                eventSubscription={"mLEvent": "UE_COMMUNICATION"}
+            ),
         )
         assert isinstance(upper_result.contract, RoundLocalArtifact)
         assert upper_result.contract.result_type == "HIERARCHY_AGGREGATE"
@@ -244,19 +235,17 @@ def test_round_input_and_hierarchy_aggregate_preserve_training_contract(tmp_path
 
         with torch.no_grad():
             upper.model.linear.weight.add_(1.0)
-        with pytest.raises(
-            HierarchyArtifactOperationError,
-            match="does not match the upper round input",
-        ):
-            service.publish_hierarchy_aggregate(
-                upper_input=upper,
-                lower_global=lower_global,
-                plan_id=PLAN,
-                upper_process_id="upper-process",
-                branch_nf_instance_id=BRANCH,
-                upper_round_indicator=3,
-                upper_scope_digest="3" * 64,
-            )
+        service.publish_hierarchy_aggregate(
+            upper_input=upper,
+            lower_global=lower_global,
+            plan_id=PLAN,
+            upper_process_id="upper-process",
+            branch_nf_instance_id=BRANCH,
+            upper_round_indicator=3,
+            upper_training_scope=TrainingScopeDescriptor(
+                eventSubscription={"mLEvent": "UE_COMMUNICATION"}
+            ),
+        )
     finally:
         branch_workspace.close()
 
@@ -266,7 +255,6 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
 ) -> None:
     root_workspace = workspace(tmp_path / "root", "http://root.example")
     base = base_bundle()
-    base_digest = weights_digest(base.model)
     candidate = root_workspace.publish(
         process_id="root-process",
         participant_id=ROOT,
@@ -277,15 +265,8 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
         metadata={
             "artifact_role": "ROUND_GLOBAL",
             "fl_metadata": {
-                "contract_version": "1.0",
                 "ml_corre_id": "root-process",
                 "round_ind": 1,
-                "model_contract_digest": model_contract_digest(base.manifest),
-                "preprocessing_contract_digest": preprocessing_contract_digest(
-                    base.manifest
-                ),
-                "base_weights_digest": base_digest,
-                "weights_digest": base_digest,
                 "participants": [
                     {
                         "participant_nf_instance_id": BRANCH,
@@ -301,7 +282,6 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
     def serve(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            headers={"X-Artifact-SHA256": candidate.digest},
             content=candidate.path.read_bytes(),
             request=request,
         )
@@ -338,12 +318,15 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
         summaries = tuple(
             ValidationSummary(
                 participant_nf_instance_id=leaf_id,
-                scope_digest=str(index) * 64,
+                training_scope=TrainingScopeDescriptor(
+                    eventSubscription={
+                        "mLEvent": "UE_COMMUNICATION",
+                        "scopeIndex": index,
+                    }
+                ),
                 evaluation_sample_count=10,
                 start_time=start,
                 end_time=start + timedelta(minutes=1),
-                base_model_weights_digest=base_digest,
-                candidate_weights_digest=base_digest,
                 base=WapeComponents(
                     absolute_error_sum=10,
                     absolute_actual_sum=100,
@@ -363,7 +346,9 @@ def test_branch_republishes_validation_candidate_byte_identically_under_plan_own
             upper_process_id="root-process",
             branch_nf_instance_id=BRANCH,
             upper_round_indicator=2,
-            upper_scope_digest="3" * 64,
+            upper_training_scope=TrainingScopeDescriptor(
+                eventSubscription={"mLEvent": "UE_COMMUNICATION"}
+            ),
             subordinate_summaries=summaries,
         )
         assert isinstance(result.contract, RoundLocalArtifact)
@@ -400,7 +385,7 @@ def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_pa
             leaf_assignment.contract.hierarchy_metadata.intended_recipient_nf_instance_id
             == LEAF_A
         )
-        assert leaf_assignment.contract.file_digests == root_assignment.contract.file_digests
+        assert "file_digests" not in leaf_assignment.manifest
         assert "assigned_leaf_nf_instance_ids" not in leaf_assignment.manifest["hierarchy_metadata"]
 
         result = branch_service.publish_preparation_result(
@@ -415,14 +400,17 @@ def test_publish_republish_and_result_round_trip_preserves_model_contract(tmp_pa
         )
         assert isinstance(result.contract, HierarchyPreparationResultArtifact)
         assert result.contract.hierarchy_metadata.outcome is PreparationOutcome.FAILED
-        assert result.contract.file_digests == root_assignment.contract.file_digests
+        assert "file_digests" not in result.manifest
 
         loader = TrustedBundleLoader()
         root_model = loader.load(metadata(root_assignment))
         leaf_model = loader.load(metadata(leaf_assignment))
         result_model = loader.load(metadata(result))
-        assert weights_digest(root_model.model) == weights_digest(leaf_model.model)
-        assert weights_digest(root_model.model) == weights_digest(result_model.model)
+        validate_model_compatibility(root_model, leaf_model)
+        validate_model_compatibility(root_model, result_model)
+        for name, value in root_model.model.state_dict().items():
+            torch.testing.assert_close(value, leaf_model.model.state_dict()[name])
+            torch.testing.assert_close(value, result_model.model.state_dict()[name])
         assert root_model.manifest["model"] == leaf_model.manifest["model"]
         assert root_model.manifest["inference"] == result_model.manifest["inference"]
     finally:
@@ -538,7 +526,6 @@ def test_hierarchy_download_binds_url_header_body_and_identity(tmp_path) -> None
         return httpx.Response(
             200,
             content=content,
-            headers={"X-Artifact-SHA256": root_assignment.digest},
             request=request,
         )
 
@@ -586,7 +573,6 @@ def test_assignment_ingress_discovers_typed_message_without_expected_publisher(t
         return httpx.Response(
             200,
             content=content,
-            headers={"X-Artifact-SHA256": root_assignment.digest},
             request=request,
         )
 
@@ -629,7 +615,6 @@ def test_branch_and_leaf_assignment_admission_each_fetches_once_and_adopts_same_
         return httpx.Response(
             200,
             content=root_content,
-            headers={"X-Artifact-SHA256": root_assignment.digest},
             request=request,
         )
 
@@ -673,7 +658,6 @@ def test_branch_and_leaf_assignment_admission_each_fetches_once_and_adopts_same_
             return httpx.Response(
                 200,
                 content=leaf_content,
-                headers={"X-Artifact-SHA256": leaf_assignment.digest},
                 request=request,
             )
 
@@ -717,7 +701,6 @@ def test_branch_and_leaf_client_preparation_each_performs_one_assignment_get(tmp
         return httpx.Response(
             200,
             content=root_content,
-            headers={"X-Artifact-SHA256": root_assignment.digest},
             request=request,
         )
 
@@ -768,7 +751,6 @@ def test_branch_and_leaf_client_preparation_each_performs_one_assignment_get(tmp
                 return httpx.Response(
                     200,
                     content=response_content,
-                    headers={"X-Artifact-SHA256": response_digest},
                     request=request,
                 )
 
@@ -902,8 +884,6 @@ def test_branch_and_leaf_client_preparation_each_performs_one_assignment_get(tmp
 @pytest.mark.parametrize(
     ("failure", "expected_error"),
     [
-        ("missing-header", FLArtifactIntegrityError),
-        ("duplicate-header", FLArtifactIntegrityError),
         ("publisher", FLArtifactIdentityError),
         ("recipient", FLArtifactIdentityError),
         ("plan", FLArtifactIdentityError),
@@ -919,12 +899,7 @@ def test_single_fetch_assignment_admission_preserves_strict_identity_checks(
     content = root_assignment.path.read_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        headers: list[tuple[str, str]] = []
-        if failure != "missing-header":
-            headers.append(("X-Artifact-SHA256", root_assignment.digest))
-        if failure == "duplicate-header":
-            headers.append(("X-Artifact-SHA256", root_assignment.digest))
-        return httpx.Response(200, content=content, headers=headers, request=request)
+        return httpx.Response(200, content=content, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     branch_workspace = workspace(
@@ -969,7 +944,6 @@ def test_single_fetch_assignment_rejects_valid_archive_with_wrong_body_digest(tm
         return httpx.Response(
             200,
             content=substituted_content,
-            headers={"X-Artifact-SHA256": requested.digest},
             request=request,
         )
 
@@ -981,15 +955,11 @@ def test_single_fetch_assignment_rejects_valid_archive_with_wrong_body_digest(tm
         allowed_origins=("http://root.example",),
     )
     try:
-        downloaded = branch_workspace.download_archive(
-            requested.url,
-            "upper-process",
-            "preparation-base",
-        )
         with pytest.raises(FLArtifactIntegrityError, match="archive digest"):
-            branch_workspace.admit_assignment(
-                downloaded,
-                intended_recipient_nf_instance_id=BRANCH,
+            branch_workspace.download_archive(
+                requested.url,
+                "upper-process",
+                "preparation-base",
             )
 
         assert not (tmp_path / "branch" / "upper-process").exists()
@@ -1000,7 +970,7 @@ def test_single_fetch_assignment_rejects_valid_archive_with_wrong_body_digest(tm
         client.close()
 
 
-@pytest.mark.parametrize("failure", ["header", "body", "publisher", "recipient", "plan"])
+@pytest.mark.parametrize("failure", ["body", "publisher", "recipient", "plan"])
 def test_hierarchy_download_rejects_integrity_and_identity_mismatch(tmp_path, failure: str) -> None:
     root_workspace = workspace(tmp_path / "root", "http://root.example")
     root_assignment = publish_root_assignment(root_workspace)
@@ -1008,11 +978,9 @@ def test_hierarchy_download_rejects_integrity_and_identity_mismatch(tmp_path, fa
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = content + b"tampered" if failure == "body" else content
-        header = "f" * 64 if failure == "header" else root_assignment.digest
         return httpx.Response(
             200,
             content=body,
-            headers={"X-Artifact-SHA256": header},
             request=request,
         )
 
@@ -1026,7 +994,7 @@ def test_hierarchy_download_rejects_integrity_and_identity_mismatch(tmp_path, fa
     try:
         expected_error = (
             FLArtifactIntegrityError
-            if failure in {"header", "body"}
+            if failure == "body"
             else FLArtifactIdentityError
         )
         with pytest.raises(expected_error):
@@ -1047,7 +1015,7 @@ def test_hierarchy_download_rejects_integrity_and_identity_mismatch(tmp_path, fa
 
 
 @pytest.mark.parametrize("header_mode", ["missing", "duplicate"])
-def test_hierarchy_download_requires_one_digest_header(tmp_path, header_mode: str) -> None:
+def test_hierarchy_download_does_not_require_digest_header(tmp_path, header_mode: str) -> None:
     root_workspace = workspace(tmp_path / "root", "http://root.example")
     root_assignment = publish_root_assignment(root_workspace)
     content = root_assignment.path.read_bytes()
@@ -1069,14 +1037,14 @@ def test_hierarchy_download_requires_one_digest_header(tmp_path, header_mode: st
         allowed_origins=("http://root.example",),
     )
     try:
-        with pytest.raises(FLArtifactIntegrityError, match="header"):
-            branch_workspace.download_hierarchy(
-                root_assignment.url,
-                expected_role=ArtifactRole.HIERARCHY_ASSIGNMENT,
-                expected_message_type=HierarchyMessageType.BRANCH_ASSIGNMENT,
-                expected_publisher_nf_instance_id=ROOT,
-                intended_recipient_nf_instance_id=BRANCH,
-            )
+        downloaded = branch_workspace.download_hierarchy(
+            root_assignment.url,
+            expected_role=ArtifactRole.HIERARCHY_ASSIGNMENT,
+            expected_message_type=HierarchyMessageType.BRANCH_ASSIGNMENT,
+            expected_publisher_nf_instance_id=ROOT,
+            intended_recipient_nf_instance_id=BRANCH,
+        )
+        assert downloaded.metadata.key == root_assignment.digest
     finally:
         root_workspace.close()
         branch_workspace.close()
@@ -1101,7 +1069,6 @@ def test_hierarchy_download_rejects_contract_origin_and_transport_mismatch(
         return httpx.Response(
             200,
             content=content,
-            headers={"X-Artifact-SHA256": root_assignment.digest},
             request=request,
         )
 
@@ -1232,7 +1199,6 @@ def test_hierarchy_download_uses_bounded_archive_error_categories(
         return httpx.Response(
             200,
             content=content,
-            headers={"X-Artifact-SHA256": digest},
             request=request,
         )
 
@@ -1343,12 +1309,8 @@ def test_release_plan_removes_all_explicitly_owned_process_directories(tmp_path)
             metadata={
                 "artifact_role": "ROUND_INPUT",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": "root-process",
                     "round_ind": 0,
-                    "model_contract_digest": "1" * 64,
-                    "preprocessing_contract_digest": "2" * 64,
-                    "weights_digest": "3" * 64,
                     "client_training": {"epochs": 1},
                 },
             },
@@ -1364,12 +1326,8 @@ def test_release_plan_removes_all_explicitly_owned_process_directories(tmp_path)
             metadata={
                 "artifact_role": "ROUND_INPUT",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": "flat-process",
                     "round_ind": 0,
-                    "model_contract_digest": "1" * 64,
-                    "preprocessing_contract_digest": "2" * 64,
-                    "weights_digest": "3" * 64,
                     "client_training": {"epochs": 1},
                 },
             },
@@ -1400,12 +1358,8 @@ def test_late_worker_cannot_republish_after_plan_release(tmp_path) -> None:
                 metadata={
                     "artifact_role": "ROUND_INPUT",
                     "fl_metadata": {
-                        "contract_version": "1.0",
                         "ml_corre_id": "late-process",
                         "round_ind": 0,
-                        "model_contract_digest": "1" * 64,
-                        "preprocessing_contract_digest": "2" * 64,
-                        "weights_digest": "3" * 64,
                         "client_training": {"epochs": 1},
                     },
                 },

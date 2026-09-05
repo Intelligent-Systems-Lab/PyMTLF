@@ -48,7 +48,7 @@ def descriptor(payload: dict) -> TrainingScopeDescriptor:
     return TrainingScopeDescriptor.from_training_request(request, 0)
 
 
-def test_scope_digest_ignores_object_key_order_and_process_ids() -> None:
+def test_scope_descriptor_ignores_process_ids_and_preserves_typed_values() -> None:
     first = preparation_payload()
     second = deepcopy(first)
     first["mLEventSubscs"][0]["mLEventFilter"] = {
@@ -66,17 +66,16 @@ def test_scope_digest_ignores_object_key_order_and_process_ids() -> None:
 
     first_descriptor = descriptor(first)
     second_descriptor = descriptor(second)
-    assert first_descriptor.scope_digest == second_descriptor.scope_digest
-    assert first_descriptor.canonical_payload() == second_descriptor.canonical_payload()
+    assert first_descriptor == second_descriptor
 
 
-def test_scope_digest_preserves_array_order() -> None:
+def test_scope_descriptor_preserves_array_order() -> None:
     first = preparation_payload()
     first["mLEventSubscs"][0]["mLEventFilter"]["dnns"] = ["internet", "ims"]
     second = deepcopy(first)
     second["mLEventSubscs"][0]["mLEventFilter"]["dnns"] = ["ims", "internet"]
 
-    assert descriptor(first).scope_digest != descriptor(second).scope_digest
+    assert descriptor(first) != descriptor(second)
 
 
 def test_scope_descriptor_preserves_standard_scope_fields() -> None:

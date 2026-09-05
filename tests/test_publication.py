@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+import torch
+from conftest import training_scope_descriptor
 from nwdaf_context import context_client
 
 from py_mtlf.config import PublicationSettings
@@ -55,7 +57,6 @@ def nwdaf_context_client():
 def pending_publication() -> PendingPublication:
     start = datetime(2026, 7, 31, tzinfo=UTC)
     return PendingPublication(
-        schemaVersion="1.0",
         publicationId="publication-a",
         state=PublicationState.FINAL_BUNDLE_READY,
         mlCorreId="process-a",
@@ -74,12 +75,10 @@ def pending_publication() -> PendingPublication:
         validationEvidence=[
             ValidationSummary(
                 participant_nf_instance_id=CLIENT_ID,
-                scope_digest="c" * 64,
+                training_scope=training_scope_descriptor(),
                 evaluation_sample_count=20,
                 start_time=start,
                 end_time=start + timedelta(minutes=1),
-                base_model_weights_digest="d" * 64,
-                candidate_weights_digest="e" * 64,
                 base=WapeComponents(
                     absolute_error_sum=10,
                     absolute_actual_sum=100,
@@ -390,7 +389,6 @@ def test_generation_reset_wakes_retry_and_abandons_without_terminal_rewrite():
 
 def test_final_bundle_receives_durable_hierarchy_validation(
     tmp_path,
-    monkeypatch,
 ):
     publication = pending_publication().model_copy(
         update={
@@ -423,12 +421,20 @@ def test_final_bundle_receives_durable_hierarchy_validation(
             update={"candidate_path": str(candidate_path)}
         ).model_dump(by_alias=True, mode="json")
     )
-    base_model = SimpleNamespace(digest="d" * 64)
-    candidate_model = SimpleNamespace(digest="e" * 64)
-    base_bundle = SimpleNamespace(manifest={"bundle": "base"}, model=base_model)
+    model_contract = {
+        "analytics_event": "UE_COMMUNICATION",
+        "model_interoperability": "001122",
+        "runtime_compatibility": {"framework": "torch"},
+        "model": {"input_size": 1, "output_size": 1},
+        "inference": {"seq_length": 1},
+    }
+    base_bundle = SimpleNamespace(
+        manifest={**model_contract, "artifact_role": "ROUND_INPUT"},
+        model=torch.nn.Linear(1, 1),
+    )
     candidate_bundle = SimpleNamespace(
-        manifest={"bundle": "candidate"},
-        model=candidate_model,
+        manifest={**model_contract, "artifact_role": "ROUND_GLOBAL"},
+        model=torch.nn.Linear(1, 1),
     )
     catalog = Mock()
     catalog.family_key_for_id.return_value = publication.family_id
@@ -458,19 +464,6 @@ def test_final_bundle_receives_durable_hierarchy_validation(
     coordinator._loader = Mock()
     coordinator._loader.load.side_effect = [base_bundle, candidate_bundle]
     coordinator._replace_publication = lambda value: value
-    monkeypatch.setattr(
-        "py_mtlf.core.publication.model_contract_digest",
-        lambda _manifest: "1" * 64,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.publication.preprocessing_contract_digest",
-        lambda _manifest: "2" * 64,
-    )
-    monkeypatch.setattr(
-        "py_mtlf.core.publication.weights_digest",
-        lambda model: model.digest,
-    )
-
     updated = coordinator._build_final_bundle(publication)
 
     metadata = workspace.publish.call_args.kwargs["metadata"]["fl_metadata"]

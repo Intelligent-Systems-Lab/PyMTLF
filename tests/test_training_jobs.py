@@ -1,4 +1,3 @@
-import hashlib
 import io
 import json
 import tarfile
@@ -80,7 +79,6 @@ def make_seed_bundle(path: Path) -> None:
         "scaler.pkl": scaler_stream.getvalue(),
     }
     manifest = {
-        "bundle_schema_version": "1.0",
         "model_identity": {"model_unique_id": 1},
         "model_generation": 1,
         "analytics_event": "UE_COMMUNICATION",
@@ -106,9 +104,6 @@ def make_seed_bundle(path: Path) -> None:
             "feature_order": list(FEATURE_ORDER),
             "output_fields": ["ul_vol", "dl_vol"],
             "preprocessing": "log1p_standard_scaler",
-        },
-        "file_digests": {
-            name: hashlib.sha256(content).hexdigest() for name, content in components.items()
         },
     }
     files = {

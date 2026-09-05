@@ -170,7 +170,7 @@ def test_static_topology_reports_missing_and_non_mapping_files(tmp_path):
         StaticTopologyPlanner.load(path)
 
 
-def test_static_flat_topology_canonicalizes_clients_tais_and_digest(tmp_path):
+def test_static_flat_topology_canonicalizes_clients_tais_and_version(tmp_path):
     path = tmp_path / "flat.yaml"
     write_topology(
         path,
@@ -203,7 +203,7 @@ clients:
         "001100",
         "001101",
     )
-    assert len(assignment.topology_digest) == 64
+    assert assignment.topology_version == 1
 
     reordered = tmp_path / "flat-reordered.yaml"
     write_topology(
@@ -228,8 +228,8 @@ clients:
     assert (
         StaticFlatTopologyPlanner.load(reordered)
         .build(server_nf_instance_id=ROOT_ID)
-        .topology_digest
-        == assignment.topology_digest
+        .topology_version
+        == assignment.topology_version
     )
 
 

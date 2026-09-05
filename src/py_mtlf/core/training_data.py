@@ -1,8 +1,5 @@
-import hashlib
-import json
 import logging
 import math
-import struct
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -50,7 +47,6 @@ class TrainingDataError(RuntimeError):
 @dataclass(frozen=True)
 class ScopeTrainingData:
     scope_key: str
-    scope_digest: str
     observation_count: int
     observation_timestamps: tuple[datetime, ...]
     observations: np.ndarray
@@ -93,20 +89,12 @@ class TrainingDataset:
 
 @dataclass(frozen=True)
 class TrainingDatasetEvidence:
-    contract_digest: str
-    observation_digest: str
-    training_tensor_digest: str
-    validation_tensor_digest: str
     observation_count: int
     training_sample_count: int
     validation_sample_count: int
 
-    def as_dict(self) -> dict[str, str | int]:
+    def as_dict(self) -> dict[str, int]:
         return {
-            "contract_digest": self.contract_digest,
-            "observation_digest": self.observation_digest,
-            "training_tensor_digest": self.training_tensor_digest,
-            "validation_tensor_digest": self.validation_tensor_digest,
             "observation_count": self.observation_count,
             "training_sample_count": self.training_sample_count,
             "validation_sample_count": self.validation_sample_count,
@@ -180,7 +168,7 @@ class TrainingDatasetBuilder:
                 logger.warning(
                     "Training scope degraded scope=%s reason=%s observations=%s "
                     "training_samples=%s validation_samples=%s",
-                    scope.scope_digest,
+                    scope.scope_key,
                     scope.exclusion_reason,
                     scope.observation_count,
                     scope.training_sample_count,
@@ -248,7 +236,6 @@ class TrainingDatasetBuilder:
             reason = "insufficient_reference_validation_data"
         return ScopeTrainingData(
             scope_key=scope_key,
-            scope_digest=hashlib.sha256(scope_key.encode()).hexdigest(),
             observation_count=len(values),
             observation_timestamps=observation_timestamps,
             observations=values,
@@ -448,7 +435,7 @@ def _parse_rate(value: object, kind: str) -> float | None:
 def eligibility_manifest(dataset: TrainingDataset) -> list[dict[str, object]]:
     return [
         {
-            "scope_key_sha256": scope.scope_digest,
+            "scope_key": scope.scope_key,
             "triggering_scope": scope.scope_key == dataset.triggering_scope_key,
             "observation_count": scope.observation_count,
             "training_sample_count": scope.training_sample_count,
@@ -462,105 +449,17 @@ def eligibility_manifest(dataset: TrainingDataset) -> list[dict[str, object]]:
 
 
 def dataset_evidence(dataset: TrainingDataset) -> TrainingDatasetEvidence:
-    scopes = tuple(sorted(dataset.scopes, key=lambda item: item.scope_digest))
-    triggering_scope = next(
-        (
-            scope.scope_digest
-            for scope in scopes
-            if scope.scope_key == dataset.triggering_scope_key
-        ),
-        "",
-    )
-    if not triggering_scope:
+    scopes = tuple(sorted(dataset.scopes, key=lambda item: item.scope_key))
+    if not any(scope.scope_key == dataset.triggering_scope_key for scope in scopes):
         raise TrainingDataError("dataset evidence requires the triggering scope")
-    contract = {
-        "evidence_schema": "training-dataset-v1",
-        "feature_order": list(dataset.feature_order),
-        "output_fields": list(dataset.output_fields),
-        "output_indices": list(dataset.output_indices),
-        "seq_length": dataset.seq_length,
-        "out_seq_len": dataset.out_seq_len,
-        "triggering_scope_digest": triggering_scope,
-        "scope_digests": [scope.scope_digest for scope in scopes],
-    }
-    contract_digest = hashlib.sha256(
-        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-    observations = hashlib.sha256()
-    training = hashlib.sha256()
-    validation = hashlib.sha256()
-    _hash_text(observations, "evidence-schema", "training-observations-v1")
-    _hash_text(training, "evidence-schema", "training-tensors-v1")
-    _hash_text(validation, "evidence-schema", "validation-tensors-v1")
     for scope in scopes:
         if len(scope.observation_timestamps) != scope.observation_count:
             raise TrainingDataError("dataset evidence observation timestamps are incomplete")
         if scope.observations.shape != (scope.observation_count, len(dataset.feature_order)):
             raise TrainingDataError("dataset evidence observation tensor shape is invalid")
-        _hash_text(observations, "scope-digest", scope.scope_digest)
-        _hash_integer(observations, "observation-count", scope.observation_count)
-        for timestamp, row in zip(
-            scope.observation_timestamps,
-            scope.observations,
-            strict=True,
-        ):
-            _hash_text(observations, "timestamp", _canonical_timestamp(timestamp))
-            _hash_tensor(observations, "observation", row)
-        _hash_text(training, "scope-digest", scope.scope_digest)
-        _hash_optional_tensor(training, "inputs", scope.training_inputs)
-        _hash_optional_tensor(training, "targets", scope.training_targets)
-        _hash_text(validation, "scope-digest", scope.scope_digest)
-        _hash_optional_tensor(validation, "inputs", scope.validation_inputs)
-        _hash_optional_tensor(validation, "targets", scope.validation_targets)
 
     return TrainingDatasetEvidence(
-        contract_digest=contract_digest,
-        observation_digest=observations.hexdigest(),
-        training_tensor_digest=training.hexdigest(),
-        validation_tensor_digest=validation.hexdigest(),
         observation_count=sum(scope.observation_count for scope in scopes),
         training_sample_count=sum(scope.training_sample_count for scope in scopes),
         validation_sample_count=sum(scope.validation_sample_count for scope in scopes),
     )
-
-
-def _hash_bytes(target, label: str, value: bytes) -> None:
-    encoded_label = label.encode()
-    target.update(struct.pack("<Q", len(encoded_label)))
-    target.update(encoded_label)
-    target.update(struct.pack("<Q", len(value)))
-    target.update(value)
-
-
-def _hash_text(target, label: str, value: str) -> None:
-    _hash_bytes(target, label, value.encode())
-
-
-def _hash_integer(target, label: str, value: int) -> None:
-    _hash_bytes(target, label, struct.pack("<q", value))
-
-
-def _hash_optional_tensor(target, label: str, value: np.ndarray | None) -> None:
-    if value is None:
-        _hash_text(target, f"{label}-presence", "absent")
-        return
-    _hash_text(target, f"{label}-presence", "present")
-    _hash_tensor(target, label, value)
-
-
-def _hash_tensor(target, label: str, value: np.ndarray) -> None:
-    canonical = np.asarray(value, dtype=np.dtype("<f8"), order="C")
-    _hash_text(target, f"{label}-dtype", "<f8")
-    _hash_bytes(
-        target,
-        f"{label}-shape",
-        json.dumps(list(canonical.shape), separators=(",", ":")).encode(),
-    )
-    _hash_bytes(target, f"{label}-values", canonical.tobytes(order="C"))
-
-
-def _canonical_timestamp(value: datetime) -> str:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise TrainingDataError("dataset evidence timestamps must include a timezone")
-    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")

@@ -3,10 +3,9 @@ from pathlib import Path
 
 
 def test_policy_oracle_has_phase_one_families_and_provenance():
-    path = Path(__file__).parent / "fixtures" / "policy_compatibility" / "policy_oracle_v1.json"
+    path = Path(__file__).parent / "fixtures" / "policy_compatibility" / "policy_oracle.json"
     oracle = json.loads(path.read_text(encoding="utf-8"))
 
-    assert oracle["schema_version"] == "1.0"
     assert oracle["baseline"]["repository"] == "NWDAF"
     assert len(oracle["baseline"]["commit"]) == 40
     fixtures = oracle["fixtures"]

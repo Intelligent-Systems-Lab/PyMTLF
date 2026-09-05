@@ -81,7 +81,6 @@ class ValidatedArchive:
 class DownloadedArchive:
     metadata: ArtifactMetadata
     validated: ValidatedArchive
-    response_digest_headers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -208,16 +207,13 @@ class FLWorkspace:
         )
         os.close(descriptor)
         temporary = Path(temporary_name)
+        expected_digest = _artifact_url_digest(url)
         digest = hashlib.sha256()
         size = 0
-        response_digest_headers: tuple[str, ...] = ()
         try:
             with self._client.stream("GET", url) as response:
                 if response.status_code != 200:
                     raise RuntimeError(f"FL artifact download failed with {response.status_code}")
-                response_digest_headers = tuple(
-                    response.headers.get_list("X-Artifact-SHA256")
-                )
                 with temporary.open("wb") as output:
                     for chunk in response.iter_bytes():
                         size += len(chunk)
@@ -227,6 +223,10 @@ class FLWorkspace:
                         output.write(chunk)
             if size == 0:
                 raise RuntimeError("FL artifact download is empty")
+            if digest.hexdigest() != expected_digest:
+                raise FLArtifactIntegrityError(
+                    "FL artifact downloaded archive digest does not match URL"
+                )
             validated = self._validate_archive(temporary)
             os.replace(temporary, path)
         except Exception:
@@ -235,18 +235,14 @@ class FLWorkspace:
             raise
         temporary.unlink(missing_ok=True)
         artifact = ArtifactMetadata(
-            key=digest.hexdigest(),
+            key=expected_digest,
             size_bytes=size,
             path=path,
             url=url,
         )
         if owner_plan_id is not None:
             self._register_owned_directory(owner_plan_id, directory.parent)
-        return DownloadedArchive(
-            metadata=artifact,
-            validated=validated,
-            response_digest_headers=response_digest_headers,
-        )
+        return DownloadedArchive(metadata=artifact, validated=validated)
 
     def download_hierarchy(
         self,
@@ -316,19 +312,7 @@ class FLWorkspace:
         source = downloaded.metadata.path
         try:
             expected_digest = _artifact_url_digest(downloaded.metadata.url)
-            digest_headers = downloaded.response_digest_headers
-            if len(digest_headers) != 1 or not SHA256_PATTERN.fullmatch(digest_headers[0]):
-                raise FLArtifactIntegrityError(
-                    "FL artifact digest response header is invalid"
-                )
-            if digest_headers[0] != expected_digest:
-                raise FLArtifactIntegrityError(
-                    "FL artifact URL and response digest do not match"
-                )
-            if (
-                downloaded.metadata.key != expected_digest
-                or _hash_file(source) != expected_digest
-            ):
+            if downloaded.metadata.key != expected_digest:
                 raise FLArtifactIntegrityError(
                     "FL artifact downloaded archive digest does not match"
                 )
@@ -473,16 +457,6 @@ class FLWorkspace:
                 if response.status_code != 200:
                     raise FLArtifactUnavailableError(
                         f"FL artifact download failed with {response.status_code}"
-                    )
-                digest_headers = response.headers.get_list("X-Artifact-SHA256")
-                if len(digest_headers) != 1 or not SHA256_PATTERN.fullmatch(digest_headers[0]):
-                    raise FLArtifactIntegrityError(
-                        "FL artifact digest response header is invalid"
-                    )
-                response_digest = digest_headers[0]
-                if response_digest != expected_digest:
-                    raise FLArtifactIntegrityError(
-                        "FL artifact URL and response digest do not match"
                     )
                 with temporary.open("wb") as output:
                     for chunk in response.iter_bytes():
@@ -705,7 +679,6 @@ class FLWorkspace:
         extracted = 0
         names = set()
         manifest_bytes: bytes | None = None
-        component_digests: dict[str, str] = {}
         try:
             with tarfile.open(path, "r:gz") as archive:
                 members = archive.getmembers()
@@ -739,8 +712,6 @@ class FLWorkspace:
                         )
                     if member.name == "config.json":
                         manifest_bytes = content
-                    else:
-                        component_digests[member.name] = hashlib.sha256(content).hexdigest()
         except (OSError, tarfile.TarError) as error:
             raise FLArtifactIntegrityError(
                 "FL artifact is not a valid gzip tar archive"
@@ -751,7 +722,7 @@ class FLWorkspace:
             raise FLArtifactIntegrityError(
                 f"FL artifact file set is invalid; missing={missing}, unexpected={unexpected}"
             )
-        manifest = _validated_manifest(manifest_bytes, component_digests)
+        manifest = _validated_manifest(manifest_bytes)
         role = manifest.get("artifact_role")
         if role is None:
             try:
@@ -801,10 +772,6 @@ class FLWorkspace:
         ):
             manifest.pop(key, None)
         manifest.update(metadata)
-        manifest["bundle_schema_version"] = "1.0"
-        manifest["file_digests"] = {
-            name: hashlib.sha256(content).hexdigest() for name, content in components.items()
-        }
         contract = validate_fl_artifact_manifest(manifest)
         files = {
             "config.json": json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
@@ -877,14 +844,8 @@ class FLWorkspace:
             metadata={
                 "artifact_role": "ROUND_INPUT",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": process_id,
                     "round_ind": round_indicator,
-                    "model_contract_digest": model_contract_digest(base.manifest),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(
-                        base.manifest
-                    ),
-                    "weights_digest": weights_digest(base.model),
                     "client_training": {"epochs": epochs},
                 },
             },
@@ -1045,37 +1006,24 @@ class FLWorkspace:
             raise FLWorkspaceError("FL workspace root is unsafe")
 
 
-def model_contract_digest(manifest: dict[str, object]) -> str:
-    file_digests = manifest.get("file_digests")
-    model_source_digest = file_digests.get("model.py") if isinstance(file_digests, dict) else None
-    payload = {
-        "model": manifest.get("model"),
-        "analytics_event": manifest.get("analytics_event"),
-        "model_interoperability": manifest.get("model_interoperability"),
-        "runtime_compatibility": manifest.get("runtime_compatibility"),
-        "model_source_digest": model_source_digest,
-    }
-    return _digest_json(payload)
-
-
-def preprocessing_contract_digest(manifest: dict[str, object]) -> str:
-    file_digests = manifest.get("file_digests")
-    scaler_digest = file_digests.get("scaler.pkl") if isinstance(file_digests, dict) else None
-    return _digest_json(
-        {
-            "inference": manifest.get("inference"),
-            "scaler_digest": scaler_digest,
-        }
+def validate_model_compatibility(base: LoadedBundle, candidate: LoadedBundle) -> None:
+    contract_fields = (
+        "analytics_event",
+        "model_interoperability",
+        "runtime_compatibility",
+        "model",
+        "inference",
     )
-
-
-def weights_digest(model: torch.nn.Module) -> str:
-    digest = hashlib.sha256()
-    for name, value in model.state_dict().items():
-        digest.update(name.encode())
-        digest.update(str(value.dtype).encode())
-        digest.update(np.asarray(value.detach().cpu()).tobytes())
-    return digest.hexdigest()
+    if any(base.manifest.get(field) != candidate.manifest.get(field) for field in contract_fields):
+        raise FLArtifactContractError("FL artifact model contract is incompatible")
+    base_state = base.model.state_dict()
+    candidate_state = candidate.model.state_dict()
+    if set(base_state) != set(candidate_state):
+        raise FLArtifactContractError("FL artifact parameter keys are incompatible")
+    for name, value in base_state.items():
+        other = candidate_state[name]
+        if value.shape != other.shape or value.dtype != other.dtype:
+            raise FLArtifactContractError("FL artifact parameter shape or dtype is incompatible")
 
 
 def _write_bundle(path: Path, files: dict[str, bytes]) -> None:
@@ -1130,12 +1078,6 @@ def _safe(value: str) -> str:
     return value
 
 
-def _digest_json(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -1163,10 +1105,7 @@ def _remove_empty_download_parent(path: Path, workspace_root: Path) -> None:
             break
 
 
-def _validated_manifest(
-    manifest_bytes: bytes | None,
-    component_digests: dict[str, str],
-) -> dict[str, object]:
+def _validated_manifest(manifest_bytes: bytes | None) -> dict[str, object]:
     if manifest_bytes is None:
         raise FLArtifactIntegrityError("FL artifact is missing config.json")
     try:
@@ -1175,8 +1114,8 @@ def _validated_manifest(
         raise FLArtifactContractError("FL artifact config.json is invalid") from error
     if not isinstance(manifest, dict):
         raise FLArtifactContractError("FL artifact config.json must contain an object")
-    if manifest.get("bundle_schema_version") != "1.0":
-        raise FLArtifactContractError("FL artifact bundle schema version is unsupported")
+    if "file_digests" in manifest:
+        raise FLArtifactContractError("unsupported manifest field: file_digests")
     if not isinstance(manifest.get("analytics_event"), str) or not manifest["analytics_event"]:
         raise FLArtifactContractError("FL artifact analytics_event is required")
     if (
@@ -1197,13 +1136,4 @@ def _validated_manifest(
     }
     if expected_names != {"model.py", "model.npy", "scaler.pkl"}:
         raise FLArtifactContractError("FL artifact component filenames are invalid")
-    declared = manifest.get("file_digests")
-    if not isinstance(declared, dict) or set(declared) != set(component_digests):
-        raise FLArtifactIntegrityError("FL artifact component digest inventory is invalid")
-    for name, actual in component_digests.items():
-        expected = declared.get(name)
-        if not isinstance(expected, str) or not SHA256_PATTERN.fullmatch(expected):
-            raise FLArtifactIntegrityError("FL artifact component digest is invalid")
-        if expected != actual:
-            raise FLArtifactIntegrityError(f"FL artifact component digest mismatch: {name}")
     return manifest

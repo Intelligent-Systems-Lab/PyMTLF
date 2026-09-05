@@ -1,4 +1,3 @@
-import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -230,7 +229,7 @@ def test_triggering_scope_requires_training_and_reference_validation():
         TrainingDatasetBuilder(FittingSettings()).build(insufficient, manifest())
 
 
-def test_dataset_evidence_is_canonical_across_scope_order_and_endianness():
+def test_dataset_evidence_reports_counts_independent_of_scope_order_and_endianness():
     dataset = TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
     reordered = replace(dataset, scopes=tuple(reversed(dataset.scopes)))
     big_endian = replace(
@@ -270,63 +269,26 @@ def test_dataset_evidence_is_canonical_across_scope_order_and_endianness():
     assert dataset_evidence(big_endian) == expected
 
 
-def test_dataset_evidence_tracks_timestamps_tensor_values_and_split():
+def test_dataset_evidence_tracks_explicit_observation_and_split_counts():
     dataset = TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
-    expected = dataset_evidence(dataset)
-    first = dataset.scopes[0]
-    shifted_times = replace(
-        dataset,
-        scopes=(
-            replace(
-                first,
-                observation_timestamps=(
-                    first.observation_timestamps[0] + timedelta(microseconds=1),
-                    *first.observation_timestamps[1:],
-                ),
-            ),
-            *dataset.scopes[1:],
-        ),
-    )
-    changed_inputs = first.training_inputs.copy()
-    changed_inputs[0, 0, 0] += 1
-    changed_tensor = replace(
-        dataset,
-        scopes=(replace(first, training_inputs=changed_inputs), *dataset.scopes[1:]),
-    )
     changed_split = TrainingDatasetBuilder(
         FittingSettings(validation_ratio=0.2)
     ).build(snapshot(), manifest())
 
-    assert dataset_evidence(shifted_times).observation_digest != expected.observation_digest
-    assert (
-        dataset_evidence(shifted_times).training_tensor_digest
-        == expected.training_tensor_digest
-    )
-    assert (
-        dataset_evidence(changed_tensor).training_tensor_digest
-        != expected.training_tensor_digest
-    )
-    assert (
-        dataset_evidence(changed_split).validation_tensor_digest
-        != expected.validation_tensor_digest
-    )
+    assert dataset_evidence(changed_split).observation_count == 800
+    assert dataset_evidence(changed_split).validation_sample_count != dataset_evidence(
+        dataset
+    ).validation_sample_count
 
 
-def test_dataset_evidence_contains_only_digests_and_counts():
+def test_dataset_evidence_contains_only_counts():
     evidence = dataset_evidence(
         TrainingDatasetBuilder(FittingSettings()).build(snapshot(), manifest())
     )
     payload = evidence.as_dict()
 
     assert set(payload) == {
-        "contract_digest",
-        "observation_digest",
-        "training_tensor_digest",
-        "validation_tensor_digest",
         "observation_count",
         "training_sample_count",
         "validation_sample_count",
     }
-    encoded = json.dumps(payload)
-    assert "imsi-" not in encoded
-    assert "corr-" not in encoded

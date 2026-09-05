@@ -44,9 +44,7 @@ from py_mtlf.core.fl_workspace import (
     FLWorkspace,
     ValidatedArchive,
     ValidatedHierarchyArtifact,
-    model_contract_digest,
-    preprocessing_contract_digest,
-    weights_digest,
+    validate_model_compatibility,
 )
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
 from py_mtlf.core.trainer import (
@@ -135,7 +133,7 @@ class BranchPreparationDispatcher(Protocol):
         upper_client_subscription_id: str,
         upper_resource_revision: int,
         upper_input_artifact_digest: str,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
         callback_margin_seconds: int,
         local_work: IntermediateLocalWork | None = None,
     ) -> BranchArtifactView: ...
@@ -149,7 +147,7 @@ class BranchPreparationDispatcher(Protocol):
         upper_candidate_artifact: ArtifactMetadata,
         upper_client_subscription_id: str,
         upper_resource_revision: int,
-        upper_scope_digest: str,
+        upper_training_scope: TrainingScopeDescriptor,
         callback_margin_seconds: int,
     ) -> BranchArtifactView: ...
 
@@ -166,8 +164,6 @@ class FLClientResource:
     revision: int = 1
     work_slot_owned: bool = True
     prepared_training_sample_count: int = 0
-    expected_model_contract_digest: str = ""
-    expected_preprocessing_contract_digest: str = ""
     preparation_base_artifact: ArtifactMetadata | None = None
     hierarchy_assignment: ValidatedHierarchyArtifact | None = None
     branch_process_id: str = ""
@@ -696,7 +692,7 @@ class FLClientEngine:
         event = value.ml_event_subscriptions[0]
         target = value.target_reporting_ue or event.target_ue
         scope = ScopeReference(
-            scope_key=resource.scope.scope_digest,
+            scope_key=f"fl:{resource.subscription_id}:event:0",
             consumer_id="",
             model_ids=(),
             ml_event=event.ml_event,
@@ -836,12 +832,6 @@ class FLClientEngine:
                             return
                         current.preparation_base_artifact = artifact
                         current.hierarchy_assignment = hierarchy_assignment
-                        current.expected_model_contract_digest = model_contract_digest(
-                            hierarchy_assignment.manifest
-                        )
-                        current.expected_preprocessing_contract_digest = (
-                            preprocessing_contract_digest(hierarchy_assignment.manifest)
-                        )
                     result = self._branch_coordinator.prepare(
                         assignment=hierarchy_assignment,
                         representation=value,
@@ -896,8 +886,6 @@ class FLClientEngine:
                 raise RuntimeError("FL preparation base model analytics event is incompatible")
             if base.manifest.get("model_interoperability") != event.model_interoperability:
                 raise RuntimeError("FL preparation base model interoperability is incompatible")
-            expected_model_contract = model_contract_digest(base.manifest)
-            expected_preprocessing_contract = preprocessing_contract_digest(base.manifest)
             with self._lock:
                 current = self._resources.get(subscription_id)
                 if current is None or current.revision != revision:
@@ -915,8 +903,6 @@ class FLClientEngine:
                     revision,
                     job,
                     base.manifest,
-                    expected_model_contract,
-                    expected_preprocessing_contract,
                 ),
                 collection_trigger,
             )
@@ -958,8 +944,6 @@ class FLClientEngine:
         revision: int,
         job: DatasetJob,
         base_manifest: dict[str, object],
-        expected_model_contract: str,
-        expected_preprocessing_contract: str,
     ) -> None:
         preparation_error = ""
         training_sample_count = 0
@@ -991,10 +975,6 @@ class FLClientEngine:
                 else:
                     resource.dataset_snapshot = job.snapshot
                     resource.prepared_training_sample_count = training_sample_count
-                    resource.expected_model_contract_digest = expected_model_contract
-                    resource.expected_preprocessing_contract_digest = (
-                        expected_preprocessing_contract
-                    )
                     resource.state = FLClientState.PREPARATION_RESULT_PENDING
                     notification = NwdafMLModelTrainNotif(
                         notifCorreId=resource.representation.notification_correlation_id,
@@ -1029,6 +1009,9 @@ class FLClientEngine:
                     raise RuntimeError("FL round resource revision is stale")
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
+                preparation_base_artifact = resource.preparation_base_artifact
+            if preparation_base_artifact is None:
+                raise RuntimeError("FL round has no prepared base model")
             model_info = value.ml_model_infos[0]
             if model_info.model_file_address is None:
                 raise RuntimeError("FL round input must use mLFileAddr")
@@ -1045,19 +1028,10 @@ class FLClientEngine:
             if (
                 round_input.fl_metadata.ml_corre_id != value.ml_correlation_id
                 or round_input.fl_metadata.round_ind != value.round_indicator
-                or round_input.fl_metadata.weights_digest != weights_digest(base.model)
-                or round_input.fl_metadata.model_contract_digest
-                != model_contract_digest(base.manifest)
-                or round_input.fl_metadata.preprocessing_contract_digest
-                != preprocessing_contract_digest(base.manifest)
-                or model_contract_digest(base.manifest)
-                != resource.expected_model_contract_digest
-                or preprocessing_contract_digest(base.manifest)
-                != resource.expected_preprocessing_contract_digest
             ):
-                raise RuntimeError(
-                    "FL round input changed the prepared model or preprocessing contract"
-                )
+                raise RuntimeError("FL round input identity does not match the command")
+            prepared_base = self._loader.load(preparation_base_artifact)
+            validate_model_compatibility(prepared_base, base)
             hierarchy_metadata = (
                 resource.hierarchy_assignment.contract.hierarchy_metadata
                 if resource.hierarchy_assignment is not None
@@ -1073,7 +1047,7 @@ class FLClientEngine:
                     "upper_client_subscription_id": subscription_id,
                     "upper_resource_revision": revision,
                     "upper_input_artifact_digest": artifact.key,
-                    "upper_scope_digest": resource.scope.scope_digest,
+                    "upper_training_scope": resource.scope,
                     "callback_margin_seconds": (
                         self._client_settings.callback_deadline_margin_seconds
                     ),
@@ -1133,22 +1107,17 @@ class FLClientEngine:
                 if current is not resource or current.revision != revision:
                     return
             participant_id = self._participant_id()
-            base_digest = weights_digest(base.model)
-            output_digest = weights_digest(result.model)
             metadata = {
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "TRAINING",
                 "fl_metadata": {
-                    "contract_version": "1.0",
                     "ml_corre_id": value.ml_correlation_id,
-                    "model_contract_digest": model_contract_digest(base.manifest),
-                    "preprocessing_contract_digest": preprocessing_contract_digest(base.manifest),
-                    "base_weights_digest": base_digest,
-                    "weights_digest": output_digest,
                     "round_ind": value.round_indicator,
                     "participant_nf_instance_id": participant_id,
-                    "scope_digest": resource.scope.scope_digest,
-                    "input_global_weights_digest": base_digest,
+                    "training_scope": resource.scope.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    ),
                     "training_sample_count": result.training_sample_count,
                     "dataset_evidence": evidence.as_dict(),
                 },
@@ -1228,19 +1197,10 @@ class FLClientEngine:
             candidate_contract = validate_fl_artifact_manifest(candidate.manifest)
             if not isinstance(candidate_contract, RoundGlobalArtifact):
                 raise RuntimeError("final validation candidate is not a ROUND_GLOBAL artifact")
-            for bundle, label in ((base, "base"), (candidate, "candidate")):
-                if (
-                    model_contract_digest(bundle.manifest)
-                    != resource.expected_model_contract_digest
-                    or preprocessing_contract_digest(bundle.manifest)
-                    != resource.expected_preprocessing_contract_digest
-                ):
-                    raise RuntimeError(f"final validation {label} changed the prepared contract")
-            candidate_digest = weights_digest(candidate.model)
+            validate_model_compatibility(base, candidate)
             if (
                 value.round_indicator is None
                 or candidate_contract.fl_metadata.round_ind != value.round_indicator - 1
-                or candidate_contract.fl_metadata.weights_digest != candidate_digest
             ):
                 raise RuntimeError("final validation candidate identity does not match the command")
             hierarchy_metadata = (
@@ -1267,7 +1227,7 @@ class FLClientEngine:
                     upper_candidate_artifact=candidate_artifact,
                     upper_client_subscription_id=subscription_id,
                     upper_resource_revision=revision,
-                    upper_scope_digest=resource.scope.scope_digest,
+                    upper_training_scope=resource.scope,
                     callback_margin_seconds=(
                         self._client_settings.callback_deadline_margin_seconds
                     ),
@@ -1333,7 +1293,6 @@ class FLClientEngine:
             if sample_count <= 0 or base_actual <= 0 or candidate_actual <= 0:
                 raise RuntimeError("final validation requires non-zero evaluation evidence")
             participant_id = self._participant_id()
-            base_digest = weights_digest(base.model)
             published = self._workspace.publish(
                 process_id=value.ml_correlation_id or subscription_id,
                 participant_id=participant_id,
@@ -1346,25 +1305,18 @@ class FLClientEngine:
                     "artifact_role": "ROUND_LOCAL",
                     "result_type": "ACCURACY_CHECK",
                     "fl_metadata": {
-                        "contract_version": "1.0",
                         "ml_corre_id": value.ml_correlation_id,
-                        "model_contract_digest": model_contract_digest(candidate.manifest),
-                        "preprocessing_contract_digest": preprocessing_contract_digest(
-                            candidate.manifest
-                        ),
-                        "base_weights_digest": candidate_digest,
-                        "weights_digest": candidate_digest,
                         "round_ind": value.round_indicator,
                         "participant_nf_instance_id": participant_id,
-                        "scope_digest": resource.scope.scope_digest,
-                        "input_global_weights_digest": candidate_digest,
+                        "training_scope": resource.scope.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        ),
                         "evaluation": {
                             "evaluation_stage": "FINAL_VALIDATION",
                             "evaluation_sample_count": sample_count,
                             "start_time": snapshot.time_window.start_time.isoformat(),
                             "end_time": snapshot.time_window.stop_time.isoformat(),
-                            "base_model_weights_digest": base_digest,
-                            "candidate_weights_digest": candidate_digest,
                             "base": {
                                 "absolute_error_sum": base_error,
                                 "absolute_actual_sum": base_actual,

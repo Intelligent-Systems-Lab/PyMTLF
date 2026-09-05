@@ -167,7 +167,7 @@ def test_artifact_get_has_immutable_integrity_headers(settings, bundle_path):
     assert response.headers["content-length"] == str(metadata.size_bytes)
     assert response.headers["content-type"] == "application/gzip"
     assert response.headers["etag"] == f'"sha256:{metadata.key}"'
-    assert response.headers["x-artifact-sha256"] == metadata.key
+    assert "x-artifact-sha256" not in response.headers
     assert "immutable" in response.headers["cache-control"]
 
 
@@ -205,7 +205,7 @@ def test_hierarchy_fl_artifact_uses_existing_serving_route(settings, bundle_path
 
     assert response.status_code == 200
     assert response.content == content
-    assert response.headers["x-artifact-sha256"] == digest
+    assert "x-artifact-sha256" not in response.headers
     assert response.headers["etag"] == f'"sha256:{digest}"'
 
 

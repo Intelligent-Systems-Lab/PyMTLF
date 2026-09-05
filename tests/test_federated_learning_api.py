@@ -153,7 +153,7 @@ def test_generation_abort_makes_old_common_training_request_return_not_found():
     }
     planner = Mock()
     planner.build.return_value = SimpleNamespace(
-        topology_digest="a" * 64,
+        topology_version=1,
         clients=(
             SimpleNamespace(
                 nf_instance_id="00000000-0000-4000-8000-000000000301",
