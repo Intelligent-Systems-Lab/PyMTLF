@@ -1,5 +1,5 @@
-# FL Server-capable PyMTLF profile with Root-side static topology initiation.
-# This enables creation of hierarchy plans; it does not register a permanent Root role.
+# FL Server-capable PyMTLF profile with protocol-driven static hierarchy initiation.
+# Import the MNIST seed and replace the placeholder artifact key before startup.
 server:
   binding_host: "127.0.0.1"
   port: 9092
@@ -59,26 +59,26 @@ federated_learning:
     config_file: "./topology/hierarchical-topology.yaml"
   training_trigger:
     degradation:
-      enabled: true
-    private_api:
       enabled: false
+    private_api:
+      enabled: true
 
 model_provision:
   seed_models:
-    - family_id: "ue-communication-default"
-      model_id: 1
-      artifact_key: "5b11c450bc11d0d41474ad5a720d473e59ba2e9c41f2a321b83384e12593db7f"
-      event: "UE_COMMUNICATION"
+    - family_id: "image-classification-mnist"
+      model_id: 1001
+      artifact_key: "0000000000000000000000000000000000000000000000000000000000000000"
+      event: "X_IMAGE_CLASSIFICATION"
       event_filter: {}
       target_ue: null
-      model_interoperability: "001122"
+      model_interoperability: "pymtlf-image-classification-mnist"
       use_case_context: ""
 
 model_monitor:
   callback_uri: "http://127.0.0.1:9092/internal/v1/ml-model-monitor/notifications"
 
 accuracy_policy:
-  enabled: true
+  enabled: false
 
 adrf:
   mode: "nrf"

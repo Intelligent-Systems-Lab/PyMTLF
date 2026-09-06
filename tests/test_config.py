@@ -758,7 +758,7 @@ def test_hierarchy_configuration_requires_server_strategy_and_topology_together(
         )
 
 
-def test_hierarchy_contract_defaults_to_model_bundle_and_accepts_protocol(tmp_path):
+def test_hierarchical_orchestration_has_single_protocol_authority(tmp_path):
     base = {
         "server": {},
         "orchestration": {
@@ -778,30 +778,14 @@ def test_hierarchy_contract_defaults_to_model_bundle_and_accepts_protocol(tmp_pa
         },
     }
 
-    legacy = FederatedLearningSettings.model_validate(base)
-    assert legacy.orchestration is not None
-    assert legacy.orchestration.hierarchy_contract == "model_bundle"
+    settings = FederatedLearningSettings.model_validate(base)
+    assert settings.orchestration is not None
+    assert settings.orchestration.mode == "hierarchical"
 
-    protocol_payload = copy.deepcopy(base)
-    protocol_payload["orchestration"]["hierarchy_contract"] = "protocol"
-    protocol = FederatedLearningSettings.model_validate(protocol_payload)
-    assert protocol.orchestration is not None
-    assert protocol.orchestration.hierarchy_contract == "protocol"
-
-
-def test_flat_orchestration_rejects_hierarchy_contract():
-    with pytest.raises(ValidationError, match="flat orchestration must not configure"):
-        FederatedLearningSettings.model_validate(
-            {
-                "server": {},
-                "orchestration": {
-                    "mode": "flat",
-                    "participant_source": "monitor_scopes",
-                    "hierarchy_contract": "protocol",
-                },
-                "training_trigger": {"degradation": {"enabled": True}},
-            }
-        )
+    legacy = copy.deepcopy(base)
+    legacy["orchestration"]["hierarchy_contract"] = "protocol"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        FederatedLearningSettings.model_validate(legacy)
 
 
 @pytest.mark.parametrize(

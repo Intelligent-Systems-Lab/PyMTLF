@@ -325,7 +325,6 @@ def create_app(
                 server=fl_server,
                 policy=accuracy_policy,
                 experiments=fl_experiments,
-                hierarchy_contract=orchestration_settings.hierarchy_contract,
                 round_model_distribution=round_model_distribution,
                 terminal_status_ttl_seconds=(
                     settings.federated_learning.lifecycle.terminal_status_ttl_seconds

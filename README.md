@@ -99,6 +99,9 @@ advertised FL capability:
 - `config/fl-server-client.yaml` enables both engines in one standard PyMTLF
   process. Hierarchy role is assigned by the Root at runtime; it is not a
   configuration mode.
+- `config/fl-server-hierarchy.yaml` runs the single protocol-driven Root
+  hierarchy path. Import the controlled image seed first and replace the
+  placeholder `artifact_key` with the value emitted by the import command.
 - `config/fl-client-image-classification.yaml` selects the controlled local
   MNIST workload. Change `dataset` to `cifar10` and mount the matching shard at
   the configured path to use CIFAR-10.

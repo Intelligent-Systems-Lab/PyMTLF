@@ -5,8 +5,6 @@ from pydantic import ValidationError
 
 from py_mtlf.core.fl_artifacts import (
     FinalModelArtifact,
-    HierarchyAssignmentArtifact,
-    HierarchyPreparationResultArtifact,
     RoundInputArtifact,
     RoundLocalArtifact,
     TensorStateEntry,
@@ -44,15 +42,6 @@ def dataset_evidence(training_sample_count: int = 120) -> dict[str, object]:
         "observation_count": 400,
         "training_sample_count": training_sample_count,
         "validation_sample_count": 34,
-    }
-
-
-def hierarchy_strategy() -> dict[str, object]:
-    return {
-        "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-        "participant_selection": "all",
-        "waiting_policy": "all",
-        "aggregation": "sample_weighted",
     }
 
 
@@ -398,80 +387,29 @@ def test_final_model_hierarchy_provenance_matches_direct_branch_evidence() -> No
         validate_fl_artifact(value)
 
 
-def test_hierarchy_assignment_and_result_use_nested_message_discriminator() -> None:
-    branch = validate_fl_artifact(
-        {
-            "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "hierarchy_metadata": {
-                "message_type": "BRANCH_ASSIGNMENT",
-                "plan_id": PLAN,
-                "publisher_nf_instance_id": ROOT,
-                "intended_recipient_nf_instance_id": BRANCH,
-                "assigned_leaf_nf_instance_ids": [CLIENT_A, CLIENT_B],
-                "admission": {"mode": "complete_required"},
-                "strategy": hierarchy_strategy(),
-            },
-        }
-    )
-    assert isinstance(branch, HierarchyAssignmentArtifact)
-
-    leaf = validate_fl_artifact(
-        {
-            "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "hierarchy_metadata": {
-                "message_type": "LEAF_ASSIGNMENT",
-                "plan_id": PLAN,
-                "publisher_nf_instance_id": BRANCH,
-                "intended_recipient_nf_instance_id": CLIENT_A,
-                "parent_branch_nf_instance_id": BRANCH,
-                "strategy": hierarchy_strategy(),
-            },
-        }
-    )
-    assert isinstance(leaf, HierarchyAssignmentArtifact)
-
-    result = validate_fl_artifact(
-        {
-            "artifact_role": "HIERARCHY_PREPARATION_RESULT",
-            "hierarchy_metadata": {
-                "message_type": "PREPARATION_RESULT",
-                "plan_id": PLAN,
-                "publisher_nf_instance_id": BRANCH,
-                "intended_recipient_nf_instance_id": ROOT,
-                "outcome": "READY",
-                "assigned_client_nf_instance_ids": [CLIENT_A, CLIENT_B],
-                "prepared_clients": [
-                    {"nf_instance_id": CLIENT_A},
-                    {"nf_instance_id": CLIENT_B},
-                ],
-                "failed_clients": [],
-                "timed_out_client_nf_instance_ids": [],
-            },
-        }
-    )
-    assert isinstance(result, HierarchyPreparationResultArtifact)
-
-    with pytest.raises(ValidationError):
+@pytest.mark.parametrize(
+    "role",
+    ["HIERARCHY_ASSIGNMENT", "HIERARCHY_PREPARATION_RESULT"],
+)
+def test_removed_hierarchy_orchestration_roles_fail_closed(role: str) -> None:
+    with pytest.raises(ValidationError, match="Input tag"):
         validate_fl_artifact(
             {
-                "artifact_role": "HIERARCHY_PREPARATION_RESULT",
-                "hierarchy_metadata": leaf.hierarchy_metadata.model_dump(mode="json"),
+                "artifact_role": role,
+                "hierarchy_metadata": {},
             }
         )
 
 
 def test_complete_manifest_projection_rejects_incompatible_role_fields() -> None:
     manifest = {
-        "artifact_role": "HIERARCHY_ASSIGNMENT",
-        "fl_metadata": {},
-        "hierarchy_metadata": {
-            "message_type": "LEAF_ASSIGNMENT",
-            "plan_id": PLAN,
-            "publisher_nf_instance_id": BRANCH,
-            "intended_recipient_nf_instance_id": CLIENT_A,
-            "parent_branch_nf_instance_id": BRANCH,
-            "strategy": hierarchy_strategy(),
+        "artifact_role": "ROUND_INPUT",
+        "fl_metadata": {
+            "ml_corre_id": "fl-process-001",
+            "round_ind": 0,
+            "client_training": {"epochs": 1},
         },
+        "model_identity": {"model_unique_id": 1},
     }
     with pytest.raises(ValueError, match="incompatible fields"):
         validate_fl_artifact_manifest(manifest)

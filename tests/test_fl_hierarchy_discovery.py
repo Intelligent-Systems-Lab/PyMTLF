@@ -6,6 +6,7 @@ import pytest
 from nwdaf_context import context_client
 
 from py_mtlf.config import FederatedLearningSettings
+from py_mtlf.core.fl_hierarchy import normalize_nf_instance_id, normalize_plan_id
 from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyDiscoveryError,
     HierarchyNodeResolver,
@@ -16,6 +17,15 @@ from py_mtlf.wire.ml_model_training import NwdafMLModelTrainSubsc, RequirementsE
 ROOT_ID = "00000000-0000-4000-8000-000000000001"
 BRANCH_ID = "00000000-0000-4000-8000-000000000010"
 LEAF_ID = "00000000-0000-4000-8000-000000000101"
+
+
+def test_hierarchy_identifiers_normalize_uuid_and_require_uuid4_plan() -> None:
+    assert normalize_nf_instance_id(BRANCH_ID.upper()) == BRANCH_ID
+    assert normalize_plan_id(BRANCH_ID.upper()) == BRANCH_ID
+    with pytest.raises(ValueError, match="UUIDv4"):
+        normalize_plan_id("00000000-0000-1000-8000-000000000010")
+    with pytest.raises(ValueError, match="UUID"):
+        normalize_nf_instance_id("not-a-uuid")
 
 
 def profile(

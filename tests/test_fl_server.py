@@ -17,8 +17,6 @@ from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.fl_artifacts import (
-    HierarchyBranchValidation,
-    RoundGlobalArtifact,
     RoundLocalArtifact,
     RoundLocalResultType,
     ValidationSummary,
@@ -41,8 +39,6 @@ from py_mtlf.core.fl_server import (
     FLServerEngine,
     FLServerProcessConflictError,
     FLServerState,
-    HierarchyPreparationTarget,
-    HierarchyValidationCollection,
     ProtocolPreparationTarget,
     _assign,
 )
@@ -1307,180 +1303,6 @@ def test_final_validation_uses_owned_candidate_and_applies_trigger_semantics(
         orchestrator.close()
 
 
-def test_hierarchy_preparation_attaches_root_process_and_uses_branch_bundle_urls(tmp_path):
-    plan_id = "00000000-0000-4000-8000-000000000900"
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_root(plan_id)
-    posts: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST":
-            posts.append(request)
-            target_id = request.headers["X-NWDAF-Target-Nf-Instance-Id"]
-            return httpx.Response(
-                201,
-                headers={"Location": f"http://go.example/subscriptions/{target_id}"},
-                request=request,
-            )
-        return httpx.Response(204, request=request)
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    context = context_client(
-        nf_instance_id="00000000-0000-4000-8000-000000000001",
-        internal_api_root="http://go.example",
-    )
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(),
-        context,
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=client,
-        experiments=registry,
-    )
-    targets = tuple(
-        HierarchyPreparationTarget(
-            participant_nf_instance_id=branch_id,
-            candidate=FLClientCandidate(
-                target=SelectedTarget(
-                    nfInstanceId=branch_id,
-                    nfServiceInstanceId=f"training-{index}",
-                    serviceName="nnwdaf-mlmodeltraining",
-                    apiRoot=f"http://branch-{index}.example",
-                    selectionSource="NRF",
-                ),
-                tracking_areas=(),
-            ),
-            assignment_url=f"http://root.example/artifacts/assignment-{index}",
-        )
-        for index, branch_id in enumerate(
-            (
-                "00000000-0000-4000-8000-000000000010",
-                "00000000-0000-4000-8000-000000000020",
-            ),
-            start=1,
-        )
-    )
-
-    process = orchestrator.start_hierarchy_preparation(
-        plan_id=plan_id,
-        reservation_id=reservation.reservation_id,
-        family_key="ue-communication-default",
-        model_id=1,
-        ml_event="UE_COMMUNICATION",
-        ml_event_filter={"networkArea": {"tais": []}},
-        target_ue=None,
-        model_interoperability="001122",
-        targets=targets,
-    )
-
-    assert process.state is FLServerState.PREPARATION_WAITING
-    assert process.process_id != plan_id
-    assert process.hierarchy_plan_id == plan_id
-    assert registry.active().server_process_id == process.process_id
-    assert len(posts) == 2
-    for request, target in zip(posts, targets, strict=True):
-        payload = json.loads(request.content)
-        assert payload["mLPreFlag"] is True
-        assert payload["mlCorreId"] == process.process_id
-        assert payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] == target.assignment_url
-        assert (
-            request.headers["X-NWDAF-Target-Nf-Instance-Id"]
-            == target.participant_nf_instance_id
-        )
-
-    with pytest.raises(
-        RuntimeError,
-        match="not awaiting preparation admission",
-    ):
-        orchestrator.admit_hierarchy_preparation(process.process_id)
-    assert process.state is FLServerState.PREPARATION_WAITING
-
-    process.state = FLServerState.PREPARATION_EVALUATING
-    orchestrator.admit_hierarchy_preparation(process.process_id)
-    assert process.state is FLServerState.READY
-
-    orchestrator.cancel_hierarchy_preparation(process.process_id, "test cleanup")
-    orchestrator.close()
-    client.close()
-
-
-def test_hierarchy_preparation_rolls_back_partial_dispatch(tmp_path):
-    plan_id = "00000000-0000-4000-8000-000000000900"
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_root(plan_id)
-    calls: list[tuple[str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, str(request.url)))
-        if request.method == "POST" and len([item for item in calls if item[0] == "POST"]) == 1:
-            return httpx.Response(
-                201,
-                headers={"Location": "http://go.example/subscriptions/first"},
-                request=request,
-            )
-        if request.method == "POST":
-            return httpx.Response(503, request=request)
-        return httpx.Response(204, request=request)
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(cleanup={"max_attempts": 1}),
-        context_client(internal_api_root="http://go.example"),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=client,
-        experiments=registry,
-    )
-    targets = tuple(
-        HierarchyPreparationTarget(
-            participant_nf_instance_id=branch_id,
-            candidate=FLClientCandidate(
-                target=SelectedTarget(
-                    nfInstanceId=branch_id,
-                    nfServiceInstanceId=f"training-{index}",
-                    serviceName="nnwdaf-mlmodeltraining",
-                    apiRoot=f"http://branch-{index}.example",
-                    selectionSource="NRF",
-                ),
-                tracking_areas=(),
-            ),
-            assignment_url=f"http://root.example/artifacts/assignment-{index}",
-        )
-        for index, branch_id in enumerate(
-            (
-                "00000000-0000-4000-8000-000000000010",
-                "00000000-0000-4000-8000-000000000020",
-            ),
-            start=1,
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="preparation create failed"):
-        orchestrator.start_hierarchy_preparation(
-            plan_id=plan_id,
-            reservation_id=reservation.reservation_id,
-            family_key="ue-communication-default",
-            model_id=1,
-            ml_event="UE_COMMUNICATION",
-            ml_event_filter={},
-            target_ue=None,
-            model_interoperability="001122",
-            targets=targets,
-        )
-
-    assert orchestrator.processes() == ()
-    assert calls[-1] == ("DELETE", "http://go.example/subscriptions/first")
-    assert registry.active().server_process_id is None
-    orchestrator.close()
-    client.close()
-
-
 def test_cutover_pending_process_releases_slot_only_after_scope_adoption(tmp_path):
     registry = FLExperimentRegistry()
     policy = Mock()
@@ -1809,638 +1631,8 @@ def test_hierarchy_collection_waits_for_every_leaf_after_first_failure(tmp_path)
         orchestrator.close()
 
 
-def test_hierarchy_validation_uses_existing_resources_and_next_round(tmp_path):
-    branch_id = "11111111-1111-4111-8111-111111111111"
-    process = FLProcess(
-        process_id="process-1",
-        intent=None,
-        state=FLServerState.READY,
-        hierarchy_plan_id="00000000-0000-4000-8000-000000000901",
-        hierarchy_cleanup_complete=True,
-    )
-    participant = FLParticipant(
-        scope=scope("branch-a", "000001", branch_id),
-        candidate=candidate(branch_id, "000001"),
-        notification_correlation_id="validation-branch-a",
-        resource_location="http://go.example/subscriptions/branch-a",
-    )
-    process.participants = [participant]
-    candidate_artifact = Mock(
-        url="http://root.example/round-global/" + "c" * 64,
-        digest="c" * 64,
-    )
-    collection = HierarchyValidationCollection(
-        candidate_artifact=Mock(),
-        validation_summaries=(
-            validation_summary(branch_id, base_error=10, candidate_error=5),
-        ),
-    )
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(round_timeout_seconds=300),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=Mock(),
-    )
-    orchestrator._processes[process.process_id] = process
-    orchestrator._validate_hierarchy_candidate = Mock()
-    orchestrator._patch_validation = Mock()
-    orchestrator._wait = Mock()
-    orchestrator._collect_hierarchy_validation = Mock(return_value=collection)
-    observed = []
-    try:
-        result = orchestrator.execute_hierarchy_validation(
-            process_id=process.process_id,
-            validation_round=2,
-            candidate=candidate_artifact,
-            base_artifact=Mock(),
-            expected_candidate_process_id="process-1",
-            expected_candidate_round=1,
-            expected_subordinates={branch_id: ("leaf-a",)},
-            state_observer=observed.append,
-        )
-
-        assert result is collection
-        assert observed == [
-            FLServerState.FINAL_VALIDATION_DISPATCH,
-            FLServerState.FINAL_VALIDATION_WAITING,
-            FLServerState.FINAL_VALIDATION_EVALUATING,
-        ]
-        patch = orchestrator._patch_validation.call_args
-        assert patch.args[:3] == (process, participant, 2)
-        assert patch.args[3] == candidate_artifact.url
-        assert patch.kwargs["timeout_seconds"] == 300
-        collected = orchestrator._collect_hierarchy_validation.call_args.kwargs
-        assert collected["expected_candidate_process_id"] == "process-1"
-        assert collected["expected_candidate_round"] == 1
-        assert collected["expected_subordinates"] == {branch_id: ("leaf-a",)}
-    finally:
-        orchestrator.close()
-
-
-def test_multiround_hierarchy_candidate_preserves_process_round_and_model_contract(
-    tmp_path,
-):
-    candidate_path = tmp_path / "candidate.tar.gz"
-    candidate_path.write_bytes(b"candidate")
-    contract = RoundGlobalArtifact.model_validate(
-        {
-            "artifact_role": "ROUND_GLOBAL",
-            "fl_metadata": {
-                "ml_corre_id": "root-process",
-                "round_ind": 1,
-                "participants": [
-                    {
-                        "participant_nf_instance_id": (
-                            "11111111-1111-4111-8111-111111111111"
-                        ),
-                        "training_sample_count": 10,
-                        "local_artifact_digest": "8" * 64,
-                    }
-                ],
-                "aggregated_training_sample_count": 10,
-            },
-        }
-    )
-    candidate = SimpleNamespace(
-        contract=contract,
-        digest="9" * 64,
-        path=candidate_path,
-        url="http://root.example/candidate",
-    )
-    manifest = {
-        "analytics_event": "UE_COMMUNICATION",
-        "model_interoperability": "001122",
-        "runtime_compatibility": {"framework": "torch"},
-        "model": {"input_size": 1},
-        "inference": {"seq_length": 1},
-    }
-    base_bundle = Mock(manifest=manifest, model=torch.nn.Linear(1, 1))
-    candidate_bundle = Mock(manifest=manifest, model=torch.nn.Linear(1, 1))
-    loader = Mock()
-    loader.load.side_effect = [base_bundle, candidate_bundle]
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(),
-        Mock(),
-        Mock(),
-        Mock(),
-        loader,
-        Mock(),
-    )
-    orchestrator._loader = loader
-    try:
-        validated = orchestrator._validate_hierarchy_candidate(
-            candidate=candidate,
-            base_artifact=Mock(),
-            expected_candidate_process_id="root-process",
-            expected_candidate_round=1,
-        )
-
-        assert validated.artifact.key == "9" * 64
-    finally:
-        orchestrator.close()
-
-
-def test_hierarchy_validation_rejects_invalid_candidate_before_branch_dispatch(
-    tmp_path,
-):
-    branch_id = "11111111-1111-4111-8111-111111111111"
-    participant = FLParticipant(
-        scope=scope("branch-a", "000001", branch_id),
-        candidate=candidate(branch_id, "000001"),
-        notification_correlation_id="validation-branch-a",
-    )
-    process = FLProcess(
-        process_id="process-1",
-        intent=None,
-        state=FLServerState.READY,
-        participants=[participant],
-        hierarchy_plan_id="00000000-0000-4000-8000-000000000901",
-        hierarchy_cleanup_complete=True,
-    )
-    invalid_candidate = Mock(
-        url="http://root.example/not-round-global",
-        contract=Mock(),
-    )
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(round_timeout_seconds=300),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=Mock(),
-    )
-    orchestrator._processes[process.process_id] = process
-    orchestrator._patch_validation = Mock()
-    orchestrator._wait = Mock()
-    try:
-        with pytest.raises(RuntimeError, match="not a ROUND_GLOBAL"):
-            orchestrator.execute_hierarchy_validation(
-                process_id=process.process_id,
-                validation_round=2,
-                candidate=invalid_candidate,
-                base_artifact=Mock(),
-                expected_candidate_process_id=process.process_id,
-                expected_candidate_round=1,
-            )
-
-        orchestrator._patch_validation.assert_not_called()
-    finally:
-        orchestrator.close()
-
-
-def test_hierarchy_validation_rejects_mismatched_candidate_identity_before_dispatch(
-    tmp_path,
-):
-    branch_id = "11111111-1111-4111-8111-111111111111"
-    participant = FLParticipant(
-        scope=scope("branch-a", "000001", branch_id),
-        candidate=candidate(branch_id, "000001"),
-        notification_correlation_id="validation-branch-a",
-    )
-    process = FLProcess(
-        process_id="process-1",
-        intent=None,
-        state=FLServerState.READY,
-        participants=[participant],
-        hierarchy_plan_id="00000000-0000-4000-8000-000000000901",
-        hierarchy_cleanup_complete=True,
-    )
-    candidate_path = tmp_path / "candidate.tar.gz"
-    candidate_path.write_bytes(b"candidate")
-    contract = RoundGlobalArtifact.model_validate(
-        {
-            "artifact_role": "ROUND_GLOBAL",
-            "fl_metadata": {
-                "ml_corre_id": "different-process",
-                "round_ind": 1,
-                "participants": [
-                    {
-                        "participant_nf_instance_id": branch_id,
-                        "training_sample_count": 10,
-                        "local_artifact_digest": "8" * 64,
-                    }
-                ],
-                "aggregated_training_sample_count": 10,
-            },
-        }
-    )
-    candidate_artifact = SimpleNamespace(
-        contract=contract,
-        digest="9" * 64,
-        path=candidate_path,
-        url="http://root.example/candidate",
-    )
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(round_timeout_seconds=300),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=Mock(),
-    )
-    orchestrator._processes[process.process_id] = process
-    orchestrator._patch_validation = Mock()
-    orchestrator._loader = Mock()
-    orchestrator._loader.load.side_effect = [
-        SimpleNamespace(
-            manifest={"bundle": "base"},
-            model=SimpleNamespace(digest="6" * 64),
-        ),
-        SimpleNamespace(
-            manifest={"bundle": "candidate"},
-            model=SimpleNamespace(digest="7" * 64),
-        ),
-    ]
-    try:
-        with pytest.raises(RuntimeError, match="identity does not match"):
-            orchestrator.execute_hierarchy_validation(
-                process_id=process.process_id,
-                validation_round=2,
-                candidate=candidate_artifact,
-                base_artifact=Mock(),
-                expected_candidate_process_id=process.process_id,
-                expected_candidate_round=1,
-            )
-
-        orchestrator._patch_validation.assert_not_called()
-    finally:
-        orchestrator.close()
-
-
-def test_hierarchy_validation_deadline_records_every_missing_participant(tmp_path):
-    participant_ids = (
-        "11111111-1111-4111-8111-111111111111",
-        "22222222-2222-4222-8222-222222222222",
-    )
-    participants = [
-        FLParticipant(
-            scope=scope(f"branch-{index}", f"00000{index}", participant_id),
-            candidate=candidate(participant_id, f"00000{index}"),
-            notification_correlation_id=f"validation-branch-{index}",
-            resource_location=f"http://go.example/subscriptions/branch-{index}",
-        )
-        for index, participant_id in enumerate(participant_ids, start=1)
-    ]
-    process = FLProcess(
-        process_id="process-1",
-        intent=None,
-        state=FLServerState.READY,
-        participants=participants,
-        hierarchy_plan_id="00000000-0000-4000-8000-000000000901",
-    )
-    client = Mock()
-    client.delete.return_value = Mock(status_code=204)
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(round_timeout_seconds=1),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        Mock(),
-        client=client,
-    )
-    orchestrator._processes[process.process_id] = process
-    orchestrator._validate_hierarchy_candidate = Mock()
-    orchestrator._patch_validation = Mock()
-    orchestrator._wait = Mock(
-        side_effect=RuntimeError("federated stage deadline expired")
-    )
-    try:
-        with pytest.raises(RuntimeError) as caught:
-            orchestrator.execute_hierarchy_validation(
-                process_id=process.process_id,
-                validation_round=2,
-                candidate=Mock(url="http://root.example/candidate"),
-                base_artifact=Mock(),
-                expected_candidate_process_id="process-1",
-                expected_candidate_round=1,
-            )
-
-        assert str(caught.value).endswith(",".join(participant_ids))
-        assert [item.round_failure for item in participants] == [
-            "validation deadline expired",
-            "validation deadline expired",
-        ]
-        assert process.state is FLServerState.FAILED
-        assert client.delete.call_count == 2
-    finally:
-        orchestrator.close()
-
-
-def test_root_rejects_branch_validation_evidence_for_unassigned_leaf(
-    tmp_path,
-):
-    branch_id = "11111111-1111-4111-8111-111111111111"
-    admitted_leaf = "22222222-2222-4222-8222-222222222222"
-    wrong_leaf = "33333333-3333-4333-8333-333333333333"
-    archive_digest = "f" * 64
-    start = datetime(2026, 8, 20, tzinfo=UTC)
-    expected_scope = training_scope_descriptor()
-    subordinate = ValidationSummary(
-        participant_nf_instance_id=wrong_leaf,
-        training_scope=training_scope_descriptor("wrong-leaf"),
-        evaluation_sample_count=10,
-        start_time=start,
-        end_time=start + timedelta(minutes=1),
-        base=WapeComponents(absolute_error_sum=10, absolute_actual_sum=100),
-        candidate=WapeComponents(absolute_error_sum=5, absolute_actual_sum=100),
-    )
-    candidate_contract = RoundGlobalArtifact.model_validate(
-        {
-            "artifact_role": "ROUND_GLOBAL",
-            "fl_metadata": {
-                "ml_corre_id": "root-process",
-                "round_ind": 1,
-                "participants": [
-                    {
-                        "participant_nf_instance_id": branch_id,
-                        "training_sample_count": 20,
-                        "local_artifact_digest": "4" * 64,
-                    }
-                ],
-                "aggregated_training_sample_count": 20,
-            },
-        }
-    )
-    local_contract = RoundLocalArtifact.model_validate(
-        {
-            "artifact_role": "ROUND_LOCAL",
-            "result_type": "ACCURACY_CHECK",
-            "fl_metadata": {
-                "ml_corre_id": "root-process",
-                "round_ind": 2,
-                "participant_nf_instance_id": branch_id,
-                "training_scope": expected_scope.model_dump(mode="json"),
-                "evaluation": {
-                    "evaluation_stage": "FINAL_VALIDATION",
-                    "evaluation_sample_count": 10,
-                    "start_time": start,
-                    "end_time": start + timedelta(minutes=1),
-                    "base": {
-                        "absolute_error_sum": 10,
-                        "absolute_actual_sum": 100,
-                    },
-                    "candidate": {
-                        "absolute_error_sum": 5,
-                        "absolute_actual_sum": 100,
-                    },
-                },
-                "subordinate_validation_summaries": [
-                    subordinate.model_dump(mode="json")
-                ],
-            },
-        }
-    )
-    candidate_path = tmp_path / "candidate.tar.gz"
-    candidate_path.write_bytes(b"candidate")
-    candidate_artifact = Mock(
-        contract=candidate_contract,
-        digest=archive_digest,
-        path=candidate_path,
-        url="http://root.example/candidate/" + archive_digest,
-    )
-    participant = FLParticipant(
-        scope=scope("branch-a", "000001", branch_id),
-        candidate=candidate(branch_id, "000001"),
-        notification_correlation_id="validation-branch-a",
-        expected_training_scope=expected_scope,
-        notification=NwdafMLModelTrainNotif.model_validate(
-            {
-                "notifCorreId": "validation-branch-a",
-                "mlCorreId": "root-process",
-                "roundInd": 2,
-                "mLModelInfos": [
-                    {
-                        "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {
-                            "mLModelUrl": "http://branch.example/result"
-                        },
-                    }
-                ],
-            }
-        ),
-    )
-    process = FLProcess(
-        process_id="root-process",
-        intent=None,
-        participants=[participant],
-        hierarchy_plan_id="00000000-0000-4000-8000-000000000901",
-    )
-    workspace = Mock()
-    workspace.download.return_value = Mock()
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(),
-        Mock(),
-        Mock(),
-        Mock(),
-        workspace,
-        Mock(),
-        client=Mock(),
-    )
-    orchestrator._loader = Mock()
-    contract_fields = {
-        "analytics_event": "UE_COMMUNICATION",
-        "model_interoperability": "001122",
-        "runtime_compatibility": {"framework": "torch"},
-        "model": {"input_size": 1},
-        "inference": {"seq_length": 1},
-    }
-    models = [Mock(), Mock(), Mock()]
-    for model in models:
-        model.state_dict.return_value = {}
-    orchestrator._loader.load.side_effect = [
-        SimpleNamespace(manifest=contract_fields, model=models[0]),
-        SimpleNamespace(manifest=contract_fields, model=models[1]),
-        SimpleNamespace(manifest=contract_fields, model=models[1]),
-        SimpleNamespace(
-            manifest={**contract_fields, **local_contract.model_dump(mode="json")},
-            model=models[2],
-        ),
-    ]
-    try:
-        with pytest.raises(RuntimeError, match="subordinate set"):
-            orchestrator._collect_hierarchy_validation(
-                process=process,
-                candidate=candidate_artifact,
-                base_artifact=Mock(),
-                validation_round=2,
-                expected_candidate_process_id="root-process",
-                expected_candidate_round=1,
-                expected_subordinates={branch_id: (admitted_leaf,)},
-            )
-    finally:
-        orchestrator.close()
-
-
-@pytest.mark.parametrize(
-    (
-        "enforce_gate",
-        "candidate_error",
-        "expected_state",
-        "publishes",
-        "stale_base",
-        "has_active_scope",
-    ),
-    [
-        (False, 12, FLServerState.COMPLETE, True, False, False),
-        (True, 12, FLServerState.VALIDATION_REJECTED, False, False, False),
-        (True, 5, FLServerState.COMPLETE, True, False, False),
-        (True, 5, FLServerState.CUTOVER_PENDING, True, False, True),
-        (True, 5, FLServerState.PUBLISHING, False, True, False),
-    ],
-)
-def test_hierarchy_finalization_applies_leaf_gate_and_reuses_publication_owner(
-    tmp_path,
-    enforce_gate,
-    candidate_error,
-    expected_state,
-    publishes,
-    stale_base,
-    has_active_scope,
-):
-    branch_id = "11111111-1111-4111-8111-111111111111"
-    leaf_id = "22222222-2222-4222-8222-222222222222"
-    plan_id = "00000000-0000-4000-8000-000000000901"
-    family = "ue-communication-default"
-    branch_summary = validation_summary(
-        branch_id,
-        base_error=10,
-        candidate_error=candidate_error,
-    )
-    leaf_summary = validation_summary(
-        leaf_id,
-        base_error=10,
-        candidate_error=candidate_error,
-    )
-    candidate_path = tmp_path / "candidate.tar.gz"
-    candidate_path.write_bytes(b"candidate")
-    retained_candidate = ArtifactMetadata(
-        key="d" * 64,
-        size_bytes=candidate_path.stat().st_size,
-        path=candidate_path,
-        url="http://root.example/candidate/" + "d" * 64,
-    )
-    collection = HierarchyValidationCollection(
-        candidate_artifact=retained_candidate,
-        validation_summaries=(branch_summary,),
-        hierarchy_branches=(
-            HierarchyBranchValidation(
-                branch_nf_instance_id=branch_id,
-                subordinate_validation_summaries=(leaf_summary,),
-            ),
-        ),
-    )
-    participant = FLParticipant(
-        scope=scope("branch-a", "000001", branch_id),
-        candidate=candidate(branch_id, "000001"),
-        notification_correlation_id="validation-branch-a",
-        training_sample_count=25,
-    )
-    process = FLProcess(
-        process_id="process-1",
-        intent=None,
-        state=FLServerState.READY,
-        participants=[participant],
-        hierarchy_plan_id=plan_id,
-        hierarchy_family_key=family,
-        hierarchy_active_scopes=(
-            (scope("leaf-a", "000002", leaf_id),) if has_active_scope else ()
-        ),
-        hierarchy_cleanup_complete=True,
-    )
-    base_artifact = Mock(key="b" * 64)
-    current = Mock(
-        model_id=1,
-        artifact=Mock(key="9" * 64) if stale_base else base_artifact,
-    )
-    catalog = Mock()
-    catalog.current.return_value = current
-    catalog.version_key_for_id.return_value = "version-1"
-    publication = Mock()
-    publication.publish.return_value = Mock(model_id=2, version_key="version-2")
-    policy = Mock()
-    orchestrator = FLServerEngine(
-        FederatedLearningSettings(workspace_root=tmp_path),
-        FLServerSettings(
-            final_validation={"enforce_performance_gate": enforce_gate}
-        ),
-        Mock(),
-        policy,
-        catalog,
-        Mock(),
-        Mock(),
-        client=Mock(),
-        publication=publication,
-    )
-    orchestrator._processes[process.process_id] = process
-    orchestrator.execute_hierarchy_validation = Mock(return_value=collection)
-    candidate_artifact = Mock(digest="d" * 64)
-    observed = []
-    try:
-        if stale_base:
-            with pytest.raises(RuntimeError, match="catalog base changed"):
-                orchestrator.finalize_hierarchy_candidate(
-                    process_id=process.process_id,
-                    validation_round=2,
-                    candidate=candidate_artifact,
-                    base_artifact=base_artifact,
-                    expected_subordinates={branch_id: (leaf_id,)},
-                    state_observer=observed.append,
-                )
-            publication.publish.assert_not_called()
-            assert process.published_model_id is None
-            assert observed[-2:] == [
-                FLServerState.CANDIDATE_READY,
-                FLServerState.PUBLISHING,
-            ]
-            return
-        result = orchestrator.finalize_hierarchy_candidate(
-            process_id=process.process_id,
-            validation_round=2,
-            candidate=candidate_artifact,
-            base_artifact=base_artifact,
-            expected_subordinates={branch_id: (leaf_id,)},
-            state_observer=observed.append,
-        )
-
-        assert result.state is expected_state
-        assert result.gate_would_accept is (candidate_error < 10)
-        if publishes:
-            published_candidate = publication.publish.call_args.args[0]
-            assert published_candidate.hierarchy_validation.plan_id == plan_id
-            assert published_candidate.validation_summaries == (branch_summary,)
-            assert published_candidate.participants[0].sample_count == 25
-            assert observed[-3:] == [
-                FLServerState.CANDIDATE_READY,
-                FLServerState.PUBLISHING,
-                expected_state,
-            ]
-            if has_active_scope:
-                policy.complete_retrain.assert_not_called()
-            else:
-                policy.complete_retrain.assert_called_once_with(family)
-        else:
-            publication.publish.assert_not_called()
-            assert observed == [FLServerState.VALIDATION_REJECTED]
-    finally:
-        orchestrator.close()
-
-
-@pytest.mark.parametrize("validation", [False, True])
 def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
     tmp_path,
-    validation,
 ):
     participant_ids = (
         "11111111-1111-4111-8111-111111111111",
@@ -2476,7 +1668,6 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
         client=client,
     )
     orchestrator._processes[process.process_id] = process
-    orchestrator._validate_hierarchy_candidate = Mock()
     for participant in participants:
         orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     completed = threading.Event()
@@ -2484,22 +1675,12 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
 
     def execute():
         try:
-            if validation:
-                orchestrator.execute_hierarchy_validation(
-                    process_id=process.process_id,
-                    validation_round=3,
-                    candidate=Mock(url="http://root.example/candidate"),
-                    base_artifact=Mock(),
-                    expected_candidate_process_id="root-process",
-                    expected_candidate_round=2,
-                )
-            else:
-                orchestrator.execute_hierarchy_round(
-                    process_id=process.process_id,
-                    round_indicator=3,
-                    round_input_url="http://root.example/round-input",
-                    expected_result_type=RoundLocalResultType.TRAINING,
-                )
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=3,
+                round_input_url="http://root.example/round-input",
+                expected_result_type=RoundLocalResultType.TRAINING,
+            )
         except Exception as error:
             failures.append(str(error))
         finally:
@@ -2508,16 +1689,8 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
     thread = threading.Thread(target=execute)
     thread.start()
     try:
-        dispatch_state = (
-            FLServerState.FINAL_VALIDATION_DISPATCH
-            if validation
-            else FLServerState.ROUND_DISPATCH
-        )
-        waiting_state = (
-            FLServerState.FINAL_VALIDATION_WAITING
-            if validation
-            else FLServerState.ROUND_WAITING
-        )
+        dispatch_state = FLServerState.ROUND_DISPATCH
+        waiting_state = FLServerState.ROUND_WAITING
         deadline = time.monotonic() + 1
         while process.state not in {dispatch_state, waiting_state}:
             if time.monotonic() >= deadline:
@@ -2551,12 +1724,9 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
             )
         )
         assert completed.wait(1) is True
-        prefix = (
-            "required hierarchy validation participants terminated: "
-            if validation
-            else "required hierarchy participants terminated: "
-        )
-        assert failures == [prefix + participant_ids[0]]
+        assert failures == [
+            "required hierarchy participants terminated: " + participant_ids[0]
+        ]
         assert process.state is FLServerState.FAILED
     finally:
         thread.join(timeout=1)
@@ -3346,10 +2516,7 @@ def test_hierarchy_cleanup_failure_records_error_but_releases_local_owner(tmp_pa
     orchestrator._correlations[participant.notification_correlation_id] = process.process_id
 
     try:
-        orchestrator.close_hierarchy_training(
-            process.process_id,
-            retain_for_adoption=False,
-        )
+        orchestrator.close_hierarchy_training(process.process_id)
 
         assert "cleanup returned 503" in process.cleanup_failure
         assert orchestrator.processes() == ()
@@ -3400,17 +2567,14 @@ def test_go_generation_reset_cleans_preparation_created_during_abort(tmp_path):
 
     def dispatch():
         try:
-            orchestrator.start_hierarchy_preparation(
-                plan_id=plan_id,
+            orchestrator.start_protocol_preparation(
+                ml_correlation_id=plan_id,
                 reservation_id=reservation.reservation_id,
-                family_key=None,
-                model_id=None,
-                ml_event="UE_COMMUNICATION",
+                ml_event="X_IMAGE_CLASSIFICATION",
                 ml_event_filter={},
-                target_ue=None,
-                model_interoperability="001122",
+                model_interoperability="pymtlf-image-classification-mnist",
                 targets=(
-                    HierarchyPreparationTarget(
+                    ProtocolPreparationTarget(
                         participant_nf_instance_id=(
                             "22222222-2222-4222-8222-222222222222"
                         ),
@@ -3418,7 +2582,9 @@ def test_go_generation_reset_cleans_preparation_created_during_abort(tmp_path):
                             "22222222-2222-4222-8222-222222222222",
                             "000001",
                         ),
-                        assignment_url="http://branch.example/assignment",
+                        topology=FlTopologyNode(
+                            nfInstanceId="22222222-2222-4222-8222-222222222222"
+                        ),
                     ),
                 ),
             )
@@ -3434,7 +2600,7 @@ def test_go_generation_reset_cleans_preparation_created_during_abort(tmp_path):
 
     try:
         assert thread.is_alive() is False
-        assert failures == ["containing NWDAF process generation changed"]
+        assert failures == []
         client.delete.assert_called_once_with(
             "http://go.example/subscriptions/late-resource"
         )

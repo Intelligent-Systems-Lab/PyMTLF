@@ -24,8 +24,6 @@ from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
-    ArtifactRole,
-    HierarchyAssignmentArtifact,
     RoundGlobalArtifact,
     RoundInputArtifact,
     validate_fl_artifact_manifest,
@@ -44,16 +42,9 @@ from py_mtlf.core.fl_experiment import (
     ExperimentRole,
     FLExperimentRegistry,
 )
-from py_mtlf.core.fl_hierarchy import (
-    BranchAssignmentMetadata,
-    LeafAssignmentMetadata,
-    PreparationOutcome,
-)
 from py_mtlf.core.fl_round_model_distribution import RoundModelDistribution
 from py_mtlf.core.fl_workspace import (
     FLWorkspace,
-    ValidatedArchive,
-    ValidatedHierarchyArtifact,
     validate_model_compatibility,
 )
 from py_mtlf.core.image_classification import ImageDatasetLoader
@@ -123,16 +114,6 @@ class BranchArtifactView(Protocol):
     url: str
 
 
-class BranchExecutionView(Protocol):
-    process_id: str
-
-
-class BranchPreparationResultView(Protocol):
-    artifact: BranchArtifactView
-    outcome: PreparationOutcome
-    execution: BranchExecutionView | None
-
-
 class BranchPreparationDispatcher(Protocol):
     def prepare_protocol(
         self,
@@ -141,29 +122,7 @@ class BranchPreparationDispatcher(Protocol):
         reservation_id: str,
     ) -> FlTopologyReport: ...
 
-    def prepare(
-        self,
-        *,
-        assignment: ValidatedHierarchyArtifact,
-        representation: NwdafMLModelTrainSubsc,
-        reservation_id: str,
-    ) -> BranchPreparationResultView: ...
-
     def cancel(self, plan_id: str, reason: str) -> None: ...
-
-    def execute_round(
-        self,
-        *,
-        assignment: ValidatedHierarchyArtifact,
-        representation: NwdafMLModelTrainSubsc,
-        upper_input: LoadedBundle,
-        upper_client_subscription_id: str,
-        upper_resource_revision: int,
-        upper_input_artifact_digest: str,
-        upper_training_scope: TrainingScopeDescriptor,
-        callback_margin_seconds: int,
-        local_work: IntermediateLocalWork | None = None,
-    ) -> BranchArtifactView: ...
 
     def execute_protocol_round(
         self,
@@ -179,20 +138,6 @@ class BranchPreparationDispatcher(Protocol):
         local_work: IntermediateLocalWork,
     ) -> BranchArtifactView: ...
 
-    def execute_validation(
-        self,
-        *,
-        assignment: ValidatedHierarchyArtifact,
-        representation: NwdafMLModelTrainSubsc,
-        upper_candidate: LoadedBundle,
-        upper_candidate_artifact: ArtifactMetadata,
-        upper_client_subscription_id: str,
-        upper_resource_revision: int,
-        upper_training_scope: TrainingScopeDescriptor,
-        callback_margin_seconds: int,
-    ) -> BranchArtifactView: ...
-
-
 @dataclass
 class FLClientResource:
     subscription_id: str
@@ -206,8 +151,6 @@ class FLClientResource:
     work_slot_owned: bool = True
     prepared_training_sample_count: int = 0
     preparation_base_artifact: ArtifactMetadata | None = None
-    hierarchy_assignment: ValidatedHierarchyArtifact | None = None
-    branch_process_id: str = ""
     experiment_reservation_id: str = ""
     callback_slot_owned: bool = True
     candidate_contract: bool = False
@@ -591,7 +534,7 @@ class FLClientEngine:
                 experiment is not None
                 and experiment.plan_id is not None
                 and experiment.assigned_role in {ExperimentRole.BRANCH, ExperimentRole.LEAF}
-            ) or resource.hierarchy_assignment is not None
+            )
             if resource.state in {
                 FLClientState.PREPARING,
                 FLClientState.ROUND_RUNNING,
@@ -810,12 +753,6 @@ class FLClientEngine:
 
     def _start_validation(self, resource: FLClientResource) -> None:
         value = resource.representation
-        hierarchy_metadata = (
-            resource.hierarchy_assignment.contract.hierarchy_metadata
-            if resource.hierarchy_assignment is not None
-            else None
-        )
-        branch_validation = isinstance(hierarchy_metadata, BranchAssignmentMetadata)
         violations: list[InvalidParameter] = []
         if value.ml_accuracy_check_flag is not True:
             violations.append(InvalidParameter("mLAccChkFlg", "must be true for final validation"))
@@ -830,8 +767,9 @@ class FLClientEngine:
                     "must provide exactly one final candidate for validation",
                 )
             )
-        if resource.preparation_base_artifact is None or (
-            resource.dataset_snapshot is None and not branch_validation
+        if (
+            resource.preparation_base_artifact is None
+            or resource.dataset_snapshot is None
         ):
             violations.append(
                 InvalidParameter(
@@ -890,7 +828,6 @@ class FLClientEngine:
         window: AdrfTimeWindow,
         protocol_initial: bool = True,
     ) -> None:
-        unbound_hierarchy_plan_id: str | None = None
         try:
             with self._lock:
                 resource = self._required(subscription_id)
@@ -916,146 +853,7 @@ class FLClientEngine:
                 "preparation-base",
             )
             artifact = downloaded.metadata
-            inspected = downloaded.validated
-            hierarchy_assignment: ValidatedHierarchyArtifact | None = None
-            hierarchy_contract = (
-                inspected.contract if isinstance(inspected, ValidatedArchive) else None
-            )
             event = value.ml_event_subscriptions[0]
-            hierarchy_role = (
-                hierarchy_contract.artifact_role
-                if hierarchy_contract is not None
-                else None
-            )
-            if hierarchy_role in {
-                ArtifactRole.HIERARCHY_ASSIGNMENT,
-                ArtifactRole.HIERARCHY_PREPARATION_RESULT,
-            }:
-                if not isinstance(hierarchy_contract, HierarchyAssignmentArtifact):
-                    raise RuntimeError(
-                        "FL preparation input is not a hierarchy assignment"
-                    )
-                context = self._nwdaf_context.get()
-                if not context.advertised_client:
-                    raise RuntimeError(
-                        "containing NWDAF does not advertise the FL Client capability"
-                    )
-                hierarchy_assignment = self._workspace.admit_assignment(
-                    downloaded,
-                    intended_recipient_nf_instance_id=context.nf_instance_id,
-                )
-                metadata = hierarchy_assignment.contract.hierarchy_metadata
-                unbound_hierarchy_plan_id = metadata.plan_id
-                if isinstance(metadata, BranchAssignmentMetadata):
-                    if self._branch_coordinator is None:
-                        raise RuntimeError(
-                            "Branch hierarchy assignment requires the Branch coordinator"
-                        )
-                    required_capabilities = {FLCapabilityType.SERVER_AND_CLIENT}
-                    assigned_role = ExperimentRole.BRANCH
-                elif isinstance(metadata, LeafAssignmentMetadata):
-                    required_capabilities = {
-                        FLCapabilityType.CLIENT,
-                        FLCapabilityType.SERVER_AND_CLIENT,
-                    }
-                    assigned_role = ExperimentRole.LEAF
-                else:
-                    raise RuntimeError("hierarchy assignment message type is unsupported")
-                if not any(
-                    event.ml_event in capability.ml_analytics_ids
-                    and capability.fl_capability_type in required_capabilities
-                    for capability in context.ml_analytics_capabilities
-                ):
-                    raise RuntimeError(
-                        "containing NWDAF does not advertise the required FL capability "
-                        "for the requested analytics event"
-                    )
-                if hierarchy_assignment.manifest.get("analytics_event") != event.ml_event:
-                    raise RuntimeError(
-                        "FL preparation base model analytics event is incompatible"
-                    )
-                if (
-                    hierarchy_assignment.manifest.get("model_interoperability")
-                    != event.model_interoperability
-                ):
-                    raise RuntimeError(
-                        "FL preparation base model interoperability is incompatible"
-                    )
-                with self._lock:
-                    current = self._resources.get(subscription_id)
-                    stale = current is None or current.revision != revision
-                    reservation_id = (
-                        "" if current is None else current.experiment_reservation_id
-                    )
-                if stale:
-                    self._workspace.release_plan(metadata.plan_id)
-                    unbound_hierarchy_plan_id = None
-                    self._release_work_slot(subscription_id, revision)
-                    return
-                self._experiments.bind_plan(
-                    reservation_id,
-                    metadata.plan_id,
-                    assigned_role,
-                )
-                unbound_hierarchy_plan_id = None
-                artifact = hierarchy_assignment.metadata
-                if assigned_role is ExperimentRole.BRANCH:
-                    with self._lock:
-                        current = self._resources.get(subscription_id)
-                        if current is None or current.revision != revision:
-                            self._release_work_slot(subscription_id, revision)
-                            return
-                        current.preparation_base_artifact = artifact
-                        current.hierarchy_assignment = hierarchy_assignment
-                    result = self._branch_coordinator.prepare(
-                        assignment=hierarchy_assignment,
-                        representation=value,
-                        reservation_id=reservation_id,
-                    )
-                    with self._lock:
-                        current = self._resources.get(subscription_id)
-                        if current is None or current.revision != revision:
-                            self._branch_coordinator.cancel(
-                                metadata.plan_id,
-                                "upper Branch resource became stale",
-                            )
-                            self._release_work_slot(subscription_id, revision)
-                            return
-                        current.branch_process_id = str(
-                            result.execution.process_id
-                            if result.execution is not None
-                            else ""
-                        )
-                        current.state = FLClientState.PREPARATION_RESULT_PENDING
-                        self._cancel_delay(subscription_id)
-                    result_artifact = result.artifact
-                    result_outcome = result.outcome
-                    notification = NwdafMLModelTrainNotif(
-                        notifCorreId=value.notification_correlation_id,
-                        mlCorreId=value.ml_correlation_id,
-                        mLModelInfos=[
-                            MLEventNotification(
-                                event=event.ml_event,
-                                mLFileAddr=MLModelAddress(
-                                    mLModelUrl=result_artifact.url,
-                                ),
-                            )
-                        ],
-                        termTrainReq=(
-                            "NOT_AVAILABLE_ML_TRAIN"
-                            if result_outcome is PreparationOutcome.FAILED
-                            else None
-                        ),
-                    )
-                    self._enqueue_delivery(
-                        current,
-                        notification,
-                        FLClientState.PREPARED
-                        if result_outcome is PreparationOutcome.READY
-                        else FLClientState.FAILED,
-                    )
-                    self._release_work_slot(subscription_id, revision)
-                    return
             base = self._loader.load(artifact)
             self._validate_workload_bundle(base, event.ml_event, event.model_interoperability)
             with self._lock:
@@ -1064,7 +862,6 @@ class FLClientEngine:
                     self._release_work_slot(subscription_id, revision)
                     return
                 current.preparation_base_artifact = artifact
-                current.hierarchy_assignment = hierarchy_assignment
             if isinstance(self._client_settings.training_data, LocalImageTrainingDataSettings):
                 with self._lock:
                     current = self._resources.get(subscription_id)
@@ -1105,14 +902,6 @@ class FLClientEngine:
                 if current is not None and current.revision == revision:
                     current.dataset_job_id = job_id
         except Exception as error:
-            if unbound_hierarchy_plan_id is not None:
-                try:
-                    self._workspace.release_plan(unbound_hierarchy_plan_id)
-                except RuntimeError:
-                    logger.exception(
-                        "Failed to release unbound FL hierarchy artifact plan_id=%s",
-                        unbound_hierarchy_plan_id,
-                    )
             logger.exception(
                 "FL client preparation failed subscription_id=%s",
                 subscription_id,
@@ -1385,7 +1174,7 @@ class FLClientEngine:
                     value.ml_correlation_id or subscription_id,
                     f"round-{value.round_indicator}-input",
                     expected_size=retrieved.model_size,
-                    owner_plan_id=_hierarchy_plan_id(resource),
+                    owner_plan_id=_owner_plan_id(resource),
                 )
                 artifact = downloaded.metadata
             else:
@@ -1395,7 +1184,7 @@ class FLClientEngine:
                     str(model_info.model_file_address.model_url),
                     value.ml_correlation_id or subscription_id,
                     f"round-{value.round_indicator}-input",
-                    owner_plan_id=_hierarchy_plan_id(resource),
+                    owner_plan_id=_owner_plan_id(resource),
                 )
             base = self._loader.load(artifact)
             round_input = validate_fl_artifact_manifest(base.manifest)
@@ -1433,11 +1222,6 @@ class FLClientEngine:
                     preparation_base_artifact = artifact
             prepared_base = self._loader.load(preparation_base_artifact)
             validate_model_compatibility(prepared_base, base)
-            hierarchy_metadata = (
-                resource.hierarchy_assignment.contract.hierarchy_metadata
-                if resource.hierarchy_assignment is not None
-                else None
-            )
             if (
                 resource.candidate_contract
                 and resource.intermediate_local_work is not None
@@ -1458,45 +1242,6 @@ class FLClientEngine:
                         self._client_settings.callback_deadline_margin_seconds
                     ),
                     local_work=resource.intermediate_local_work,
-                )
-                notification = NwdafMLModelTrainNotif(
-                    notifCorreId=value.notification_correlation_id,
-                    mlCorreId=value.ml_correlation_id,
-                    roundInd=value.round_indicator,
-                    mLModelInfos=[
-                        MLEventNotification(
-                            event=value.ml_event_subscriptions[0].ml_event,
-                            mLFileAddr=MLModelAddress(mLModelUrl=published.url),
-                        )
-                    ],
-                )
-                with self._lock:
-                    current = self._resources.get(subscription_id)
-                    if current is not resource or current.revision != revision:
-                        return
-                    current.state = FLClientState.RESULT_PENDING
-                    self._cancel_delay(subscription_id)
-                self._enqueue_delivery(current, notification, FLClientState.READY)
-                return
-            if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
-                if self._branch_coordinator is None:
-                    raise RuntimeError("Branch hierarchy round requires the Branch coordinator")
-                arguments = {
-                    "assignment": resource.hierarchy_assignment,
-                    "representation": value,
-                    "upper_input": base,
-                    "upper_client_subscription_id": subscription_id,
-                    "upper_resource_revision": revision,
-                    "upper_input_artifact_digest": artifact.key,
-                    "upper_training_scope": resource.scope,
-                    "callback_margin_seconds": (
-                        self._client_settings.callback_deadline_margin_seconds
-                    ),
-                }
-                if resource.intermediate_local_work is not None:
-                    arguments["local_work"] = resource.intermediate_local_work
-                published = self._branch_coordinator.execute_round(
-                    **arguments,
                 )
                 notification = NwdafMLModelTrainNotif(
                     notifCorreId=value.notification_correlation_id,
@@ -1551,10 +1296,6 @@ class FLClientEngine:
             if resource.client_local_work is not None:
                 epochs = resource.client_local_work.epochs
                 proximal_mu = resource.client_local_work.proximal_mu
-            elif resource.hierarchy_assignment is not None:
-                if not isinstance(hierarchy_metadata, LeafAssignmentMetadata):
-                    raise RuntimeError("hierarchy round assignment is unsupported")
-                proximal_mu = hierarchy_metadata.strategy.algorithm.proximal_mu
             result = self._trainer.train(
                 base,
                 dataset,
@@ -1590,7 +1331,7 @@ class FLClientEngine:
                 role="ROUND_LOCAL",
                 base=base,
                 model=result.model,
-                owner_plan_id=_hierarchy_plan_id(resource),
+                owner_plan_id=_owner_plan_id(resource),
                 metadata=metadata,
             )
             notification = NwdafMLModelTrainNotif(
@@ -1701,7 +1442,6 @@ class FLClientEngine:
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
                 preparation_base_artifact = resource.preparation_base_artifact
-                hierarchy_assignment = resource.hierarchy_assignment
             model_info = value.ml_model_infos[0]
             if model_info.model_file_address is None:
                 raise RuntimeError("final validation candidate must use mLFileAddr")
@@ -1709,7 +1449,7 @@ class FLClientEngine:
                 str(model_info.model_file_address.model_url),
                 value.ml_correlation_id or subscription_id,
                 f"validation-{value.round_indicator}-candidate",
-                owner_plan_id=_hierarchy_plan_id(resource),
+                owner_plan_id=_owner_plan_id(resource),
             )
             base = self._loader.load(preparation_base_artifact)
             candidate = self._loader.load(candidate_artifact)
@@ -1722,54 +1462,10 @@ class FLClientEngine:
                 or candidate_contract.fl_metadata.round_ind != value.round_indicator - 1
             ):
                 raise RuntimeError("final validation candidate identity does not match the command")
-            hierarchy_metadata = (
-                hierarchy_assignment.contract.hierarchy_metadata
-                if hierarchy_assignment is not None
-                else None
-            )
-            if not isinstance(hierarchy_metadata, LeafAssignmentMetadata) and (
-                candidate_contract.fl_metadata.ml_corre_id
-                != value.ml_correlation_id
-            ):
+            if candidate_contract.fl_metadata.ml_corre_id != value.ml_correlation_id:
                 raise RuntimeError(
                     "final validation candidate does not match the upper process"
                 )
-            if isinstance(hierarchy_metadata, BranchAssignmentMetadata):
-                if self._branch_coordinator is None:
-                    raise RuntimeError(
-                        "Branch hierarchy validation requires the Branch coordinator"
-                    )
-                published = self._branch_coordinator.execute_validation(
-                    assignment=hierarchy_assignment,
-                    representation=value,
-                    upper_candidate=candidate,
-                    upper_candidate_artifact=candidate_artifact,
-                    upper_client_subscription_id=subscription_id,
-                    upper_resource_revision=revision,
-                    upper_training_scope=resource.scope,
-                    callback_margin_seconds=(
-                        self._client_settings.callback_deadline_margin_seconds
-                    ),
-                )
-                notification = NwdafMLModelTrainNotif(
-                    notifCorreId=value.notification_correlation_id,
-                    mlCorreId=value.ml_correlation_id,
-                    roundInd=value.round_indicator,
-                    mLModelInfos=[
-                        MLEventNotification(
-                            event=value.ml_event_subscriptions[0].ml_event,
-                            mLFileAddr=MLModelAddress(mLModelUrl=published.url),
-                        )
-                    ],
-                )
-                with self._lock:
-                    current = self._resources.get(subscription_id)
-                    if current is None or current.revision != revision:
-                        return
-                    current.state = FLClientState.RESULT_PENDING
-                    self._cancel_delay(subscription_id)
-                self._enqueue_delivery(current, notification, FLClientState.READY)
-                return
             if snapshot is None:
                 raise RuntimeError("final validation has no frozen preparation dataset")
             dataset = self._dataset_builder.build(snapshot, base.manifest)
@@ -1819,7 +1515,7 @@ class FLClientEngine:
                 role="ROUND_LOCAL",
                 base=candidate,
                 model=candidate.model,
-                owner_plan_id=_hierarchy_plan_id(resource),
+                owner_plan_id=_owner_plan_id(resource),
                 metadata={
                     "artifact_role": "ROUND_LOCAL",
                     "result_type": "ACCURACY_CHECK",
@@ -2239,10 +1935,10 @@ def _minimum_samples(value: NwdafMLModelTrainSubsc) -> int:
     )
 
 
-def _hierarchy_plan_id(resource: FLClientResource) -> str | None:
-    if resource.hierarchy_assignment is None:
+def _owner_plan_id(resource: FLClientResource) -> str | None:
+    if not resource.candidate_contract:
         return None
-    return resource.hierarchy_assignment.contract.hierarchy_metadata.plan_id
+    return resource.representation.ml_correlation_id
 
 
 def _termination(resource: FLClientResource) -> NwdafMLModelTrainNotif:

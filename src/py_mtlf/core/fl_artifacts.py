@@ -16,11 +16,7 @@ from pydantic import (
     model_validator,
 )
 
-from py_mtlf.core.fl_hierarchy import (
-    AssignmentMetadata,
-    PreparationResultMetadata,
-    normalize_plan_id,
-)
+from py_mtlf.core.fl_hierarchy import normalize_plan_id
 from py_mtlf.core.training_scope import TrainingScopeDescriptor
 from py_mtlf.models import SHA256_PATTERN, ModelIdentity
 
@@ -36,8 +32,6 @@ class ArtifactRole(StrEnum):
     ROUND_LOCAL = "ROUND_LOCAL"
     ROUND_GLOBAL = "ROUND_GLOBAL"
     FINAL_MODEL = "FINAL_MODEL"
-    HIERARCHY_ASSIGNMENT = "HIERARCHY_ASSIGNMENT"
-    HIERARCHY_PREPARATION_RESULT = "HIERARCHY_PREPARATION_RESULT"
 
 
 class RoundLocalResultType(StrEnum):
@@ -399,23 +393,11 @@ class FinalModelArtifact(ArtifactContractModel):
     fl_metadata: FinalModelMetadata
 
 
-class HierarchyAssignmentArtifact(ArtifactContractModel):
-    artifact_role: Literal[ArtifactRole.HIERARCHY_ASSIGNMENT]
-    hierarchy_metadata: AssignmentMetadata
-
-
-class HierarchyPreparationResultArtifact(ArtifactContractModel):
-    artifact_role: Literal[ArtifactRole.HIERARCHY_PREPARATION_RESULT]
-    hierarchy_metadata: PreparationResultMetadata
-
-
 FLArtifactContract = Annotated[
     RoundInputArtifact
     | RoundLocalArtifact
     | RoundGlobalArtifact
-    | FinalModelArtifact
-    | HierarchyAssignmentArtifact
-    | HierarchyPreparationResultArtifact,
+    | FinalModelArtifact,
     Field(discriminator="artifact_role"),
 ]
 
@@ -442,14 +424,11 @@ def fl_artifact_projection(manifest: Mapping[str, object]) -> dict[str, object]:
         ArtifactRole.ROUND_LOCAL: {"result_type", "fl_metadata"},
         ArtifactRole.ROUND_GLOBAL: {"fl_metadata"},
         ArtifactRole.FINAL_MODEL: {"model_identity", "fl_metadata"},
-        ArtifactRole.HIERARCHY_ASSIGNMENT: {"hierarchy_metadata"},
-        ArtifactRole.HIERARCHY_PREPARATION_RESULT: {"hierarchy_metadata"},
     }[role]
     known_role_fields = {
         "result_type",
         "fl_metadata",
         "model_identity",
-        "hierarchy_metadata",
     }
     unexpected = sorted((known_role_fields - role_fields).intersection(manifest))
     if unexpected:

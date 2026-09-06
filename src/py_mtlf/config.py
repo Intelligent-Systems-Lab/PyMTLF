@@ -555,14 +555,11 @@ class TopologySettings(FrozenSettings):
 class OrchestrationSettings(FrozenSettings):
     mode: Literal["flat", "hierarchical"]
     participant_source: Literal["monitor_scopes", "static"]
-    hierarchy_contract: Literal["model_bundle", "protocol"] = "model_bundle"
 
     @model_validator(mode="after")
     def validate_mode_and_participant_source(self) -> "OrchestrationSettings":
         if self.mode == "hierarchical" and self.participant_source != "static":
             raise ValueError("hierarchical orchestration requires static participants")
-        if self.mode == "flat" and "hierarchy_contract" in self.model_fields_set:
-            raise ValueError("flat orchestration must not configure hierarchy_contract")
         return self
 
 

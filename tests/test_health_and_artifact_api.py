@@ -182,12 +182,12 @@ def test_unknown_and_malformed_artifact_keys_are_not_found(settings):
     assert malformed.json()["code"] == "ARTIFACT_NOT_FOUND"
 
 
-def test_hierarchy_fl_artifact_uses_existing_serving_route(settings, bundle_path):
+def test_fl_round_artifact_uses_existing_serving_route(settings, bundle_path):
     content = bundle_path.read_bytes()
     digest = hashlib.sha256(content).hexdigest()
     process_id = "11111111-1111-4111-8111-111111111111"
     participant_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    role = "HIERARCHY_ASSIGNMENT"
+    role = "ROUND_INPUT"
     path = (
         settings.federated_learning.workspace_root
         / process_id

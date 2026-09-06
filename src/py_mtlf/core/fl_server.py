@@ -17,9 +17,6 @@ from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeRef
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
-    HierarchyBranchValidation,
-    HierarchyValidation,
-    RoundGlobalArtifact,
     RoundInputArtifact,
     RoundLocalAccuracyCheckMetadata,
     RoundLocalArtifact,
@@ -116,13 +113,6 @@ class FLClientCandidate:
 
 
 @dataclass(frozen=True)
-class HierarchyPreparationTarget:
-    participant_nf_instance_id: str
-    candidate: FLClientCandidate
-    assignment_url: str
-
-
-@dataclass(frozen=True)
 class ProtocolPreparationTarget:
     participant_nf_instance_id: str
     candidate: FLClientCandidate
@@ -183,11 +173,7 @@ class FLProcess:
     published_model_id: int | None = None
     experiment_reservation_id: str = ""
     hierarchy_plan_id: str = ""
-    hierarchy_family_key: FamilyKey | None = None
-    hierarchy_active_scopes: tuple[ScopeReference, ...] = ()
     hierarchy_cleanup_complete: bool = False
-    hierarchy_validation: HierarchyValidation | None = None
-    hierarchy_state_observer: Callable[[FLServerState], None] | None = None
     hierarchy_selected_participant_ids: frozenset[str] = frozenset()
     protocol_hierarchy: bool = False
     condition: threading.Condition = field(
@@ -199,7 +185,6 @@ class FLProcess:
 class HierarchyParticipantPreparationOutcome:
     participant_nf_instance_id: str
     resource_location: str
-    assignment_url: str
     notification: NwdafMLModelTrainNotif | None
     failure: str
     delay_extensions: int
@@ -212,27 +197,6 @@ class HierarchyPreparationCollection:
     plan_id: str
     participants: tuple[HierarchyParticipantPreparationOutcome, ...]
     timed_out_participant_nf_instance_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class HierarchyValidationCollection:
-    candidate_artifact: ArtifactMetadata
-    validation_summaries: tuple[ValidationSummary, ...]
-    hierarchy_branches: tuple[HierarchyBranchValidation, ...] = ()
-
-
-@dataclass(frozen=True)
-class _ValidatedHierarchyCandidate:
-    artifact: ArtifactMetadata
-
-
-@dataclass(frozen=True)
-class HierarchyFinalizationResult:
-    state: FLServerState
-    candidate_digest: str
-    published_model_id: int | None
-    gate_would_accept: bool
-    gate_rejection_reasons: tuple[str, ...]
 
 
 class FLClientResolver:
@@ -416,7 +380,6 @@ class FLServerEngine:
             if process.hierarchy_plan_id:
                 self.close_hierarchy_training(
                     process.process_id,
-                    retain_for_adoption=False,
                 )
             else:
                 for participant in process.participants:
@@ -492,107 +455,6 @@ class FLServerEngine:
             self._futures.add(future)
         future.add_done_callback(self._future_done)
         return process
-
-    def start_hierarchy_preparation(
-        self,
-        *,
-        plan_id: str,
-        reservation_id: str,
-        family_key: FamilyKey | None,
-        model_id: int | None,
-        ml_event: str,
-        ml_event_filter: dict,
-        target_ue: dict | None,
-        model_interoperability: str,
-        targets: tuple[HierarchyPreparationTarget, ...],
-        active_scopes: tuple[ScopeReference, ...] = (),
-    ) -> FLProcess:
-        with self._lock:
-            if self._closing.is_set():
-                raise RuntimeError("FL Server is closing")
-            generation = self._generation
-        if not targets:
-            raise ValueError("hierarchy preparation requires at least one participant target")
-        participant_ids = tuple(item.participant_nf_instance_id for item in targets)
-        if participant_ids != tuple(sorted(participant_ids)) or len(participant_ids) != len(
-            set(participant_ids)
-        ):
-            raise ValueError(
-                "hierarchy participant targets must be unique and canonically ordered"
-            )
-        for target in targets:
-            if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
-                raise ValueError(
-                    "hierarchy participant target identity does not match its candidate"
-                )
-            if not target.assignment_url.strip():
-                raise ValueError("hierarchy participant assignment URL must not be blank")
-
-        process = FLProcess(
-            process_id=str(uuid4()),
-            intent=None,
-            generation=generation,
-            experiment_reservation_id=reservation_id,
-            hierarchy_plan_id=plan_id,
-            hierarchy_family_key=family_key,
-            hierarchy_active_scopes=active_scopes,
-        )
-        self._experiments.attach_server(reservation_id, plan_id, process.process_id)
-        process.participants = [
-            FLParticipant(
-                scope=ScopeReference(
-                    scope_key=f"hierarchy:{plan_id}:{target.participant_nf_instance_id}",
-                    consumer_id=target.participant_nf_instance_id,
-                    model_ids=(model_id,) if model_id is not None else (),
-                    ml_event=ml_event,
-                    ml_event_filter=dict(ml_event_filter),
-                    target_ue=dict(target_ue) if target_ue is not None else None,
-                ),
-                candidate=target.candidate,
-                notification_correlation_id=str(uuid4()),
-            )
-            for target in targets
-        ]
-        with self._lock:
-            stale_generation = generation != self._generation
-            if not stale_generation:
-                self._processes[process.process_id] = process
-                for participant in process.participants:
-                    self._correlations[participant.notification_correlation_id] = (
-                        process.process_id
-                    )
-        if stale_generation:
-            self._experiments.detach_server(reservation_id, process.process_id)
-            raise RuntimeError("containing NWDAF process generation changed")
-
-        try:
-            process.state = FLServerState.PREPARATION_CREATING
-            for participant, target in zip(process.participants, targets, strict=True):
-                self._ensure_process_generation(process)
-                self._create_preparation(
-                    process,
-                    participant,
-                    model_interoperability,
-                    target.assignment_url,
-                )
-            self._ensure_process_generation(process)
-            process.state = FLServerState.PREPARATION_WAITING
-            logger.info(
-                "Hierarchy preparation dispatched plan_id=%s process_id=%s participants=%s",
-                plan_id,
-                process.process_id,
-                participant_ids,
-            )
-            return process
-        except Exception as error:
-            process.state = FLServerState.FAILED
-            process.failure = str(error)
-            self._cleanup_hierarchy_process(process)
-            if self._experiments.for_server_process(process.process_id) is not None:
-                self._experiments.detach_server(reservation_id, process.process_id)
-            with self._lock:
-                self._processes.pop(process.process_id, None)
-            raise
 
     def start_protocol_preparation(
         self,
@@ -798,13 +660,11 @@ class FLServerEngine:
             if not process.failure:
                 process.failure = reason
             process.condition.notify_all()
-        self.close_hierarchy_training(process_id, retain_for_adoption=False)
+        self.close_hierarchy_training(process_id)
 
     def close_hierarchy_training(
         self,
         process_id: str,
-        *,
-        retain_for_adoption: bool,
     ) -> None:
         with self._lock:
             process = self._processes.get(process_id)
@@ -820,18 +680,7 @@ class FLServerEngine:
                 process.process_id,
             )
         with self._lock:
-            if not retain_for_adoption:
-                self._processes.pop(process_id, None)
-            else:
-                # Adoption completion only needs the published model/family and
-                # Root observer; drop the completed Training procedure payload.
-                process.participants.clear()
-                process.hierarchy_active_scopes = ()
-                process.current_global_url = ""
-                process.current_global_artifact = None
-                process.candidate_url = ""
-                process.candidate_artifact = None
-                process.validation_summaries = ()
+            self._processes.pop(process_id, None)
 
     def receive_notification(self, notification: NwdafMLModelTrainNotif) -> None:
         with self._lock:
@@ -1081,17 +930,6 @@ class FLServerEngine:
                 HierarchyParticipantPreparationOutcome(
                     participant_nf_instance_id=item.candidate.target.nf_instance_id,
                     resource_location=item.resource_location,
-                    assignment_url=str(
-                        item.preparation_notification.ml_model_infos[0]
-                        .model_file_address.model_url
-                    )
-                    if (
-                        item.preparation_notification is not None
-                        and item.preparation_notification.ml_model_infos
-                        and item.preparation_notification.ml_model_infos[0].model_file_address
-                        is not None
-                    )
-                    else "",
                     notification=(
                         item.preparation_notification.model_copy(deep=True)
                         if item.preparation_notification is not None
@@ -1298,256 +1136,6 @@ class FLServerEngine:
             self.cancel_hierarchy_preparation(process.process_id, str(error))
             raise
 
-    def execute_hierarchy_validation(
-        self,
-        *,
-        process_id: str,
-        validation_round: int,
-        candidate: FLWorkspaceArtifact,
-        base_artifact: ArtifactMetadata,
-        expected_candidate_process_id: str,
-        expected_candidate_round: int,
-        expected_subordinates: dict[str, tuple[str, ...]] | None = None,
-        timeout_seconds: int | None = None,
-        state_observer: Callable[[FLServerState], None] | None = None,
-    ) -> HierarchyValidationCollection:
-        with self._lock:
-            process = self._processes.get(process_id)
-        if process is None or not process.hierarchy_plan_id:
-            raise KeyError(process_id)
-        if process.state is not FLServerState.READY:
-            raise RuntimeError("hierarchy Server process is not ready for final validation")
-        if validation_round < 0 or expected_candidate_round < 0:
-            raise ValueError("hierarchy validation rounds must be non-negative")
-        if not expected_candidate_process_id:
-            raise ValueError("hierarchy validation requires the candidate process identity")
-        if timeout_seconds is not None and timeout_seconds <= 0:
-            raise ValueError("hierarchy validation timeout must be positive")
-        timeout = min(
-            timeout_seconds or self._server_settings.round_timeout_seconds,
-            self._server_settings.round_timeout_seconds,
-        )
-        try:
-            self._validate_hierarchy_candidate(
-                candidate=candidate,
-                base_artifact=base_artifact,
-                expected_candidate_process_id=expected_candidate_process_id,
-                expected_candidate_round=expected_candidate_round,
-            )
-            self._set_hierarchy_state(
-                process,
-                FLServerState.FINAL_VALIDATION_DISPATCH,
-                state_observer,
-            )
-            process.candidate_url = candidate.url
-            for participant in process.participants:
-                self._raise_if_failed(process)
-                participant.expected_round = validation_round
-                participant.notification = None
-                participant.round_complete = False
-                participant.round_failure = ""
-                participant.delay_extensions = 0
-                participant.requested_extension = 0
-                participant.granted_extension_seconds = 0
-                self._patch_validation(
-                    process,
-                    participant,
-                    validation_round,
-                    candidate.url,
-                    timeout_seconds=timeout,
-                )
-            self._raise_if_failed(process)
-            self._set_hierarchy_state(
-                process,
-                FLServerState.FINAL_VALIDATION_WAITING,
-                state_observer,
-            )
-            try:
-                self._wait(
-                    process,
-                    lambda: all(item.round_complete for item in process.participants),
-                    timeout,
-                    collect_participant_failures=True,
-                )
-            except RuntimeError as error:
-                if str(error) == "federated stage deadline expired":
-                    timed_out = []
-                    for participant in process.participants:
-                        if not participant.round_complete:
-                            participant.round_failure = "validation deadline expired"
-                            participant.round_complete = True
-                            timed_out.append(
-                                participant.candidate.target.nf_instance_id
-                            )
-                    raise RuntimeError(
-                        "hierarchy validation deadline expired for participants: "
-                        + ",".join(timed_out)
-                    ) from error
-                raise
-            failed = [
-                item.candidate.target.nf_instance_id
-                for item in process.participants
-                if item.round_failure
-                or (
-                    item.notification is not None
-                    and item.notification.termination_request is not None
-                )
-            ]
-            if failed:
-                raise RuntimeError(
-                    "required hierarchy validation participants terminated: "
-                    + ",".join(failed)
-                )
-            self._set_hierarchy_state(
-                process,
-                FLServerState.FINAL_VALIDATION_EVALUATING,
-                state_observer,
-            )
-            return self._collect_hierarchy_validation(
-                process=process,
-                candidate=candidate,
-                base_artifact=base_artifact,
-                validation_round=validation_round,
-                expected_candidate_process_id=expected_candidate_process_id,
-                expected_candidate_round=expected_candidate_round,
-                expected_subordinates=expected_subordinates,
-            )
-        except Exception as error:
-            with process.condition:
-                process.state = FLServerState.FAILED
-                if not process.failure:
-                    process.failure = str(error)
-                process.condition.notify_all()
-            self.cancel_hierarchy_preparation(process.process_id, str(error))
-            raise
-
-    def finalize_hierarchy_candidate(
-        self,
-        *,
-        process_id: str,
-        validation_round: int,
-        candidate: FLWorkspaceArtifact,
-        base_artifact: ArtifactMetadata,
-        expected_subordinates: dict[str, tuple[str, ...]],
-        state_observer: Callable[[FLServerState], None] | None = None,
-    ) -> HierarchyFinalizationResult:
-        with self._lock:
-            process = self._processes.get(process_id)
-        if process is None or not process.hierarchy_plan_id:
-            raise KeyError(process_id)
-        if process.hierarchy_family_key is None:
-            raise RuntimeError("Root hierarchy process has no model family")
-        if self._publication is None:
-            raise RuntimeError("Root hierarchy publication owner is unavailable")
-        process.hierarchy_state_observer = state_observer
-        collection = self.execute_hierarchy_validation(
-            process_id=process_id,
-            validation_round=validation_round,
-            candidate=candidate,
-            base_artifact=base_artifact,
-            expected_candidate_process_id=process_id,
-            expected_candidate_round=validation_round - 1,
-            expected_subordinates=expected_subordinates,
-            state_observer=state_observer,
-        )
-        hierarchy_validation = HierarchyValidation(
-            plan_id=process.hierarchy_plan_id,
-            branches=collection.hierarchy_branches,
-        )
-        process.candidate_artifact = collection.candidate_artifact
-        process.validation_summaries = collection.validation_summaries
-        process.hierarchy_validation = hierarchy_validation
-        leaf_summaries = tuple(
-            summary
-            for branch in hierarchy_validation.branches
-            for summary in branch.subordinate_validation_summaries
-        )
-        self._evaluate_hierarchy_gate(process, leaf_summaries)
-        if (
-            self._server_settings.final_validation.enforce_performance_gate
-            and not process.gate_would_accept
-        ):
-            self._set_hierarchy_state(
-                process,
-                FLServerState.VALIDATION_REJECTED,
-                state_observer,
-            )
-            return HierarchyFinalizationResult(
-                state=process.state,
-                candidate_digest=candidate.digest,
-                published_model_id=None,
-                gate_would_accept=False,
-                gate_rejection_reasons=process.gate_rejection_reasons,
-            )
-
-        self._set_hierarchy_state(
-            process,
-            FLServerState.CANDIDATE_READY,
-            state_observer,
-        )
-        self._set_hierarchy_state(
-            process,
-            FLServerState.PUBLISHING,
-            state_observer,
-        )
-        current = self._catalog.current(process.hierarchy_family_key)
-        if current is None or current.artifact.key != base_artifact.key:
-            raise RuntimeError("catalog base changed before hierarchy publication")
-        published = self._publication.publish(
-            ValidatedCandidate(
-                process_id=process.process_id,
-                family_key=process.hierarchy_family_key,
-                base_artifact=base_artifact,
-                candidate_artifact=collection.candidate_artifact,
-                participants=tuple(
-                    ParticipantSampleCount(
-                        participantNfInstanceId=(
-                            participant.candidate.target.nf_instance_id
-                        ),
-                        sampleCount=participant.training_sample_count,
-                    )
-                    for participant in sorted(
-                        process.participants,
-                        key=lambda item: item.candidate.target.nf_instance_id,
-                    )
-                ),
-                validation_summaries=collection.validation_summaries,
-                required_scope_keys=tuple(
-                    item.scope_key for item in process.hierarchy_active_scopes
-                ),
-                gate_would_accept=bool(process.gate_would_accept),
-                gate_rejection_reasons=process.gate_rejection_reasons,
-                hierarchy_validation=hierarchy_validation,
-            )
-        )
-        process.published_model_id = published.model_id
-        required_scope_keys = tuple(
-            item.scope_key for item in process.hierarchy_active_scopes
-        )
-        self._policy.begin_generation(
-            process.hierarchy_family_key,
-            self._catalog.version_key_for_id(current.model_id),
-            published.version_key,
-            required_scope_keys,
-        )
-        if self._provision_notifications is not None:
-            self._provision_notifications.reconcile_family(process.hierarchy_family_key)
-        terminal_state = (
-            FLServerState.CUTOVER_PENDING
-            if required_scope_keys
-            else FLServerState.COMPLETE
-        )
-        self._set_hierarchy_state(process, terminal_state, state_observer)
-        if terminal_state is FLServerState.COMPLETE:
-            self._policy.complete_retrain(process.hierarchy_family_key)
-        return HierarchyFinalizationResult(
-            state=process.state,
-            candidate_digest=candidate.digest,
-            published_model_id=published.model_id,
-            gate_would_accept=bool(process.gate_would_accept),
-            gate_rejection_reasons=process.gate_rejection_reasons,
-        )
-
     def mark_scope_adopted(
         self,
         family_key: tuple[str, str],
@@ -1565,28 +1153,13 @@ class FLServerEngine:
                     item
                     for item in self._processes.values()
                     if item.published_model_id == model_id
-                    and (
-                        _flat_family_key(item) == family_key
-                        or item.hierarchy_family_key == family_key
-                    )
+                    and _flat_family_key(item) == family_key
                 ),
                 None,
             )
         if process is not None:
-            if process.hierarchy_plan_id:
-                process.state = FLServerState.COMPLETE
-                observer = process.hierarchy_state_observer
-                if observer is not None:
-                    try:
-                        observer(process.state)
-                    except Exception:
-                        logger.exception(
-                            "Failed to project hierarchy cutover completion process_id=%s",
-                            process.process_id,
-                        )
-            else:
-                process.state = FLServerState.COMPLETE
-                self._finish_experiment(process)
+            process.state = FLServerState.COMPLETE
+            self._finish_experiment(process)
         self._policy.complete_retrain(family_key)
         logger.info(
             "Federated model cutover complete model_id=%s family=%s",
@@ -2551,179 +2124,6 @@ class FLServerEngine:
             process.process_id,
             aggregate_base,
             aggregate_candidate,
-            process.gate_would_accept,
-            self._server_settings.final_validation.enforce_performance_gate,
-        )
-
-    def _collect_hierarchy_validation(
-        self,
-        *,
-        process: FLProcess,
-        candidate: FLWorkspaceArtifact,
-        base_artifact: ArtifactMetadata,
-        validation_round: int,
-        expected_candidate_process_id: str,
-        expected_candidate_round: int,
-        expected_subordinates: dict[str, tuple[str, ...]] | None,
-    ) -> HierarchyValidationCollection:
-        validated = self._validate_hierarchy_candidate(
-            candidate=candidate,
-            base_artifact=base_artifact,
-            expected_candidate_process_id=expected_candidate_process_id,
-            expected_candidate_round=expected_candidate_round,
-        )
-        candidate_artifact = validated.artifact
-        candidate_bundle = self._loader.load(candidate_artifact)
-
-        summaries: list[ValidationSummary] = []
-        hierarchy_branches: list[HierarchyBranchValidation] = []
-        for participant in process.participants:
-            notification = participant.notification
-            model_infos = notification.ml_model_infos if notification is not None else None
-            if (
-                notification is None
-                or model_infos is None
-                or len(model_infos) != 1
-                or model_infos[0].event != participant.scope.ml_event
-            ):
-                raise RuntimeError("participant final validation result is missing or invalid")
-            address = model_infos[0].model_file_address
-            if address is None or address.model_url is None:
-                raise RuntimeError("participant final validation result has no model URL")
-            artifact = self._workspace.download(
-                str(address.model_url),
-                process.process_id,
-                f"validation-{participant.candidate.target.nf_instance_id}",
-                owner_plan_id=process.hierarchy_plan_id or None,
-            )
-            bundle = self._loader.load(artifact)
-            contract = validate_fl_artifact(_artifact_projection(bundle.manifest))
-            if (
-                not isinstance(contract, RoundLocalArtifact)
-                or contract.result_type is not RoundLocalResultType.ACCURACY_CHECK
-                or not isinstance(contract.fl_metadata, RoundLocalAccuracyCheckMetadata)
-            ):
-                raise RuntimeError("participant returned a non-validation local artifact")
-            metadata = contract.fl_metadata
-            evaluation = metadata.evaluation
-            validate_model_compatibility(candidate_bundle, bundle)
-            if (
-                metadata.ml_corre_id != process.process_id
-                or metadata.round_ind != validation_round
-                or metadata.participant_nf_instance_id
-                != participant.candidate.target.nf_instance_id
-                or metadata.training_scope != participant.expected_training_scope
-                or evaluation.base.absolute_actual_sum <= 0
-                or evaluation.candidate.absolute_actual_sum <= 0
-            ):
-                raise RuntimeError(
-                    "participant final validation identity does not match assignment"
-                )
-            summary = ValidationSummary(
-                participant_nf_instance_id=metadata.participant_nf_instance_id,
-                training_scope=metadata.training_scope,
-                evaluation_sample_count=evaluation.evaluation_sample_count,
-                start_time=evaluation.start_time,
-                end_time=evaluation.end_time,
-                base=evaluation.base,
-                candidate=evaluation.candidate,
-            )
-            summaries.append(summary)
-            if expected_subordinates is None:
-                if metadata.subordinate_validation_summaries is not None:
-                    raise RuntimeError(
-                        "Leaf validation result must not contain subordinate evidence"
-                    )
-                continue
-            expected = expected_subordinates.get(metadata.participant_nf_instance_id)
-            subordinate = metadata.subordinate_validation_summaries
-            actual = tuple(
-                item.participant_nf_instance_id for item in subordinate or ()
-            )
-            if expected is None or subordinate is None or actual != expected:
-                raise RuntimeError(
-                    "Branch validation subordinate set does not match admission"
-                )
-            hierarchy_branches.append(
-                HierarchyBranchValidation(
-                    branch_nf_instance_id=metadata.participant_nf_instance_id,
-                    subordinate_validation_summaries=subordinate,
-                )
-            )
-        summaries.sort(key=lambda item: item.participant_nf_instance_id)
-        hierarchy_branches.sort(key=lambda item: item.branch_nf_instance_id)
-        if expected_subordinates is not None and set(expected_subordinates) != {
-            item.branch_nf_instance_id for item in hierarchy_branches
-        }:
-            raise RuntimeError("hierarchy validation does not cover every admitted Branch")
-        return HierarchyValidationCollection(
-            candidate_artifact=candidate_artifact,
-            validation_summaries=tuple(summaries),
-            hierarchy_branches=tuple(hierarchy_branches),
-        )
-
-    def _validate_hierarchy_candidate(
-        self,
-        *,
-        candidate: FLWorkspaceArtifact,
-        base_artifact: ArtifactMetadata,
-        expected_candidate_process_id: str,
-        expected_candidate_round: int,
-    ) -> _ValidatedHierarchyCandidate:
-        if not isinstance(candidate.contract, RoundGlobalArtifact):
-            raise RuntimeError("hierarchy final candidate is not a ROUND_GLOBAL artifact")
-        candidate_metadata = candidate.contract.fl_metadata
-        candidate_artifact = ArtifactMetadata(
-            key=candidate.digest,
-            size_bytes=candidate.path.stat().st_size,
-            path=candidate.path,
-            url=candidate.url,
-        )
-        base = self._loader.load(base_artifact)
-        candidate_bundle = self._loader.load(candidate_artifact)
-        if (
-            candidate_metadata.ml_corre_id != expected_candidate_process_id
-            or candidate_metadata.round_ind != expected_candidate_round
-        ):
-            raise RuntimeError("hierarchy final candidate identity does not match the plan")
-        validate_model_compatibility(base, candidate_bundle)
-        return _ValidatedHierarchyCandidate(
-            artifact=candidate_artifact,
-        )
-
-    def _evaluate_hierarchy_gate(
-        self,
-        process: FLProcess,
-        summaries: tuple[ValidationSummary, ...],
-    ) -> None:
-        if not summaries:
-            raise RuntimeError("hierarchy final validation has no Leaf evidence")
-        base_error = sum(item.base.absolute_error_sum for item in summaries)
-        base_actual = sum(item.base.absolute_actual_sum for item in summaries)
-        candidate_error = sum(item.candidate.absolute_error_sum for item in summaries)
-        candidate_actual = sum(item.candidate.absolute_actual_sum for item in summaries)
-        if base_actual <= 0 or candidate_actual <= 0:
-            raise RuntimeError("hierarchy final validation has a zero denominator")
-        reasons: list[str] = []
-        if candidate_error / candidate_actual >= base_error / base_actual:
-            reasons.append("aggregate_not_improved")
-        for summary in summaries:
-            regression = (wape(summary.candidate) or 0.0) - (
-                wape(summary.base) or 0.0
-            )
-            if regression > self._server_settings.final_validation.max_scope_wape_regression:
-                reasons.append(
-                    "scope_regression_exceeded:"
-                    f"{summary.participant_nf_instance_id}"
-                )
-        process.gate_would_accept = not reasons
-        process.gate_rejection_reasons = tuple(reasons)
-        logger.info(
-            "Hierarchy final validation evaluated process_id=%s "
-            "base_wape=%s candidate_wape=%s gate_would_accept=%s enforced=%s",
-            process.process_id,
-            base_error / base_actual,
-            candidate_error / candidate_actual,
             process.gate_would_accept,
             self._server_settings.final_validation.enforce_performance_gate,
         )

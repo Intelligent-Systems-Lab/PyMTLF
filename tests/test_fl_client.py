@@ -17,12 +17,6 @@ from py_mtlf.config import (
 )
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJobState
-from py_mtlf.core.fl_artifacts import HierarchyAssignmentArtifact
-from py_mtlf.core.fl_branch import (
-    BranchPreparationExecution,
-    FLBranchPreparationCoordinator,
-)
-from py_mtlf.core.fl_candidate_orchestration import ClientLocalWork
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
     FLClientEngine,
@@ -31,12 +25,9 @@ from py_mtlf.core.fl_client import (
     _termination,
 )
 from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
-from py_mtlf.core.fl_hierarchy import HierarchyMessageType, PreparationOutcome
-from py_mtlf.core.fl_server import HierarchyValidationCollection
 from py_mtlf.core.fl_workspace import (
     DownloadedArchive,
     ValidatedArchive,
-    ValidatedHierarchyArtifact,
 )
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
@@ -296,58 +287,6 @@ def round_global_bundle():
     return Mock(manifest=manifest, model=model)
 
 
-def hierarchy_assignment(tmp_path, *, branch: bool) -> ValidatedHierarchyArtifact:
-    root_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    hierarchy_metadata = {
-        "message_type": (
-            HierarchyMessageType.BRANCH_ASSIGNMENT
-            if branch
-            else HierarchyMessageType.LEAF_ASSIGNMENT
-        ),
-        "plan_id": "11111111-1111-4111-8111-111111111111",
-        "publisher_nf_instance_id": root_id if branch else branch_id,
-        "intended_recipient_nf_instance_id": branch_id if branch else leaf_id,
-        "strategy": {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
-    }
-    if branch:
-        hierarchy_metadata.update(
-            {
-                "assigned_leaf_nf_instance_ids": [leaf_id],
-                "admission": {"mode": "complete_required"},
-            }
-        )
-    else:
-        hierarchy_metadata["parent_branch_nf_instance_id"] = branch_id
-    contract = HierarchyAssignmentArtifact.model_validate(
-        {
-            "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "hierarchy_metadata": hierarchy_metadata,
-        }
-    )
-    path = tmp_path / ("branch-assignment.tar.gz" if branch else "leaf-assignment.tar.gz")
-    path.write_bytes(b"assignment")
-    return ValidatedHierarchyArtifact(
-        metadata=ArtifactMetadata(
-            key="a" * 64,
-            size_bytes=path.stat().st_size,
-            path=path,
-            url="http://parent.example/assignment.tar.gz",
-        ),
-        manifest={
-            "analytics_event": "UE_COMMUNICATION",
-            "model_interoperability": "001122",
-        },
-        contract=contract,
-    )
-
-
 def test_create_admits_before_async_adrf_preparation(tmp_path):
     datasets = Mock()
     datasets.submit_external.return_value = "dataset-job-1"
@@ -500,6 +439,61 @@ def test_protocol_leaf_preparation_reports_ready_without_model_or_dataset_read(t
     finally:
         service.close()
         client.close()
+
+
+def test_protocol_preparation_with_model_reference_refuses_hierarchy_feature(
+    tmp_path,
+):
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    workspace = Mock()
+    branch = Mock()
+    settings = FLClientSettings(
+        workload={"profile": "image_classification"},
+        training_data={
+            "collection_trigger": "local",
+            "dataset": "mnist",
+            "shard_path": str(tmp_path / "leaf.npz"),
+        },
+        model_interoperability_ids=("pymtlf-image-classification-mnist",),
+    )
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        settings,
+        NotificationSettings(),
+        context,
+        Mock(),
+        workspace,
+        branch_coordinator=branch,
+        round_model_distribution=Mock(),
+    )
+    payload = protocol_leaf_preparation_payload()
+    payload["mLModelInfos"] = [
+        {
+            "event": "X_IMAGE_CLASSIFICATION",
+            "mLFileAddr": {"mLModelUrl": "http://legacy.example/assignment.tar.gz"},
+        }
+    ]
+    try:
+        resource = service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+
+        assert resource.state is FLClientState.READY
+        assert resource.representation.supported_features == ""
+        assert workspace.method_calls == []
+        branch.prepare_protocol.assert_not_called()
+    finally:
+        service.close()
 
 
 def test_protocol_intermediate_accepts_image_round_without_local_training_config(
@@ -1536,346 +1530,6 @@ def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
         datasets.shutdown()
 
 
-@pytest.mark.parametrize("scope_available", [True, False], ids=("ready", "missing"))
-def test_leaf_assignment_binds_plan_before_local_data_preparation(
-    tmp_path,
-    scope_available,
-):
-    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    plan_id = "11111111-1111-4111-8111-111111111111"
-    assignment_url = "http://branch.example/artifacts/" + "a" * 64
-    payload = preparation_payload()
-    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment_url
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    contract = HierarchyAssignmentArtifact.model_validate(
-        {
-            "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "hierarchy_metadata": {
-                "message_type": HierarchyMessageType.LEAF_ASSIGNMENT,
-                "plan_id": plan_id,
-                "publisher_nf_instance_id": branch_id,
-                "intended_recipient_nf_instance_id": leaf_id,
-                "parent_branch_nf_instance_id": branch_id,
-                "strategy": {
-                    "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-                    "participant_selection": "all",
-                    "waiting_policy": "all",
-                    "aggregation": "sample_weighted",
-                },
-            },
-        }
-    )
-    generic_path = tmp_path / "generic-assignment.tar.gz"
-    generic_path.write_bytes(b"validated archive")
-    generic = ArtifactMetadata(
-        key="a" * 64,
-        size_bytes=generic_path.stat().st_size,
-        path=generic_path,
-        url=assignment_url,
-    )
-    admitted_path = tmp_path / "admitted-assignment.tar.gz"
-    admitted_path.write_bytes(b"admitted archive")
-    admitted_metadata = ArtifactMetadata(
-        key="a" * 64,
-        size_bytes=admitted_path.stat().st_size,
-        path=admitted_path,
-        url=assignment_url,
-    )
-    manifest = {
-        "analytics_event": "UE_COMMUNICATION",
-        "model_interoperability": "001122",
-    }
-    admitted = ValidatedHierarchyArtifact(
-        metadata=admitted_metadata,
-        manifest=manifest,
-        contract=contract,
-    )
-    workspace = Mock()
-    workspace.download_archive.return_value = DownloadedArchive(
-        metadata=generic,
-        validated=ValidatedArchive(manifest=manifest, contract=contract),
-    )
-    workspace.admit_assignment.return_value = admitted
-    context_client = Mock()
-    context_client.get.return_value = NwdafContext(
-        nf_instance_id=leaf_id,
-        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
-        api_root="http://leaf.example",
-        internal_api_root="http://leaf-internal.example",
-        ml_analytics_capabilities=(
-            MLAnalyticsCapability(
-                ml_analytics_ids=("UE_COMMUNICATION",),
-                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
-            ),
-        ),
-    )
-    datasets = Mock()
-    datasets.submit_external.return_value = "dataset-job-1"
-    if not scope_available:
-        datasets.validate_external_scope.side_effect = RuntimeError(
-            "scope has no usable training-data descriptor"
-        )
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        context_client,
-        datasets,
-        workspace,
-        experiments=registry,
-    )
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.PREPARING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        experiment_reservation_id=reservation.reservation_id,
-    )
-    service._resources[resource.subscription_id] = resource
-    service._loader = Mock()
-    service._enqueue_delivery = Mock()
-    service._loader.load.return_value.manifest = manifest
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_preparation(
-            resource.subscription_id,
-            resource.revision,
-            Mock(),
-            Mock(),
-        )
-
-        active = registry.active()
-        updated = service.get(resource.subscription_id)
-        assert active is not None
-        assert active.plan_id == plan_id
-        assert active.assigned_role is ExperimentRole.LEAF
-        assert updated.hierarchy_assignment == admitted
-        assert updated.preparation_base_artifact == admitted_metadata
-        if scope_available:
-            datasets.submit_external.assert_called_once()
-        else:
-            assert updated.state is FLClientState.FAILED
-            assert "no usable training-data descriptor" in updated.last_error
-            datasets.submit_external.assert_not_called()
-            notification = service._enqueue_delivery.call_args.args[1]
-            assert notification.termination_request == "NOT_AVAILABLE_ML_TRAIN"
-        workspace.download_archive.assert_called_once_with(
-            assignment_url,
-            value.ml_correlation_id,
-            "preparation-base",
-        )
-        workspace.admit_assignment.assert_called_once_with(
-            workspace.download_archive.return_value,
-            intended_recipient_nf_instance_id=leaf_id,
-        )
-        workspace.claim_artifact.assert_not_called()
-    finally:
-        service.close()
-
-
-def test_hierarchy_assignment_bind_failure_releases_adopted_plan_artifact(tmp_path):
-    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    assignment = hierarchy_assignment(tmp_path, branch=False)
-    metadata = assignment.contract.hierarchy_metadata
-    payload = preparation_payload()
-    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment.metadata.url
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    workspace = Mock()
-    workspace.download_archive.return_value = DownloadedArchive(
-        metadata=assignment.metadata,
-        validated=ValidatedArchive(
-            manifest=assignment.manifest,
-            contract=assignment.contract,
-        ),
-    )
-    workspace.admit_assignment.return_value = assignment
-    context = Mock()
-    context.get.return_value = NwdafContext(
-        nf_instance_id=leaf_id,
-        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
-        api_root="http://leaf.example",
-        internal_api_root="http://leaf-internal.example",
-        ml_analytics_capabilities=(
-            MLAnalyticsCapability(
-                ml_analytics_ids=("UE_COMMUNICATION",),
-                fl_capability_type=FLCapabilityType.CLIENT,
-            ),
-        ),
-    )
-    experiments = Mock()
-    experiments.bind_plan.side_effect = RuntimeError("plan is unavailable")
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        context,
-        Mock(),
-        workspace,
-        experiments=experiments,
-    )
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.PREPARING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        experiment_reservation_id="reservation-1",
-    )
-    service._resources[resource.subscription_id] = resource
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_preparation(resource.subscription_id, resource.revision, Mock(), Mock())
-
-        assert service.get(resource.subscription_id).state is FLClientState.FAILED
-        workspace.release_plan.assert_called_once_with(metadata.plan_id)
-        service._enqueue_delivery.assert_called_once()
-    finally:
-        service.close()
-
-
-@pytest.mark.parametrize(
-    ("branch_outcome", "expected_termination"),
-    [
-        (PreparationOutcome.READY, None),
-        (PreparationOutcome.FAILED, "NOT_AVAILABLE_ML_TRAIN"),
-    ],
-)
-def test_branch_assignment_binds_plan_and_dispatches_without_local_dataset(
-    tmp_path,
-    branch_outcome,
-    expected_termination,
-):
-    root_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    branch_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    leaf_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    plan_id = "11111111-1111-4111-8111-111111111111"
-    assignment_url = "http://root.example/artifacts/" + "a" * 64
-    payload = preparation_payload()
-    payload["mLModelInfos"][0]["mLFileAddr"]["mLModelUrl"] = assignment_url
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    contract = HierarchyAssignmentArtifact.model_validate(
-        {
-            "artifact_role": "HIERARCHY_ASSIGNMENT",
-            "hierarchy_metadata": {
-                "message_type": HierarchyMessageType.BRANCH_ASSIGNMENT,
-                "plan_id": plan_id,
-                "publisher_nf_instance_id": root_id,
-                "intended_recipient_nf_instance_id": branch_id,
-                "assigned_leaf_nf_instance_ids": [leaf_id],
-                "admission": {"mode": "complete_required"},
-                "strategy": {
-                    "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-                    "participant_selection": "all",
-                    "waiting_policy": "all",
-                    "aggregation": "sample_weighted",
-                },
-            },
-        }
-    )
-    generic_path = tmp_path / "generic-branch.tar.gz"
-    generic_path.write_bytes(b"generic")
-    admitted_path = tmp_path / "admitted-branch.tar.gz"
-    admitted_path.write_bytes(b"admitted")
-    generic = ArtifactMetadata(
-        key="a" * 64,
-        size_bytes=generic_path.stat().st_size,
-        path=generic_path,
-        url=assignment_url,
-    )
-    admitted = ValidatedHierarchyArtifact(
-        metadata=ArtifactMetadata(
-            key="a" * 64,
-            size_bytes=admitted_path.stat().st_size,
-            path=admitted_path,
-            url=assignment_url,
-        ),
-        manifest={
-            "analytics_event": "UE_COMMUNICATION",
-            "model_interoperability": "001122",
-        },
-        contract=contract,
-    )
-    workspace = Mock()
-    workspace.download_archive.return_value = DownloadedArchive(
-        metadata=generic,
-        validated=ValidatedArchive(manifest=admitted.manifest, contract=contract),
-    )
-    workspace.admit_assignment.return_value = admitted
-    context = Mock()
-    context.get.return_value = NwdafContext(
-        nf_instance_id=branch_id,
-        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
-        api_root="http://branch.example",
-        internal_api_root="http://branch-internal.example",
-        ml_analytics_capabilities=(
-            MLAnalyticsCapability(
-                ml_analytics_ids=("UE_COMMUNICATION",),
-                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
-            ),
-        ),
-    )
-    datasets = Mock()
-    branch = Mock()
-    branch.prepare.return_value = Mock(
-        execution=Mock(process_id="lower-process"),
-        artifact=Mock(url="http://branch.example/preparation-result"),
-        outcome=branch_outcome,
-    )
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        context,
-        datasets,
-        workspace,
-        experiments=registry,
-        branch_coordinator=branch,
-    )
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.PREPARING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        experiment_reservation_id=reservation.reservation_id,
-    )
-    service._resources[resource.subscription_id] = resource
-    service._loader = Mock()
-    service._enqueue_delivery = Mock()
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_preparation(resource.subscription_id, resource.revision, Mock(), Mock())
-
-        active = registry.active()
-        updated = service.get(resource.subscription_id)
-        assert active is not None
-        assert active.plan_id == plan_id
-        assert active.assigned_role is ExperimentRole.BRANCH
-        assert updated.branch_process_id == "lower-process"
-        assert updated.hierarchy_assignment == admitted
-        assert updated.preparation_base_artifact == admitted.metadata
-        branch.prepare.assert_called_once_with(
-            assignment=admitted,
-            representation=value,
-            reservation_id=reservation.reservation_id,
-        )
-        datasets.validate_external_scope.assert_not_called()
-        datasets.submit_external.assert_not_called()
-        service._loader.load.assert_not_called()
-        notification = service._enqueue_delivery.call_args.args[1]
-        assert notification.termination_request == expected_termination
-        assert (
-            str(notification.ml_model_infos[0].model_file_address.model_url)
-            == "http://branch.example/preparation-result"
-        )
-    finally:
-        service.close()
-
-
 def test_preparation_rejects_base_bundle_with_different_interoperability(tmp_path):
     datasets = Mock()
     workspace = Mock()
@@ -2058,19 +1712,12 @@ def test_accuracy_check_patch_enters_validation_without_training(tmp_path):
         service.close()
 
 
-@pytest.mark.parametrize("hierarchy_leaf", [False, True])
 def test_final_validation_uses_configured_training_device(
     tmp_path,
     monkeypatch,
-    hierarchy_leaf,
 ):
     nwdaf_context = Mock()
-    assignment = hierarchy_assignment(tmp_path, branch=False) if hierarchy_leaf else None
-    nwdaf_context.get.return_value.nf_instance_id = (
-        assignment.contract.hierarchy_metadata.intended_recipient_nf_instance_id
-        if assignment is not None
-        else "participant-a"
-    )
+    nwdaf_context.get.return_value.nf_instance_id = "participant-a"
     workspace = Mock()
     workspace.download.return_value = Mock()
     workspace.publish.return_value.url = "http://client.example/validation.tar.gz"
@@ -2111,13 +1758,10 @@ def test_final_validation_uses_configured_training_device(
         dataset_snapshot=snapshot,
         prepared_training_sample_count=10,
         preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
     )
     service._resources[resource.subscription_id] = resource
     candidate = round_global_bundle()
     base = candidate
-    if hierarchy_leaf:
-        candidate.manifest["fl_metadata"]["ml_corre_id"] = "root-process"
     candidate.scaler = Mock()
     service._loader = Mock()
     service._loader.load.side_effect = [base, candidate]
@@ -2398,509 +2042,6 @@ def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):
         else:
             raise AssertionError("conflicting duplicate round was accepted")
     finally:
-        service.close()
-
-
-@pytest.mark.parametrize("stale_before_callback", [False, True])
-def test_image_branch_round_delegates_without_local_dataset_or_training(
-    tmp_path,
-    stale_before_callback,
-):
-    payload = preparation_payload()
-    payload.update(
-        {
-            "mLPreFlag": False,
-            "roundInd": 2,
-            "mLModelInfos": [
-                {
-                    "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://root.example/round-input.tar.gz"
-                    },
-                }
-            ],
-        }
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    base = round_input_bundle(epochs=7)
-    assignment = hierarchy_assignment(tmp_path, branch=True)
-    workspace = Mock()
-    workspace.download.return_value = Mock(key="4" * 64)
-    branch = Mock()
-    branch.execute_round.return_value = Mock(
-        url="http://branch.example/hierarchy-aggregate.tar.gz"
-    )
-    branch_client_settings = FLClientSettings(
-        workload={"profile": "image_classification"},
-        model_interoperability_ids=("001122",),
-    )
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        branch_client_settings,
-        NotificationSettings(),
-        Mock(),
-        Mock(),
-        workspace,
-        branch_coordinator=branch,
-    )
-    service._loader = Mock()
-    service._loader.load.return_value = base
-    service._dataset_builder = Mock()
-    service._trainer = Mock()
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.ROUND_RUNNING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
-    )
-    service._resources[resource.subscription_id] = resource
-    if stale_before_callback:
-        def retire_resource(**_kwargs):
-            service._resources.pop(resource.subscription_id)
-            return Mock(url="http://branch.example/hierarchy-aggregate.tar.gz")
-
-        branch.execute_round.side_effect = retire_resource
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_round(resource.subscription_id, resource.revision)
-
-        branch.execute_round.assert_called_once_with(
-            assignment=assignment,
-            representation=value,
-            upper_input=base,
-            upper_client_subscription_id=resource.subscription_id,
-            upper_resource_revision=resource.revision,
-            upper_input_artifact_digest="4" * 64,
-            upper_training_scope=resource.scope,
-            callback_margin_seconds=branch_client_settings.callback_deadline_margin_seconds,
-        )
-        service._dataset_builder.build.assert_not_called()
-        service._trainer.train.assert_not_called()
-        if stale_before_callback:
-            service._enqueue_delivery.assert_not_called()
-            return
-        notification = service._enqueue_delivery.call_args.args[1]
-        assert notification.round_indicator == 2
-        assert (
-            str(notification.ml_model_infos[0].model_file_address.model_url)
-            == "http://branch.example/hierarchy-aggregate.tar.gz"
-        )
-    finally:
-        service.close()
-
-
-@pytest.mark.parametrize("delete_during_validation", [False, True])
-def test_branch_validation_delegates_without_local_dataset_or_local_metrics(
-    tmp_path,
-    delete_during_validation,
-):
-    payload = preparation_payload()
-    payload.update(
-        {
-            "mLPreFlag": False,
-            "mLAccChkFlg": True,
-            "skipFlInd": True,
-            "roundInd": 2,
-            "mLModelInfos": [
-                {
-                    "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://root.example/round-global.tar.gz"
-                    },
-                }
-            ],
-        }
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    candidate = round_global_bundle()
-    base = Mock(manifest=candidate.manifest, model=candidate.model)
-    assignment = hierarchy_assignment(tmp_path, branch=True)
-    candidate_artifact = Mock(key="4" * 64)
-    workspace = Mock()
-    workspace.download.return_value = candidate_artifact
-    branch = Mock()
-    branch.execute_validation.return_value = Mock(
-        url="http://branch.example/validation-result.tar.gz"
-    )
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        Mock(),
-        Mock(),
-        workspace,
-        branch_coordinator=branch,
-    )
-    service._loader = Mock()
-    service._loader.load.side_effect = [base, candidate]
-    service._dataset_builder = Mock()
-    service._trainer = Mock()
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.VALIDATION_RUNNING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
-    )
-    service._resources[resource.subscription_id] = resource
-    dispatched_revision = resource.revision
-    if delete_during_validation:
-        assert service._outbox_capacity.acquire(blocking=False)
-
-        def delete_parent(**_kwargs):
-            service.delete(resource.subscription_id)
-            return Mock(url="http://branch.example/validation-result.tar.gz")
-
-        branch.execute_validation.side_effect = delete_parent
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_validation(resource.subscription_id, dispatched_revision)
-
-        branch.execute_validation.assert_called_once_with(
-            assignment=assignment,
-            representation=value,
-            upper_candidate=candidate,
-            upper_candidate_artifact=candidate_artifact,
-            upper_client_subscription_id=resource.subscription_id,
-            upper_resource_revision=dispatched_revision,
-            upper_training_scope=resource.scope,
-            callback_margin_seconds=client_settings().callback_deadline_margin_seconds,
-        )
-        service._dataset_builder.build.assert_not_called()
-        service._trainer.train.assert_not_called()
-        if delete_during_validation:
-            service._enqueue_delivery.assert_not_called()
-            assert resource.subscription_id not in service._resources
-            return
-        notification = service._enqueue_delivery.call_args.args[1]
-        assert notification.round_indicator == 2
-        assert (
-            str(notification.ml_model_infos[0].model_file_address.model_url)
-            == "http://branch.example/validation-result.tar.gz"
-        )
-    finally:
-        service.close()
-
-
-def test_parent_delete_cancels_real_branch_validation_and_fences_callback(tmp_path):
-    payload = preparation_payload()
-    payload.update(
-        {
-            "mLPreFlag": False,
-            "mLAccChkFlg": True,
-            "skipFlInd": True,
-            "roundInd": 2,
-            "mLModelInfos": [
-                {
-                    "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://root.example/round-global.tar.gz"
-                    },
-                }
-            ],
-        }
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    candidate = round_global_bundle()
-    base = Mock(manifest=candidate.manifest, model=candidate.model)
-    assignment = hierarchy_assignment(tmp_path, branch=True)
-    metadata = assignment.contract.hierarchy_metadata
-    plan_id = metadata.plan_id
-    candidate_artifact = Mock(key="4" * 64)
-    republished = Mock(
-        url="http://branch.example/validation-candidate.tar.gz",
-        digest="4" * 64,
-    )
-    lower_started = threading.Event()
-    release_lower = threading.Event()
-    server = Mock()
-
-    def execute_lower(**_kwargs):
-        lower_started.set()
-        if not release_lower.wait(1):
-            raise AssertionError("test did not release the lower validation")
-        return HierarchyValidationCollection(
-            candidate_artifact=candidate_artifact,
-            validation_summaries=(),
-        )
-
-    def cancel_lower(_process_id, _reason):
-        release_lower.set()
-
-    server.execute_hierarchy_validation.side_effect = execute_lower
-    server.cancel_hierarchy_preparation.side_effect = cancel_lower
-    artifacts = Mock()
-    artifacts.republish_validation_candidate.return_value = republished
-    context = Mock()
-    context.get.return_value = NwdafContext(
-        nf_instance_id=metadata.intended_recipient_nf_instance_id,
-        containing_nwdaf_process_instance_id="22222222-2222-4222-8222-222222222222",
-        api_root="http://branch.example",
-        internal_api_root="http://branch-internal.example",
-        ml_analytics_capabilities=(
-            MLAnalyticsCapability(
-                ml_analytics_ids=("UE_COMMUNICATION",),
-                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
-            ),
-        ),
-    )
-    branch = FLBranchPreparationCoordinator(
-        resolver=Mock(),
-        nwdaf_context=context,
-        artifact_service=artifacts,
-        server=server,
-    )
-    branch._executions[plan_id] = BranchPreparationExecution(
-        plan_id=plan_id,
-        parent_assignment=assignment,
-        leaf_nodes=(Mock(),),
-        leaf_assignments=(Mock(),),
-        process_id="lower-process",
-    )
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_client("resource-1", value.ml_correlation_id or "")
-    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.BRANCH)
-    workspace = Mock()
-    workspace.download.return_value = candidate_artifact
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        Mock(),
-        Mock(),
-        workspace,
-        experiments=registry,
-        branch_coordinator=branch,
-    )
-    service._loader = Mock()
-    service._loader.load.side_effect = [base, candidate]
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.VALIDATION_RUNNING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
-        experiment_reservation_id=reservation.reservation_id,
-    )
-    service._resources[resource.subscription_id] = resource
-    assert service._capacity.acquire(blocking=False)
-    assert service._outbox_capacity.acquire(blocking=False)
-    thread = threading.Thread(
-        target=service._run_validation,
-        args=(resource.subscription_id, resource.revision),
-    )
-    thread.start()
-    try:
-        assert lower_started.wait(1) is True
-        service.delete(resource.subscription_id)
-        thread.join(timeout=1)
-
-        assert not thread.is_alive()
-        assert resource.subscription_id not in service._resources
-        assert registry.active() is None
-        assert (plan_id, value.ml_correlation_id, value.round_indicator) not in (
-            branch._validations
-        )
-        artifacts.publish_hierarchy_validation_result.assert_not_called()
-        service._enqueue_delivery.assert_not_called()
-        server.cancel_hierarchy_preparation.assert_called_once_with(
-            "lower-process",
-            "parent cancelled preparation",
-        )
-    finally:
-        release_lower.set()
-        thread.join(timeout=1)
-        service.close()
-        branch.close()
-
-
-@pytest.mark.parametrize(
-    ("local_work", "expected_epochs", "expected_proximal_mu"),
-    [
-        (None, 7, 0.01),
-        (ClientLocalWork(epochs=3, proximal_mu=0), 3, 0),
-    ],
-)
-def test_leaf_round_uses_resolved_or_legacy_local_work(
-    tmp_path,
-    local_work,
-    expected_epochs,
-    expected_proximal_mu,
-):
-    payload = preparation_payload()
-    payload.update(
-        {
-            "mLPreFlag": False,
-            "roundInd": 2,
-            "mLModelInfos": [
-                {
-                    "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://branch.example/round-input.tar.gz"
-                    },
-                }
-            ],
-        }
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    base = round_input_bundle(epochs=7)
-    assignment = hierarchy_assignment(tmp_path, branch=False)
-    workspace = Mock()
-    workspace.download.return_value = Mock()
-    workspace.publish.return_value = Mock(url="http://leaf.example/local.tar.gz")
-    context = Mock()
-    context.get.return_value.nf_instance_id = (
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    )
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        context,
-        Mock(),
-        workspace,
-    )
-    service._loader = Mock()
-    service._loader.load.return_value = base
-    dataset = round_training_dataset()
-    service._dataset_builder = Mock()
-    service._dataset_builder.build.return_value = dataset
-    result_model = torch.nn.Linear(2, 1)
-    service._trainer = Mock()
-    service._trainer.train.return_value = Mock(
-        model=result_model,
-        training_sample_count=10,
-    )
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.ROUND_RUNNING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        dataset_snapshot=Mock(),
-        prepared_training_sample_count=10,
-        preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
-        client_local_work=local_work,
-    )
-    service._resources[resource.subscription_id] = resource
-    assert service._capacity.acquire(blocking=False)
-    try:
-        service._run_round(resource.subscription_id, resource.revision)
-
-        service._trainer.train.assert_called_once_with(
-            base,
-            dataset,
-            epochs=expected_epochs,
-            proximal_mu=expected_proximal_mu,
-        )
-        metadata = workspace.publish.call_args.kwargs["metadata"]
-        assert metadata["fl_metadata"]["training_sample_count"] == 10
-        notification = service._enqueue_delivery.call_args.args[1]
-        assert notification.round_indicator == 2
-    finally:
-        service.close()
-
-
-def test_go_generation_reset_drops_leaf_result_published_during_abort(tmp_path):
-    payload = preparation_payload()
-    payload.update(
-        {
-            "mLPreFlag": False,
-            "roundInd": 2,
-            "mLModelInfos": [
-                {
-                    "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://branch.example/round-input.tar.gz"
-                    },
-                }
-            ],
-        }
-    )
-    value = NwdafMLModelTrainSubsc.model_validate(payload)
-    base = round_input_bundle(epochs=1)
-    assignment = hierarchy_assignment(tmp_path, branch=False)
-    plan_id = assignment.contract.hierarchy_metadata.plan_id
-    registry = FLExperimentRegistry()
-    reservation = registry.reserve_client("resource-1", value.ml_correlation_id)
-    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.LEAF)
-    publish_started = threading.Event()
-    allow_publish = threading.Event()
-    workspace = Mock()
-    workspace.download.return_value = Mock()
-
-    def publish_during_abort(**_kwargs):
-        publish_started.set()
-        assert allow_publish.wait(1)
-        return Mock(url="http://leaf.example/local.tar.gz")
-
-    workspace.publish.side_effect = publish_during_abort
-    context = Mock()
-    context.get.return_value.nf_instance_id = (
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    )
-    service = FLClientEngine(
-        fl_settings(tmp_path),
-        client_settings(),
-        NotificationSettings(),
-        context,
-        Mock(),
-        workspace,
-        experiments=registry,
-    )
-    service._loader = Mock()
-    service._loader.load.return_value = base
-    service._dataset_builder = Mock(build=Mock(return_value=round_training_dataset()))
-    service._trainer = Mock(
-        train=Mock(
-            return_value=Mock(
-                model=torch.nn.Linear(2, 1),
-                training_sample_count=10,
-            )
-        )
-    )
-    service._enqueue_delivery = Mock()
-    resource = FLClientResource(
-        subscription_id="resource-1",
-        representation=value,
-        state=FLClientState.ROUND_RUNNING,
-        scope=TrainingScopeDescriptor.from_training_request(value, 0),
-        dataset_snapshot=Mock(),
-        prepared_training_sample_count=10,
-        preparation_base_artifact=Mock(),
-        hierarchy_assignment=assignment,
-        experiment_reservation_id=reservation.reservation_id,
-    )
-    service._resources[resource.subscription_id] = resource
-    assert service._capacity.acquire(blocking=False)
-    assert service._outbox_capacity.acquire(blocking=False)
-    thread = threading.Thread(
-        target=service._run_round,
-        args=(resource.subscription_id, resource.revision),
-    )
-    thread.start()
-    assert publish_started.wait(1)
-
-    service.abort_generation("containing NWDAF process generation changed")
-    allow_publish.set()
-    thread.join(timeout=1)
-
-    try:
-        assert thread.is_alive() is False
-        service._enqueue_delivery.assert_not_called()
-        workspace.release_plan.assert_called_once_with(plan_id)
-        assert service._capacity.acquire(blocking=False)
-        service._capacity.release()
-    finally:
-        registry.reset_generation()
         service.close()
 
 
