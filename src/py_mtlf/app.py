@@ -299,14 +299,13 @@ def create_app(
         else None
     )
     topology_settings = settings.federated_learning.topology
-    strategy_settings = settings.federated_learning.strategy
     fl_coordinator = None
     fl_root = None
     if orchestration_settings is not None:
         if fl_server is None or fl_server_settings is None:
             raise RuntimeError("validated orchestration configuration is incomplete")
         if orchestration_settings.mode == "hierarchical":
-            if topology_settings is None or strategy_settings is None:
+            if topology_settings is None:
                 raise RuntimeError("validated hierarchy configuration is incomplete")
             topology_planner = StaticTopologyPlanner.load(topology_settings.config_file)
             hierarchy_resolver = HierarchyNodeResolver(
@@ -314,7 +313,6 @@ def create_app(
                 nwdaf_context,
             )
             fl_root = FLRootCoordinator(
-                strategy=strategy_settings,
                 server_settings=fl_server_settings,
                 planner=topology_planner,
                 resolver=hierarchy_resolver,

@@ -1,5 +1,4 @@
 import re
-from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -516,25 +515,6 @@ class FLServerSettings(FrozenSettings):
         return value
 
 
-class FedProxAlgorithmSettings(FrozenSettings):
-    name: Literal["fedprox"]
-    proximal_mu: float = Field(gt=0)
-
-    @field_validator("proximal_mu")
-    @classmethod
-    def validate_proximal_mu(cls, value: float) -> float:
-        if not isfinite(value):
-            raise ValueError("federated_learning.strategy.algorithm.proximal_mu must be finite")
-        return value
-
-
-class FederatedStrategySettings(FrozenSettings):
-    algorithm: FedProxAlgorithmSettings
-    participant_selection: Literal["all"]
-    waiting_policy: Literal["all"]
-    aggregation: Literal["sample_weighted"]
-
-
 class TopologySettings(FrozenSettings):
     strategy: Literal["static"]
     config_file: Path
@@ -590,7 +570,6 @@ class FederatedLearningSettings(FrozenSettings):
     server: FLServerSettings | None = None
     client: FLClientSettings | None = None
     orchestration: OrchestrationSettings | None = None
-    strategy: FederatedStrategySettings | None = None
     topology: TopologySettings | None = None
     training_trigger: TrainingTriggerSettings = TrainingTriggerSettings()
     lifecycle: FLLifecycleSettings = FLLifecycleSettings()
@@ -617,9 +596,9 @@ class FederatedLearningSettings(FrozenSettings):
                 raise ValueError(
                     "server-only federated profile requires autonomous orchestration"
                 )
-            if self.topology is not None or self.strategy is not None:
+            if self.topology is not None:
                 raise ValueError(
-                    "topology and strategy require federated_learning.orchestration"
+                    "topology requires federated_learning.orchestration"
                 )
             if degradation_enabled or private_api_enabled:
                 raise ValueError(
@@ -631,8 +610,6 @@ class FederatedLearningSettings(FrozenSettings):
         if not degradation_enabled and not private_api_enabled:
             raise ValueError("autonomous orchestration requires at least one training trigger")
         if orchestration.mode == "flat":
-            if self.strategy is not None:
-                raise ValueError("flat orchestration must not configure hierarchy strategy")
             if orchestration.participant_source == "monitor_scopes":
                 if self.topology is not None:
                     raise ValueError("flat monitor_scopes must not configure topology")
@@ -647,8 +624,6 @@ class FederatedLearningSettings(FrozenSettings):
         else:
             if self.topology is None:
                 raise ValueError("hierarchical orchestration requires topology")
-            if self.strategy is None:
-                raise ValueError("hierarchical orchestration requires strategy")
         return self
 
 

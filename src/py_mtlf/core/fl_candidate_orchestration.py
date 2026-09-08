@@ -475,6 +475,61 @@ class CandidatePool:
             record.revision += 1
             self._revision += 1
 
+    def resolve_establishment_intent(
+        self,
+        intent: EstablishmentIntent,
+        node: ResolvedHierarchyNode,
+    ) -> EstablishmentIntent:
+        nf_id = normalize_nf_instance_id(node.nf_instance_id)
+        with self._lock:
+            record = self._required_locked(nf_id)
+            if (
+                intent.nf_instance_id != nf_id
+                or record.revision != intent.revision
+                or record.status is not CandidateRelationshipStatus.DEPLOYING
+            ):
+                raise RuntimeError("candidate establishment intent became stale")
+            if node.role is not intent.role:
+                raise ValueError("resolved candidate role does not match establishment intent")
+            record.resolved = node
+            return EstablishmentIntent(
+                nf_instance_id=intent.nf_instance_id,
+                revision=intent.revision,
+                role=intent.role,
+                target=node,
+                instruction=(
+                    intent.instruction.model_copy(deep=True)
+                    if intent.instruction is not None
+                    else None
+                ),
+            )
+
+    def fail_relationship(
+        self,
+        nf_instance_id: str,
+        *,
+        cause: str | CandidateStatusCause,
+    ) -> DeleteIntent | None:
+        nf_id = normalize_nf_instance_id(nf_instance_id)
+        cause_value = cause.value if isinstance(cause, CandidateStatusCause) else cause
+        with self._lock:
+            record = self._required_locked(nf_id)
+            resource_location = record.resource_location
+            self._transition_locked(
+                record,
+                CandidateRelationshipStatus.FAILED,
+                cause_value,
+            )
+            record.revision += 1
+            self._revision += 1
+            if not resource_location:
+                return None
+            return DeleteIntent(
+                nf_instance_id=nf_id,
+                revision=record.revision,
+                resource_location=resource_location,
+            )
+
     def next_establishment_intents(self, capacity: int) -> tuple[EstablishmentIntent, ...]:
         if capacity <= 0:
             return ()

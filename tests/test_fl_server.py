@@ -185,7 +185,8 @@ def test_assignment_does_not_substitute_another_eligible_same_tai_client():
         )
 
 
-def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback():
+def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(caplog):
+    caplog.set_level(logging.INFO, logger="py_mtlf.core.fl_server")
     root_id = "11111111-1111-4111-8111-111111111111"
     branch_id = "22222222-2222-4222-8222-222222222222"
     procedure_id = "99999999-9999-4999-8999-999999999999"
@@ -282,6 +283,12 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback()
         ]
 
         participant = process.participants[0]
+        assert (
+            "FL participant resource created "
+            f"process_id={procedure_id} nf={branch_id} "
+            f"notif_corre_id={participant.notification_correlation_id} "
+            "location=http://branch.example/subscriptions/resource-a"
+        ) in caplog.text
         orchestrator.receive_notification(
             NwdafMLModelTrainNotif.model_validate(
                 {
@@ -509,6 +516,189 @@ def test_protocol_process_adds_and_removes_participants_after_admission():
         orchestrator.close()
         registry.reset_generation()
         client.close()
+
+
+def test_protocol_replacement_prepares_independently_of_ready_process_cohort(tmp_path):
+    root_id = "11111111-1111-4111-8111-111111111111"
+    existing_id = "22222222-2222-4222-8222-222222222222"
+    replacement_id = "33333333-3333-4333-8333-333333333333"
+    procedure_id = "99999999-9999-4999-8999-999999999999"
+    request_started = threading.Event()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "DELETE":
+            return httpx.Response(204, request=request)
+        payload = json.loads(request.content)
+        request_started.set()
+        return httpx.Response(
+            201,
+            request=request,
+            headers={"Location": "http://replacement.example/subscriptions/new"},
+            json=payload,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(preparation_timeout_seconds=2),
+        context_client(
+            nf_instance_id=root_id,
+            api_root="http://root.example",
+            internal_api_root="http://root-go.example",
+        ),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    existing = FLParticipant(
+        scope=scope("existing", "000001", existing_id),
+        candidate=candidate(existing_id, "000001"),
+        notification_correlation_id="existing-correlation",
+        resource_location="http://existing.example/subscriptions/old",
+    )
+    process = FLProcess(
+        process_id=procedure_id,
+        intent=None,
+        hierarchy_plan_id=procedure_id,
+        protocol_hierarchy=True,
+        state=FLServerState.READY,
+        participants=[existing],
+        hierarchy_selected_participant_ids=frozenset({existing_id}),
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[existing.notification_correlation_id] = process.process_id
+    topology = FlTopologyNode.model_validate(
+        {
+            "nfInstanceId": replacement_id,
+            "policy": {
+                "selectionMethod": "priority",
+                "minAvailableNodes": 1,
+                "fractionTrain": 1.0,
+                "minTrainNodes": 1,
+                "acceptFailures": False,
+            },
+            "strategy": {
+                "method": "fedProx",
+                "aggregation": "sampleWeighted",
+                "methodParameters": {"proximalMu": 0.01},
+            },
+            "reportAfter": {"count": 1, "unit": "round"},
+        }
+    )
+    result = []
+    failures = []
+
+    def prepare():
+        try:
+            result.append(
+                orchestrator.prepare_protocol_replacement_target(
+                    process_id=process.process_id,
+                    ml_event="X_IMAGE_CLASSIFICATION",
+                    ml_event_filter={},
+                    model_interoperability="pymtlf-image-classification-mnist",
+                    target=ProtocolPreparationTarget(
+                        participant_nf_instance_id=replacement_id,
+                        candidate=candidate(replacement_id, "000002"),
+                        topology=topology,
+                    ),
+                )
+            )
+        except Exception as error:
+            failures.append(str(error))
+
+    thread = threading.Thread(target=prepare)
+    thread.start()
+    try:
+        assert request_started.wait(1)
+        replacement = next(
+            participant
+            for participant in process.participants
+            if participant.candidate.target.nf_instance_id == replacement_id
+        )
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": replacement.notification_correlation_id,
+                    "mlCorreId": procedure_id,
+                    "x-flTopologyReport": {"nfInstanceId": replacement_id},
+                }
+            )
+        )
+        thread.join(timeout=1)
+
+        assert thread.is_alive() is False
+        assert failures == []
+        assert result[0].participant_nf_instance_id == replacement_id
+        assert result[0].failure == ""
+        assert process.state is FLServerState.READY
+        assert process.hierarchy_selected_participant_ids == frozenset({existing_id})
+        payload = json.loads(requests[0].content)
+        assert payload["mlCorreId"] == procedure_id
+        assert payload["notifCorreId"] != existing.notification_correlation_id
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+        client.close()
+
+
+def test_protocol_participant_retirement_fences_local_identity_when_peer_cleanup_fails(
+    tmp_path,
+):
+    participant_id = "22222222-2222-4222-8222-222222222222"
+    participant = FLParticipant(
+        scope=scope("existing", "000001", participant_id),
+        candidate=candidate(participant_id, "000001"),
+        notification_correlation_id="failed-branch-correlation",
+        resource_location="http://failed.example/subscriptions/old",
+    )
+    process = FLProcess(
+        process_id="99999999-9999-4999-8999-999999999999",
+        intent=None,
+        hierarchy_plan_id="99999999-9999-4999-8999-999999999999",
+        protocol_hierarchy=True,
+        state=FLServerState.READY,
+        participants=[participant],
+    )
+    client = Mock()
+    client.delete.return_value = Mock(status_code=503, text="unavailable")
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = (
+        process.process_id
+    )
+    try:
+        cleanup_failure = orchestrator.remove_protocol_participant(
+            process.process_id,
+            participant_id,
+        )
+
+        assert "cleanup returned 503" in cleanup_failure
+        assert process.participants == []
+        with pytest.raises(KeyError):
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(
+                    notifCorreId=participant.notification_correlation_id,
+                    mlCorreId=process.process_id,
+                    roundInd=0,
+                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+                )
+            )
+        assert process.state is FLServerState.READY
+    finally:
+        orchestrator.close()
 
 
 def test_fl_client_discovery_requests_training_capability_for_scope_tai():
@@ -1494,6 +1684,80 @@ def test_preparation_result_is_recorded_before_termination(tmp_path):
         orchestrator.close()
 
 
+def test_hierarchy_termination_outside_stage_schedules_standard_unsubscribe(tmp_path):
+    owner_id = "11111111-1111-4111-8111-111111111111"
+    participant = FLParticipant(
+        scope=scope("scope-a", "000001", owner_id),
+        candidate=candidate(owner_id, "000001"),
+        notification_correlation_id="superseded-client-a",
+        resource_location="http://go.example/subscriptions/resource-a",
+    )
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=[participant],
+    )
+    cleanup_delivered = threading.Event()
+    allow_cleanup = threading.Event()
+    notification_returned = threading.Event()
+    notification_errors = []
+    client = Mock()
+
+    def delete_resource(location):
+        assert location == participant.resource_location
+        cleanup_delivered.set()
+        assert allow_cleanup.wait(1)
+        return Mock(status_code=204)
+
+    client.delete.side_effect = delete_resource
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(cleanup={"max_attempts": 1}),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+
+    def deliver_termination():
+        try:
+            orchestrator.receive_notification(
+                NwdafMLModelTrainNotif(
+                    notifCorreId=participant.notification_correlation_id,
+                    mlCorreId=process.process_id,
+                    termTrainReq="NOT_AVAILABLE_ML_TRAIN",
+                )
+            )
+        except Exception as error:
+            notification_errors.append(error)
+        finally:
+            notification_returned.set()
+
+    notification_thread = threading.Thread(target=deliver_termination)
+    try:
+        notification_thread.start()
+        assert cleanup_delivered.wait(1)
+        assert notification_returned.wait(0.2)
+        assert notification_errors == []
+        allow_cleanup.set()
+        deadline = time.monotonic() + 1
+        while participant.resource_location:
+            if time.monotonic() >= deadline:
+                raise AssertionError("terminated participant was not released")
+            time.sleep(0.001)
+        client.delete.assert_called_once()
+    finally:
+        allow_cleanup.set()
+        notification_thread.join(timeout=1)
+        orchestrator.close()
+
+
 def test_flat_preparation_termination_still_fails_the_process(tmp_path):
     owner_id = "11111111-1111-4111-8111-111111111111"
     participant = FLParticipant(
@@ -1672,14 +1936,17 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
         orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     completed = threading.Event()
     failures = []
+    outcomes = []
 
     def execute():
         try:
-            orchestrator.execute_hierarchy_round(
-                process_id=process.process_id,
-                round_indicator=3,
-                round_input_url="http://root.example/round-input",
-                expected_result_type=RoundLocalResultType.TRAINING,
+            outcomes.append(
+                orchestrator.execute_hierarchy_round(
+                    process_id=process.process_id,
+                    round_indicator=3,
+                    round_input_url="http://root.example/round-input",
+                    expected_result_type=RoundLocalResultType.TRAINING,
+                )
             )
         except Exception as error:
             failures.append(str(error))
@@ -1724,10 +1991,17 @@ def test_hierarchy_stage_waits_for_every_terminal_outcome_before_failure(
             )
         )
         assert completed.wait(1) is True
-        assert failures == [
-            "required hierarchy participants terminated: " + participant_ids[0]
-        ]
-        assert process.state is FLServerState.FAILED
+        assert failures == []
+        assert len(outcomes) == 1
+        assert outcomes[0].accepted is False
+        assert outcomes[0].aggregate is None
+        assert outcomes[0].successful_participant_nf_instance_ids == (
+            participant_ids[1],
+        )
+        assert outcomes[0].failed_participant_nf_instance_ids == (
+            participant_ids[0],
+        )
+        assert process.state is FLServerState.READY
     finally:
         thread.join(timeout=1)
         orchestrator.close()
@@ -1843,7 +2117,11 @@ def test_hierarchy_round_freezes_selected_set_and_aggregates_only_successful_res
         )
 
         assert completed.wait(1) is True
-        assert results == [aggregate]
+        assert len(results) == 1
+        assert results[0].accepted is True
+        assert results[0].aggregate is aggregate
+        assert results[0].successful_participant_nf_instance_ids == participant_ids[:1]
+        assert results[0].failed_participant_nf_instance_ids == participant_ids[1:2]
         assert client.patch.call_count == 2
         orchestrator._aggregate_round.assert_called_once()
         assert (
@@ -1852,6 +2130,103 @@ def test_hierarchy_round_freezes_selected_set_and_aggregates_only_successful_res
             ]
             == participant_ids[:1]
         )
+    finally:
+        thread.join(timeout=1)
+        orchestrator.close()
+
+
+def test_hierarchy_round_treats_peer_unavailable_as_typed_participant_failure(
+    tmp_path,
+):
+    participant_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    )
+    participants = [
+        FLParticipant(
+            scope=scope(f"scope-{index}", f"00000{index}", nf_id),
+            candidate=candidate(nf_id, f"00000{index}"),
+            notification_correlation_id=f"round-client-{index}",
+            resource_location=f"http://go.example/subscriptions/resource-{index}",
+        )
+        for index, nf_id in enumerate(participant_ids, start=1)
+    ]
+    process = FLProcess(
+        process_id="process-1",
+        intent=None,
+        hierarchy_plan_id="11111111-1111-4111-8111-111111111112",
+        state=FLServerState.READY,
+        participants=participants,
+    )
+    client = Mock()
+    client.patch.side_effect = [Mock(status_code=503), Mock(status_code=204)]
+    orchestrator = FLServerEngine(
+        FederatedLearningSettings(workspace_root=tmp_path),
+        FLServerSettings(round_timeout_seconds=2),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        Mock(),
+        client=client,
+    )
+    orchestrator._processes[process.process_id] = process
+    for participant in participants:
+        orchestrator._correlations[participant.notification_correlation_id] = (
+            process.process_id
+        )
+    aggregate = Mock(url="http://server.example/aggregate")
+    orchestrator._aggregate_round = Mock(return_value=aggregate)
+    results = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(
+            orchestrator.execute_hierarchy_round(
+                process_id=process.process_id,
+                round_indicator=4,
+                round_input_url="http://server.example/round-input",
+                round_input_artifact=Mock(url="http://server.example/round-input"),
+                expected_result_type=RoundLocalResultType.TRAINING,
+                selected_participant_nf_instance_ids=participant_ids,
+                accept_failures=True,
+                minimum_completion_rate=0.5,
+            )
+        )
+    )
+    thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        while process.state is not FLServerState.ROUND_WAITING:
+            if time.monotonic() >= deadline:
+                raise AssertionError("hierarchy round did not enter waiting state")
+            time.sleep(0.001)
+        orchestrator.receive_notification(
+            NwdafMLModelTrainNotif.model_validate(
+                {
+                    "notifCorreId": participants[1].notification_correlation_id,
+                    "mlCorreId": process.process_id,
+                    "roundInd": 4,
+                    "mLModelInfos": [
+                        {
+                            "event": "UE_COMMUNICATION",
+                            "mLFileAddr": {
+                                "mLModelUrl": "http://leaf.example/local-result"
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert results[0].accepted is True
+        assert results[0].aggregate is aggregate
+        assert results[0].failed_participant_nf_instance_ids == participant_ids[:1]
+        assert results[0].successful_participant_nf_instance_ids == participant_ids[1:]
+        assert process.state is FLServerState.READY
+        orchestrator._aggregate_round.assert_called_once()
     finally:
         thread.join(timeout=1)
         orchestrator.close()
@@ -1898,18 +2273,21 @@ def test_hierarchy_round_completion_gate_rejects_without_aggregating(tmp_path):
             process.process_id
         )
     failures = []
+    results = []
 
     def execute():
         try:
-            orchestrator.execute_hierarchy_round(
-                process_id=process.process_id,
-                round_indicator=1,
-                round_input_url="http://server.example/round-input",
-                round_input_artifact=Mock(url="http://server.example/round-input"),
-                expected_result_type=RoundLocalResultType.TRAINING,
-                selected_participant_nf_instance_ids=participant_ids,
-                accept_failures=True,
-                minimum_completion_rate=1,
+            results.append(
+                orchestrator.execute_hierarchy_round(
+                    process_id=process.process_id,
+                    round_indicator=1,
+                    round_input_url="http://server.example/round-input",
+                    round_input_artifact=Mock(url="http://server.example/round-input"),
+                    expected_result_type=RoundLocalResultType.TRAINING,
+                    selected_participant_nf_instance_ids=participant_ids,
+                    accept_failures=True,
+                    minimum_completion_rate=1,
+                )
             )
         except Exception as error:
             failures.append(error)
@@ -1950,8 +2328,13 @@ def test_hierarchy_round_completion_gate_rejects_without_aggregating(tmp_path):
 
         thread.join(timeout=1)
         assert not thread.is_alive()
-        assert len(failures) == 1
-        assert "required hierarchy participants" in str(failures[0])
+        assert failures == []
+        assert len(results) == 1
+        assert results[0].accepted is False
+        assert results[0].aggregate is None
+        assert results[0].successful_participant_nf_instance_ids == participant_ids[:1]
+        assert results[0].failed_participant_nf_instance_ids == participant_ids[1:]
+        assert process.state is FLServerState.READY
         orchestrator._aggregate_round.assert_not_called()
     finally:
         thread.join(timeout=1)
@@ -2043,7 +2426,11 @@ def test_hierarchy_round_timeout_can_accept_completed_selected_subset(tmp_path):
 
         thread.join(timeout=2)
         assert not thread.is_alive()
-        assert results == [aggregate]
+        assert len(results) == 1
+        assert results[0].accepted is True
+        assert results[0].aggregate is aggregate
+        assert results[0].successful_participant_nf_instance_ids == participant_ids[:1]
+        assert results[0].failed_participant_nf_instance_ids == participant_ids[1:]
         assert participants[1].round_failure == "round deadline expired"
         assert (
             orchestrator._aggregate_round.call_args.kwargs[
@@ -2175,15 +2562,17 @@ def test_hierarchy_round_deadline_marks_every_missing_participant_and_skips_aggr
         side_effect=RuntimeError("federated stage deadline expired")
     )
     try:
-        with pytest.raises(RuntimeError, match="federated stage deadline expired"):
-            orchestrator.execute_hierarchy_round(
-                process_id=process.process_id,
-                round_indicator=3,
-                round_input_url="http://branch.example/round-input",
-                expected_result_type=RoundLocalResultType.TRAINING,
-            )
+        outcome = orchestrator.execute_hierarchy_round(
+            process_id=process.process_id,
+            round_indicator=3,
+            round_input_url="http://branch.example/round-input",
+            expected_result_type=RoundLocalResultType.TRAINING,
+        )
 
-        assert process.state is FLServerState.FAILED
+        assert outcome.accepted is False
+        assert outcome.aggregate is None
+        assert outcome.failed_participant_nf_instance_ids == participant_ids
+        assert process.state is FLServerState.READY
         assert [item.round_failure for item in participants] == [
             "round deadline expired",
             "round deadline expired",
@@ -2191,10 +2580,7 @@ def test_hierarchy_round_deadline_marks_every_missing_participant_and_skips_aggr
         assert all(item.round_complete for item in participants)
         workspace.download.assert_not_called()
         workspace.publish.assert_not_called()
-        assert client.delete.call_args_list == [
-            call(participants[0].resource_location),
-            call(participants[1].resource_location),
-        ]
+        client.delete.assert_not_called()
     finally:
         orchestrator.close()
 
@@ -2681,29 +3067,10 @@ def test_hierarchy_wrong_round_records_failure_but_still_collects_other_outcomes
                     termTrainReq="NOT_AVAILABLE_ML_TRAIN",
                 )
             )
-        assert completed.wait(0.05) is False
-
-        orchestrator.receive_notification(
-            NwdafMLModelTrainNotif.model_validate(
-                {
-                    "notifCorreId": participants[1].notification_correlation_id,
-                    "mlCorreId": process.process_id,
-                    "roundInd": 3,
-                    "mLModelInfos": [
-                        {
-                            "event": "UE_COMMUNICATION",
-                            "mLFileAddr": {
-                                "mLModelUrl": "http://leaf.example/local-result"
-                            },
-                        }
-                    ],
-                }
-            )
-        )
         assert completed.wait(1) is True
-        assert failures == [
-            "required hierarchy participants terminated: " + participant_ids[0]
-        ]
+        assert len(failures) == 1
+        assert "ML_MODEL_TRAINING_REQS_NOT_MET" in failures[0]
+        assert process.state is FLServerState.FAILED
     finally:
         thread.join(timeout=1)
         orchestrator.close()
@@ -3073,7 +3440,8 @@ def test_preparation_uses_configured_historical_data_window(tmp_path, caplog):
         assert (stop - start).total_seconds() == 3600
         assert (
             "FL participant resource created process_id=process-1 "
-            f"nf={owner_id} location=http://go.example/subscriptions/preparation-a"
+            f"nf={owner_id} notif_corre_id=preparation-client-a "
+            "location=http://go.example/subscriptions/preparation-a"
         ) in caplog.text
     finally:
         orchestrator.close()

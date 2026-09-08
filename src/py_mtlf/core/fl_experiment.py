@@ -163,6 +163,42 @@ class FLExperimentRegistry:
             record.upper_client_subscription_ids.remove(subscription_id)
             return self._snapshot(record)
 
+    def supersede_clients(
+        self,
+        reservation_id: str,
+        *,
+        active_subscription_id: str,
+        superseded_subscription_ids: tuple[str, ...],
+    ) -> ExperimentSnapshot:
+        active_subscription_id = _required_identity(
+            active_subscription_id,
+            "active_subscription_id",
+        )
+        superseded = tuple(
+            _required_identity(value, "superseded_subscription_id")
+            for value in superseded_subscription_ids
+        )
+        if len(superseded) != len(set(superseded)):
+            raise ExperimentStateError("superseded subscriptions must be unique")
+        if active_subscription_id in superseded:
+            raise ExperimentStateError("active subscription cannot be superseded")
+        with self._lock:
+            record = self._required(reservation_id)
+            if (
+                record.lifecycle is not ExperimentLifecycle.ACTIVE
+                or record.assigned_role is not ExperimentRole.LEAF
+            ):
+                raise ExperimentStateError(
+                    "client supersede requires an active Leaf experiment"
+                )
+            if active_subscription_id not in record.upper_client_subscription_ids:
+                raise ExperimentStateError("active subscription is not reserved")
+            unknown = set(superseded) - record.upper_client_subscription_ids
+            if unknown:
+                raise ExperimentStateError("superseded client subscription is not reserved")
+            record.upper_client_subscription_ids.difference_update(superseded)
+            return self._snapshot(record)
+
     def bind_plan(
         self,
         reservation_id: str,

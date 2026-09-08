@@ -103,6 +103,7 @@ class FLClientState(StrEnum):
     VALIDATION_RUNNING = "VALIDATION_RUNNING"
     RESULT_PENDING = "RESULT_PENDING"
     READY = "READY"
+    TERMINATING = "TERMINATING"
     FAILED = "FAILED"
 
 
@@ -526,6 +527,15 @@ class FLClientEngine:
         with self._lock:
             self._prune_cancelled_resources_locked()
             if subscription_id in self._cancelled_hierarchy_resources:
+                return
+            resource = self._resources.get(subscription_id)
+            if resource is not None and resource.state is FLClientState.TERMINATING:
+                self._cancel_delay(subscription_id)
+                self._resources.pop(subscription_id, None)
+                self._deleting.discard(subscription_id)
+                self._cancelled_hierarchy_resources[subscription_id] = (
+                    self._clock() + self._settings.lifecycle.tombstone_ttl_seconds
+                )
                 return
         experiment = self._experiments.for_client_subscription(subscription_id)
         with self._lock:
@@ -1631,10 +1641,18 @@ class FLClientEngine:
             try:
                 response = self._client.post(notification_uri, json=payload)
                 if response.status_code == 204:
+                    superseded = ()
                     with self._lock:
                         current = self._resources.get(subscription_id)
                         if current is not None and current.revision == revision:
                             current.state = success_state
+                            if success_state is FLClientState.PREPARED:
+                                superseded = self._supersede_prepared_leaf_resource(
+                                    subscription_id,
+                                    revision,
+                                )
+                    for old_resource in superseded:
+                        self._deliver_superseded_termination(old_resource)
                     terminal = True
                     break
                 last_error = f"callback returned {response.status_code}"
@@ -1676,6 +1694,167 @@ class FLClientEngine:
                 current.callback_slot_owned = False
         if terminal and not abandoned:
             self._outbox_capacity.release()
+
+    def _supersede_prepared_leaf_resource(
+        self,
+        subscription_id: str,
+        revision: int,
+    ) -> tuple[FLClientResource, ...]:
+        release_work_slots = 0
+        release_callback_slots = 0
+        with self._lock:
+            experiment = self._experiments.for_client_subscription(subscription_id)
+            if (
+                experiment is None
+                or experiment.lifecycle is not ExperimentLifecycle.ACTIVE
+                or experiment.assigned_role is not ExperimentRole.LEAF
+            ):
+                return ()
+            superseded_ids = tuple(
+                sorted(
+                    value
+                    for value in experiment.upper_client_subscription_ids
+                    if value != subscription_id
+                )
+            )
+            if not superseded_ids:
+                return ()
+            current = self._resources.get(subscription_id)
+            if current is None or current.revision != revision:
+                return ()
+            for old_id in superseded_ids:
+                old = self._resources.get(old_id)
+                if (
+                    old is None
+                    or not old.candidate_contract
+                    or old.experiment_reservation_id != experiment.reservation_id
+                    or old.representation.ml_correlation_id
+                    != current.representation.ml_correlation_id
+                ):
+                    raise RuntimeError(
+                        "Leaf rebind resource group does not match the active procedure"
+                    )
+            self._experiments.supersede_clients(
+                experiment.reservation_id,
+                active_subscription_id=subscription_id,
+                superseded_subscription_ids=superseded_ids,
+            )
+            superseded_resources = []
+            for old_id in superseded_ids:
+                old = self._resources.get(old_id)
+                if old is None:
+                    continue
+                key = (old.subscription_id, old.revision)
+                if old.work_slot_owned:
+                    old.work_slot_owned = False
+                    self._abandoned_work_keys.add(key)
+                    release_work_slots += 1
+                if old.callback_slot_owned:
+                    if key in self._outbox_keys:
+                        self._abandoned_outbox_keys.add(key)
+                    old.callback_slot_owned = False
+                    release_callback_slots += 1
+                old.revision += 1
+                old.state = FLClientState.TERMINATING
+                old.last_error = ""
+                old.dataset_snapshot = None
+                old.dataset_job_id = ""
+                old.prepared_training_sample_count = 0
+                old.preparation_base_artifact = None
+                old.experiment_reservation_id = ""
+                old.protocol_image_dataset = None
+                old.client_local_work = None
+                old.intermediate_local_work = None
+                self._cancel_delay(old.subscription_id)
+                self._deleting.discard(old.subscription_id)
+                superseded_resources.append(copy.deepcopy(old))
+        for _ in range(release_callback_slots):
+            self._outbox_capacity.release()
+        for _ in range(release_work_slots):
+            self._capacity.release()
+        return tuple(superseded_resources)
+
+    def _deliver_superseded_termination(
+        self,
+        resource: FLClientResource,
+    ) -> None:
+        payload = _termination(resource).model_dump(
+            by_alias=True,
+            exclude_none=True,
+            mode="json",
+        )
+        last_error = ""
+        for attempt in range(self._notification_settings.max_attempts):
+            with self._lock:
+                current = self._resources.get(resource.subscription_id)
+                if (
+                    current is None
+                    or current.revision != resource.revision
+                    or current.state is not FLClientState.TERMINATING
+                ):
+                    return
+            try:
+                response = self._client.post(
+                    str(resource.representation.notification_uri),
+                    json=payload,
+                )
+                if response.status_code == 204:
+                    logger.info(
+                        "Delivered superseded FL Client termination subscription_id=%s",
+                        resource.subscription_id,
+                    )
+                    return
+                last_error = f"termination delivery returned {response.status_code}"
+                self._discard_terminal_resource(resource.subscription_id, resource.revision)
+                logger.info(
+                    "Discarded superseded FL Client resource after explicit delivery "
+                    "failure subscription_id=%s status=%s",
+                    resource.subscription_id,
+                    response.status_code,
+                )
+                return
+            except httpx.TransportError as error:
+                last_error = str(error)
+            if attempt + 1 < self._notification_settings.max_attempts:
+                delay = min(
+                    self._notification_settings.initial_backoff_seconds
+                    * (2**attempt),
+                    self._notification_settings.max_backoff_seconds,
+                )
+                if self._closing.wait(delay):
+                    break
+        with self._lock:
+            current = self._resources.get(resource.subscription_id)
+            if (
+                current is not None
+                and current.revision == resource.revision
+                and current.state is FLClientState.TERMINATING
+            ):
+                current.last_error = (
+                    "superseded termination delivery remains pending: "
+                    f"{last_error}"
+                )
+        logger.warning(
+            "Superseded FL Client termination delivery remains pending "
+            "subscription_id=%s error=%s",
+            resource.subscription_id,
+            last_error,
+        )
+
+    def _discard_terminal_resource(self, subscription_id: str, revision: int) -> None:
+        with self._lock:
+            current = self._resources.get(subscription_id)
+            if (
+                current is None
+                or current.revision != revision
+                or current.state is not FLClientState.TERMINATING
+            ):
+                return
+            self._resources.pop(subscription_id, None)
+            self._deleting.discard(subscription_id)
+            self._cancelled_hierarchy_resources[subscription_id] = (
+                self._clock() + self._settings.lifecycle.tombstone_ttl_seconds
+            )
 
     def _outbox_done(self, future: Future) -> None:
         with self._lock:
@@ -1893,7 +2072,7 @@ class FLClientEngine:
 
     @staticmethod
     def _ensure_mutable(resource: FLClientResource) -> None:
-        if resource.state is FLClientState.FAILED:
+        if resource.state in {FLClientState.FAILED, FLClientState.TERMINATING}:
             raise RuntimeError("NOT_AVAILABLE_FOR_FL_PROCESS_ANYMORE")
 
     def _prune_cancelled_resources_locked(self) -> None:

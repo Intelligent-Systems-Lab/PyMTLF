@@ -24,7 +24,11 @@ from py_mtlf.core.fl_client import (
     FLClientState,
     _termination,
 )
-from py_mtlf.core.fl_experiment import ExperimentRole, FLExperimentRegistry
+from py_mtlf.core.fl_experiment import (
+    ExperimentLifecycle,
+    ExperimentRole,
+    FLExperimentRegistry,
+)
 from py_mtlf.core.fl_workspace import (
     DownloadedArchive,
     ValidatedArchive,
@@ -437,6 +441,250 @@ def test_protocol_leaf_preparation_reports_ready_without_model_or_dataset_read(t
         assert not datasets.method_calls
         branch.prepare_protocol.assert_not_called()
     finally:
+        service.close()
+        client.close()
+
+
+def test_protocol_leaf_rebind_terminates_old_resource_until_standard_delete(tmp_path):
+    callbacks = []
+    second_prepared = threading.Event()
+    termination_delivered = threading.Event()
+    supersede_entered = threading.Event()
+    allow_supersede = threading.Event()
+
+    class BlockingRegistry(FLExperimentRegistry):
+        def supersede_clients(self, *args, **kwargs):
+            supersede_entered.set()
+            assert allow_supersede.wait(2)
+            return super().supersede_clients(*args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        payload = json.loads(request.content)
+        callbacks.append(payload)
+        if payload["notifCorreId"] == "prep-client-replacement":
+            second_prepared.set()
+        if payload.get("termTrainReq") == "NOT_AVAILABLE_ML_TRAIN":
+            termination_delivered.set()
+        return httpx.Response(204, request=request)
+
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    registry = BlockingRegistry()
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        FLClientSettings(
+            workload={"profile": "image_classification"},
+            training_data={
+                "collection_trigger": "local",
+                "dataset": "mnist",
+                "shard_path": str(tmp_path / "leaf.npz"),
+            },
+            model_interoperability_ids=("pymtlf-image-classification-mnist",),
+        ),
+        NotificationSettings(
+            max_attempts=2,
+            initial_backoff_seconds=0,
+            max_backoff_seconds=0,
+        ),
+        context,
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+        round_model_distribution=Mock(),
+    )
+    try:
+        first = service.create(
+            NwdafMLModelTrainSubsc.model_validate(
+                protocol_leaf_preparation_payload()
+            )
+        )
+        deadline = time.monotonic() + 2
+        while service.get(first.subscription_id).state is not FLClientState.PREPARED:
+            if time.monotonic() >= deadline:
+                raise AssertionError("initial Leaf preparation did not complete")
+            time.sleep(0.001)
+        with service._lock:
+            first_resource = service._resources[first.subscription_id]
+            first_resource.dataset_snapshot = Mock()
+            first_resource.dataset_job_id = "old-dataset-job"
+            first_resource.prepared_training_sample_count = 64
+            first_resource.preparation_base_artifact = Mock()
+            first_resource.client_local_work = Mock()
+
+        replacement_payload = protocol_leaf_preparation_payload()
+        replacement_payload["notifCorreId"] = "prep-client-replacement"
+        second = service.create(
+            NwdafMLModelTrainSubsc.model_validate(replacement_payload)
+        )
+
+        assert second_prepared.wait(2)
+        assert supersede_entered.wait(2)
+        allow_supersede.set()
+        assert termination_delivered.wait(2)
+        deadline = time.monotonic() + 2
+        while service.get(second.subscription_id).state is not FLClientState.PREPARED:
+            if time.monotonic() >= deadline:
+                raise AssertionError("replacement Leaf preparation did not complete")
+            time.sleep(0.001)
+
+        old = service.get(first.subscription_id)
+        assert old.state is FLClientState.TERMINATING
+        assert old.dataset_snapshot is None
+        assert old.dataset_job_id == ""
+        assert old.prepared_training_sample_count == 0
+        assert old.preparation_base_artifact is None
+        assert old.experiment_reservation_id == ""
+        assert old.protocol_image_dataset is None
+        assert old.client_local_work is None
+        assert old.intermediate_local_work is None
+        service.delete(first.subscription_id)
+        with pytest.raises(KeyError):
+            service.get(first.subscription_id)
+        with pytest.raises(KeyError):
+            service.patch(
+                first.subscription_id,
+                NwdafMLModelTrainSubscPatch.model_validate(
+                    {"mLTrainRepInfo": {"maxResTime": 300}}
+                ),
+            )
+        active = registry.active()
+        assert active is not None
+        assert active.lifecycle is ExperimentLifecycle.ACTIVE
+        assert active.upper_client_subscription_ids == frozenset(
+            {second.subscription_id}
+        )
+        assert [item["notifCorreId"] for item in callbacks] == [
+            "prep-client-a",
+            "prep-client-replacement",
+            "prep-client-a",
+        ]
+        assert callbacks[-1]["mlCorreId"] == callbacks[0]["mlCorreId"]
+        assert callbacks[-1]["termTrainReq"] == "NOT_AVAILABLE_ML_TRAIN"
+    finally:
+        allow_supersede.set()
+        service.abort_generation("test cleanup")
+        registry.reset_generation()
+        service.close()
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_attempts", "old_resource_retained"),
+    (
+        ("explicit-response", 1, False),
+        ("transport-error", 2, True),
+    ),
+)
+def test_protocol_leaf_rebind_handles_termination_delivery_failure(
+    tmp_path,
+    failure_mode,
+    expected_attempts,
+    old_resource_retained,
+):
+    termination_attempts = 0
+    termination_attempted = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal termination_attempts
+        payload = json.loads(request.content)
+        if payload.get("termTrainReq") != "NOT_AVAILABLE_ML_TRAIN":
+            return httpx.Response(204, request=request)
+        termination_attempts += 1
+        if termination_attempts >= expected_attempts:
+            termination_attempted.set()
+        if failure_mode == "transport-error":
+            raise httpx.ConnectError("local Go is unavailable", request=request)
+        return httpx.Response(502, request=request)
+
+    context = Mock()
+    context.get.return_value = NwdafContext(
+        nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        containing_nwdaf_process_instance_id="11111111-1111-4111-8111-111111111111",
+        api_root="http://nwdaf.example",
+        internal_api_root="http://nwdaf-internal.example",
+        ml_analytics_capabilities=(
+            MLAnalyticsCapability(
+                ml_analytics_ids=("X_IMAGE_CLASSIFICATION",),
+                fl_capability_type=FLCapabilityType.SERVER_AND_CLIENT,
+            ),
+        ),
+    )
+    registry = FLExperimentRegistry()
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    service = FLClientEngine(
+        fl_settings(tmp_path),
+        FLClientSettings(
+            workload={"profile": "image_classification"},
+            training_data={
+                "collection_trigger": "local",
+                "dataset": "mnist",
+                "shard_path": str(tmp_path / "leaf.npz"),
+            },
+            model_interoperability_ids=("pymtlf-image-classification-mnist",),
+        ),
+        NotificationSettings(
+            max_attempts=2,
+            initial_backoff_seconds=0,
+            max_backoff_seconds=0,
+        ),
+        context,
+        Mock(),
+        Mock(),
+        client=client,
+        experiments=registry,
+        round_model_distribution=Mock(),
+    )
+    try:
+        first = service.create(
+            NwdafMLModelTrainSubsc.model_validate(
+                protocol_leaf_preparation_payload()
+            )
+        )
+        deadline = time.monotonic() + 2
+        while service.get(first.subscription_id).state is not FLClientState.PREPARED:
+            if time.monotonic() >= deadline:
+                raise AssertionError("initial Leaf preparation did not complete")
+            time.sleep(0.001)
+
+        replacement_payload = protocol_leaf_preparation_payload()
+        replacement_payload["notifCorreId"] = "prep-client-replacement"
+        second = service.create(
+            NwdafMLModelTrainSubsc.model_validate(replacement_payload)
+        )
+
+        assert termination_attempted.wait(2)
+        deadline = time.monotonic() + 2
+        while service.get(second.subscription_id).state is not FLClientState.PREPARED:
+            if time.monotonic() >= deadline:
+                raise AssertionError("replacement Leaf preparation did not complete")
+            time.sleep(0.001)
+
+        assert termination_attempts == expected_attempts
+        if old_resource_retained:
+            old = service.get(first.subscription_id)
+            assert old.state is FLClientState.TERMINATING
+            assert "local Go is unavailable" in old.last_error
+        else:
+            with pytest.raises(KeyError):
+                service.get(first.subscription_id)
+            service.delete(first.subscription_id)
+    finally:
+        service.abort_generation("test cleanup")
+        registry.reset_generation()
         service.close()
         client.close()
 

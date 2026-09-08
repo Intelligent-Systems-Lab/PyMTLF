@@ -18,6 +18,7 @@ from py_mtlf.core.fl_hierarchy_discovery import (
 from py_mtlf.core.fl_server import (
     HierarchyParticipantPreparationOutcome,
     HierarchyPreparationCollection,
+    HierarchyRoundOutcome,
 )
 from py_mtlf.core.nwdaf_context import (
     FLCapabilityType,
@@ -425,7 +426,22 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
     )
     first_global = _lower_global(tmp_path, 0, process_id=PLAN)
     second_global = _lower_global(tmp_path, 1, process_id=PLAN)
-    server.execute_hierarchy_round.side_effect = [first_global, second_global]
+    server.execute_hierarchy_round.side_effect = [
+        HierarchyRoundOutcome(
+            aggregate=first_global,
+            accepted=True,
+            selected_participant_nf_instance_ids=(LEAF_A, LEAF_B),
+            successful_participant_nf_instance_ids=(LEAF_A, LEAF_B),
+            failed_participant_nf_instance_ids=(),
+        ),
+        HierarchyRoundOutcome(
+            aggregate=second_global,
+            accepted=True,
+            selected_participant_nf_instance_ids=(LEAF_A, LEAF_B),
+            successful_participant_nf_instance_ids=(LEAF_A, LEAF_B),
+            failed_participant_nf_instance_ids=(),
+        ),
+    ]
     coordinator._loader = Mock()
     coordinator._loader.load.return_value = Mock(manifest=upper_manifest)
     local_input = Mock(

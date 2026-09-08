@@ -8,7 +8,6 @@ from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
     FederatedLearningSettings,
-    FederatedStrategySettings,
     FittingSettings,
     FLClientSettings,
     FLLifecycleSettings,
@@ -660,7 +659,7 @@ def test_tracked_hierarchy_profile_references_a_valid_topology():
     assert loaded.federated_learning.topology is not None
     planner = StaticTopologyPlanner.load(loaded.federated_learning.topology.config_file)
     assignment = planner.build(root_nf_instance_id="00000000-0000-4000-8000-000000000001")
-    assert len(assignment.branches) == 1
+    assert len(assignment.branch_groups) == 1
 
 
 def test_removed_flat_training_and_fl_role_keys_are_rejected():
@@ -692,13 +691,6 @@ federated_learning:
   training_trigger:
     degradation:
       enabled: true
-  strategy:
-    algorithm:
-      name: fedprox
-      proximal_mu: 0.01
-    participant_selection: all
-    waiting_policy: all
-    aggregation: sample_weighted
   topology:
     strategy: static
     config_file: ./topology/hierarchy.yaml
@@ -715,29 +707,13 @@ federated_learning:
     assert loaded.federated_learning.topology.config_file == topology_path.resolve()
 
 
-def test_hierarchy_configuration_requires_server_strategy_and_topology_together(tmp_path):
+def test_hierarchy_configuration_requires_server_and_topology(tmp_path):
     topology = {"strategy": "static", "config_file": tmp_path / "topology.yaml"}
-    strategy = FederatedStrategySettings.model_validate(
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        }
-    )
 
     orchestration = {"mode": "hierarchical", "participant_source": "static"}
     trigger = {"degradation": {"enabled": True}}
     with pytest.raises(ValidationError, match="requires server engine"):
         FederatedLearningSettings(
-            orchestration=orchestration,
-            topology=topology,
-            strategy=strategy,
-            training_trigger=trigger,
-        )
-    with pytest.raises(ValidationError, match="requires strategy"):
-        FederatedLearningSettings(
-            server=FLServerSettings(),
             orchestration=orchestration,
             topology=topology,
             training_trigger=trigger,
@@ -746,8 +722,17 @@ def test_hierarchy_configuration_requires_server_strategy_and_topology_together(
         FederatedLearningSettings(
             server=FLServerSettings(),
             orchestration=orchestration,
-            strategy=strategy,
             training_trigger=trigger,
+        )
+    with pytest.raises(ValidationError, match="strategy"):
+        FederatedLearningSettings.model_validate(
+            {
+                "server": {},
+                "orchestration": orchestration,
+                "topology": topology,
+                "training_trigger": trigger,
+                "strategy": {"algorithm": {"name": "fedprox"}},
+            }
         )
     with pytest.raises(ValidationError):
         FederatedLearningSettings.model_validate(
@@ -766,12 +751,6 @@ def test_hierarchical_orchestration_has_single_protocol_authority(tmp_path):
             "participant_source": "static",
         },
         "training_trigger": {"private_api": {"enabled": True}},
-        "strategy": {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
         "topology": {
             "strategy": "static",
             "config_file": tmp_path / "topology.yaml",
@@ -786,49 +765,3 @@ def test_hierarchical_orchestration_has_single_protocol_authority(tmp_path):
     legacy["orchestration"]["hierarchy_contract"] = "protocol"
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         FederatedLearningSettings.model_validate(legacy)
-
-
-@pytest.mark.parametrize(
-    "strategy",
-    [
-        {
-            "algorithm": {"name": "fedavg", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": float("inf")},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "fixed_count",
-            "waiting_policy": "all",
-            "aggregation": "sample_weighted",
-        },
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "minimum_results",
-            "aggregation": "sample_weighted",
-        },
-        {
-            "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-            "participant_selection": "all",
-            "waiting_policy": "all",
-            "aggregation": "uniform",
-        },
-    ],
-)
-def test_hierarchy_strategy_rejects_unsupported_values(strategy):
-    with pytest.raises(ValidationError):
-        FederatedStrategySettings.model_validate(strategy)

@@ -1,10 +1,50 @@
-version: 1
-
 admission:
   mode: complete_required
 
-branches:
-  - nf_instance_id: "00000000-0000-4000-8000-000000000010"
+policy:
+  allow_additional_candidates: false
+  additional_candidate_priority: 0
+  selection_method: priority
+  min_available_nodes: 1
+  fraction_train: 1.0
+  min_train_nodes: 1
+  accept_failures: false
+  min_completion_rate: 1.0
+
+strategy: &fedprox_strategy
+  method: fedProx
+  aggregation: sampleWeighted
+  method_parameters:
+    proximal_mu: 0.01
+
+branch_groups:
+  - branches:
+      - nf_instance_id: "00000000-0000-4000-8000-000000000010"
+        enabled: true
+        priority: 100
+        report_after:
+          count: 1
+          unit: round
+    policy:
+      allow_additional_candidates: false
+      additional_candidate_priority: 0
+      selection_method: priority
+      min_available_nodes: 2
+      fraction_train: 1.0
+      min_train_nodes: 2
+      accept_failures: false
+      min_completion_rate: 1.0
+    strategy: *fedprox_strategy
     leaves:
       - nf_instance_id: "00000000-0000-4000-8000-000000000101"
+        enabled: true
+        priority: 100
+        report_after:
+          count: 18
+          unit: epoch
       - nf_instance_id: "00000000-0000-4000-8000-000000000102"
+        enabled: true
+        priority: 100
+        report_after:
+          count: 18
+          unit: epoch

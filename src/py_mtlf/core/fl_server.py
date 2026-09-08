@@ -126,6 +126,7 @@ class FLParticipant:
     notification_correlation_id: str
     resource_location: str = ""
     preparation_complete: bool = False
+    preparation_in_progress: bool = False
     preparation_notification: NwdafMLModelTrainNotif | None = None
     preparation_failure: str = ""
     expected_round: int | None = None
@@ -138,6 +139,8 @@ class FLParticipant:
     expected_training_scope: TrainingScopeDescriptor | None = None
     training_sample_count: int = 0
     accepted_features: str = ""
+    termination_cleanup_pending: bool = False
+    termination_cleanup_failure: str = ""
 
     @property
     def identity(self) -> TrainingResourceIdentity:
@@ -197,6 +200,19 @@ class HierarchyPreparationCollection:
     plan_id: str
     participants: tuple[HierarchyParticipantPreparationOutcome, ...]
     timed_out_participant_nf_instance_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HierarchyRoundOutcome:
+    aggregate: FLWorkspaceArtifact | None
+    accepted: bool
+    selected_participant_nf_instance_ids: tuple[str, ...]
+    successful_participant_nf_instance_ids: tuple[str, ...]
+    failed_participant_nf_instance_ids: tuple[str, ...]
+
+
+class HierarchyParticipantAvailabilityError(RuntimeError):
+    pass
 
 
 class FLClientResolver:
@@ -520,6 +536,7 @@ class FLServerEngine:
                 ),
                 candidate=target.candidate,
                 notification_correlation_id=str(uuid4()),
+                preparation_in_progress=True,
             )
             for target in targets
         ]
@@ -594,6 +611,7 @@ class FLServerEngine:
                 ),
                 candidate=target.candidate,
                 notification_correlation_id=str(uuid4()),
+                preparation_in_progress=True,
             )
             for target in targets
         ]
@@ -615,11 +633,76 @@ class FLServerEngine:
             )
         process.state = FLServerState.PREPARATION_WAITING
 
+    def prepare_protocol_replacement_target(
+        self,
+        *,
+        process_id: str,
+        ml_event: str,
+        ml_event_filter: dict,
+        model_interoperability: str,
+        target: ProtocolPreparationTarget,
+    ) -> HierarchyParticipantPreparationOutcome:
+        with self._lock:
+            process = self._processes.get(process_id)
+        if process is None or not process.protocol_hierarchy:
+            raise KeyError(process_id)
+        if process.state in {FLServerState.FAILED, FLServerState.COMPLETE}:
+            raise RuntimeError("protocol process cannot accept a replacement target")
+        if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
+            raise ValueError("protocol replacement identity does not match its candidate")
+        if target.topology.nf_instance_id != target.participant_nf_instance_id:
+            raise ValueError("protocol replacement identity does not match its topology")
+        participant = FLParticipant(
+            scope=ScopeReference(
+                scope_key=f"hierarchy:{process_id}:{target.participant_nf_instance_id}",
+                consumer_id=target.participant_nf_instance_id,
+                model_ids=(),
+                ml_event=ml_event,
+                ml_event_filter=dict(ml_event_filter),
+                target_ue=None,
+            ),
+            candidate=target.candidate,
+            notification_correlation_id=str(uuid4()),
+            preparation_in_progress=True,
+        )
+        with self._lock:
+            self._ensure_process_generation(process)
+            if any(
+                item.candidate.target.nf_instance_id
+                == target.participant_nf_instance_id
+                for item in process.participants
+            ):
+                raise ValueError("protocol replacement target already exists")
+            process.participants.append(participant)
+            process.participants.sort(
+                key=lambda item: item.candidate.target.nf_instance_id
+            )
+            self._correlations[participant.notification_correlation_id] = process.process_id
+        self._attempt_protocol_preparation(
+            process,
+            participant,
+            model_interoperability,
+            target.topology,
+        )
+        self._wait_for_protocol_participant_preparation(process, participant)
+        return HierarchyParticipantPreparationOutcome(
+            participant_nf_instance_id=target.participant_nf_instance_id,
+            resource_location=participant.resource_location,
+            notification=(
+                participant.preparation_notification.model_copy(deep=True)
+                if participant.preparation_notification is not None
+                else None
+            ),
+            failure=participant.preparation_failure,
+            delay_extensions=participant.delay_extensions,
+            granted_extension_seconds=participant.granted_extension_seconds,
+        )
+
     def remove_protocol_participant(
         self,
         process_id: str,
         participant_nf_instance_id: str,
-    ) -> None:
+    ) -> str:
         with self._lock:
             process = self._processes.get(process_id)
         if process is None or not process.protocol_hierarchy:
@@ -640,13 +723,13 @@ class FLServerEngine:
         )
         if participant is None:
             raise KeyError(nf_id)
+        failure = ""
         if participant.resource_location:
             failure = self._cleanup_participant(process, participant)
-            if failure:
-                raise RuntimeError(failure)
         with self._lock:
             self._correlations.pop(participant.notification_correlation_id, None)
             process.participants.remove(participant)
+        return failure
 
     def cancel_hierarchy_preparation(self, process_id: str, reason: str) -> None:
         with self._lock:
@@ -702,8 +785,8 @@ class FLServerEngine:
             active_preparation = process.state in {
                 FLServerState.PREPARATION_CREATING,
                 FLServerState.PREPARATION_WAITING,
-            }
-            active_round = process.state in {
+            } or participant.preparation_in_progress
+            active_round = not active_preparation and process.state in {
                 FLServerState.ROUND_DISPATCH,
                 FLServerState.ROUND_WAITING,
                 FLServerState.FINAL_VALIDATION_DISPATCH,
@@ -732,6 +815,7 @@ class FLServerEngine:
                 if process.hierarchy_plan_id and active_round:
                     participant.round_failure = str(error)
                     participant.round_complete = True
+                    process.failure = str(error)
                     process.condition.notify_all()
                 raise
             terminal_outcome = bool(
@@ -740,6 +824,13 @@ class FLServerEngine:
                 or notification.fl_topology_report
             )
             if not (active_preparation or active_round):
+                if process.hierarchy_plan_id and notification.termination_request:
+                    if participant.termination_cleanup_pending:
+                        return
+                    participant.notification = notification.model_copy(deep=True)
+                    self._schedule_terminated_participant_cleanup(process, participant)
+                    process.condition.notify_all()
+                    return
                 if terminal_outcome and (
                     (
                         notification.round_indicator is None
@@ -805,11 +896,14 @@ class FLServerEngine:
                     return
                 participant.preparation_notification = notification.model_copy(deep=True)
                 participant.preparation_complete = True
+                participant.preparation_in_progress = False
                 if notification.termination_request and not process.hierarchy_plan_id:
                     process.failure = (
                         "participant terminated training: "
                         f"{notification.termination_request}"
                     )
+                elif notification.termination_request:
+                    self._schedule_terminated_participant_cleanup(process, participant)
                 process.condition.notify_all()
                 return
             if notification.delay_event_notification is not None:
@@ -844,6 +938,8 @@ class FLServerEngine:
                     process.failure = (
                         f"participant terminated training: {notification.termination_request}"
                     )
+                else:
+                    self._schedule_terminated_participant_cleanup(process, participant)
             elif notification.delay_event_notification is None and not notification.ml_model_infos:
                 failure = "notification does not contain a stage outcome"
                 if process.hierarchy_plan_id and active_round:
@@ -854,6 +950,104 @@ class FLServerEngine:
                 process.condition.notify_all()
                 raise ValueError(failure)
             process.condition.notify_all()
+
+    def _schedule_terminated_participant_cleanup(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+    ) -> None:
+        if participant.termination_cleanup_pending or not participant.resource_location:
+            return
+        participant.termination_cleanup_pending = True
+        participant.termination_cleanup_failure = ""
+        future = self._executor.submit(
+            self._cleanup_terminated_participant,
+            process,
+            participant,
+        )
+        with self._lock:
+            self._futures.add(future)
+        future.add_done_callback(self._future_done)
+
+    def _cleanup_terminated_participant(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+    ) -> None:
+        notification_correlation_id = participant.notification_correlation_id
+        failure = self._cleanup_participant(process, participant)
+        if not failure:
+            with self._lock:
+                if self._correlations.get(notification_correlation_id) == process.process_id:
+                    self._correlations.pop(notification_correlation_id, None)
+        with process.condition:
+            participant.termination_cleanup_pending = False
+            participant.termination_cleanup_failure = failure
+            if not failure:
+                participant.resource_location = ""
+            process.condition.notify_all()
+
+    def _wait_for_protocol_participant_preparation(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+    ) -> None:
+        deadline = time.monotonic() + self._server_settings.preparation_timeout_seconds
+        while True:
+            extension = 0
+            with process.condition:
+                if self._closing.is_set():
+                    raise RuntimeError("FL Server is shutting down")
+                if process.failure:
+                    raise RuntimeError(process.failure)
+                if participant.preparation_complete:
+                    return
+                if participant.requested_extension:
+                    remaining_budget = (
+                        self._server_settings.delay_policy.max_extension_seconds
+                        - participant.granted_extension_seconds
+                    )
+                    if (
+                        participant.delay_extensions
+                        >= self._server_settings.delay_policy.max_extensions
+                        or remaining_budget <= 0
+                    ):
+                        participant.preparation_failure = (
+                            "participant delay extension budget is exhausted"
+                        )
+                        participant.preparation_complete = True
+                        participant.preparation_in_progress = False
+                        participant.requested_extension = 0
+                        return
+                    extension = min(
+                        participant.requested_extension,
+                        self._server_settings.preparation_timeout_seconds,
+                        remaining_budget,
+                    )
+                    participant.requested_extension = 0
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        participant.preparation_failure = "preparation deadline expired"
+                        participant.preparation_complete = True
+                        participant.preparation_in_progress = False
+                        return
+                    process.condition.wait(timeout=remaining)
+                    continue
+            try:
+                self._grant_extension(participant, extension)
+            except Exception as error:
+                with process.condition:
+                    participant.preparation_failure = str(error)
+                    participant.preparation_complete = True
+                    participant.preparation_in_progress = False
+                    process.condition.notify_all()
+                return
+            with process.condition:
+                participant.delay_extensions += 1
+                participant.granted_extension_seconds += extension
+                deadline = max(deadline, time.monotonic() + extension)
+                process.condition.notify_all()
 
     def processes(self) -> tuple[FLProcess, ...]:
         with self._lock:
@@ -982,7 +1176,7 @@ class FLServerEngine:
         minimum_completion_rate: float = 1.0,
         timeout_seconds: int | None = None,
         state_observer: Callable[[FLServerState], None] | None = None,
-    ) -> FLWorkspaceArtifact:
+    ) -> HierarchyRoundOutcome:
         with self._lock:
             process = self._processes.get(process_id)
         if process is None or not process.hierarchy_plan_id:
@@ -1044,22 +1238,26 @@ class FLServerEngine:
                 participant.delay_extensions = 0
                 participant.requested_extension = 0
                 participant.granted_extension_seconds = 0
-                if round_input_model is None:
-                    self._patch_round(
-                        process,
-                        participant,
-                        round_indicator,
-                        round_input_url,
-                        timeout_seconds=timeout,
-                    )
-                else:
-                    self._patch_round_model(
-                        process,
-                        participant,
-                        round_indicator,
-                        round_input_model,
-                        timeout_seconds=timeout,
-                    )
+                try:
+                    if round_input_model is None:
+                        self._patch_round(
+                            process,
+                            participant,
+                            round_indicator,
+                            round_input_url,
+                            timeout_seconds=timeout,
+                        )
+                    else:
+                        self._patch_round_model(
+                            process,
+                            participant,
+                            round_indicator,
+                            round_input_model,
+                            timeout_seconds=timeout,
+                        )
+                except HierarchyParticipantAvailabilityError as error:
+                    participant.round_failure = str(error)
+                    participant.round_complete = True
             self._raise_if_failed(process)
             process.state = FLServerState.ROUND_WAITING
             if state_observer is not None:
@@ -1077,8 +1275,6 @@ class FLServerEngine:
                         if not participant.round_complete:
                             participant.round_failure = "round deadline expired"
                             participant.round_complete = True
-                    if not accept_failures:
-                        raise
                 else:
                     raise
             process.state = FLServerState.ROUND_EVALUATING
@@ -1093,23 +1289,29 @@ class FLServerEngine:
                     and item.notification.termination_request is not None
                 )
             ]
-            if failed:
-                successful_count = len(selected) - len(failed)
-                completion_rate = successful_count / len(selected)
-                if not accept_failures or completion_rate < minimum_completion_rate:
-                    raise RuntimeError(
-                        "required hierarchy participants terminated: " + ",".join(failed)
-                    )
-            process.state = FLServerState.AGGREGATING
-            if state_observer is not None:
-                state_observer(process.state)
-            if round_input_artifact is None:
-                raise RuntimeError("Server aggregation requires its owned ROUND_INPUT artifact")
             successful_ids = tuple(
                 item.candidate.target.nf_instance_id
                 for item in selected
                 if item.candidate.target.nf_instance_id not in failed
             )
+            completion_rate = len(successful_ids) / len(selected)
+            accepted = not failed if not accept_failures else (
+                completion_rate >= minimum_completion_rate
+            )
+            if not accepted:
+                process.state = FLServerState.READY
+                return HierarchyRoundOutcome(
+                    aggregate=None,
+                    accepted=False,
+                    selected_participant_nf_instance_ids=tuple(selected_ids),
+                    successful_participant_nf_instance_ids=successful_ids,
+                    failed_participant_nf_instance_ids=tuple(failed),
+                )
+            process.state = FLServerState.AGGREGATING
+            if state_observer is not None:
+                state_observer(process.state)
+            if round_input_artifact is None:
+                raise RuntimeError("Server aggregation requires its owned ROUND_INPUT artifact")
             aggregate_options = {
                 "round_input_artifact": round_input_artifact,
                 "expected_input_round": input_round_indicator,
@@ -1126,7 +1328,13 @@ class FLServerEngine:
             )
             process.current_global_url = result.url
             process.state = FLServerState.READY
-            return result
+            return HierarchyRoundOutcome(
+                aggregate=result,
+                accepted=True,
+                selected_participant_nf_instance_ids=tuple(selected_ids),
+                successful_participant_nf_instance_ids=successful_ids,
+                failed_participant_nf_instance_ids=tuple(failed),
+            )
         except Exception as error:
             with process.condition:
                 process.state = FLServerState.FAILED
@@ -1505,9 +1713,11 @@ class FLServerEngine:
             )
         participant.resource_location = response.headers["Location"]
         logger.info(
-            "FL participant resource created process_id=%s nf=%s location=%s",
+            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s "
+            "location=%s",
             process.process_id,
             participant.candidate.target.nf_instance_id,
+            participant.notification_correlation_id,
             participant.resource_location,
         )
         participant.expected_training_scope = TrainingScopeDescriptor.from_training_request(
@@ -1611,6 +1821,14 @@ class FLServerEngine:
             raise RuntimeError(
                 "protocol participant changed the accepted resource identity"
             )
+        logger.info(
+            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s "
+            "location=%s",
+            process.process_id,
+            participant.candidate.target.nf_instance_id,
+            participant.notification_correlation_id,
+            participant.resource_location,
+        )
         participant.expected_training_scope = TrainingScopeDescriptor.from_training_request(
             value,
             0,
@@ -1642,6 +1860,7 @@ class FLServerEngine:
                 if not participant.preparation_failure:
                     participant.preparation_failure = _protocol_candidate_failure(error)
                 participant.preparation_complete = True
+                participant.preparation_in_progress = False
                 process.condition.notify_all()
 
     def _patch_round(
@@ -1666,11 +1885,20 @@ class FLServerEngine:
                 maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
             ),
         )
-        response = self._client.patch(
-            participant.resource_location,
-            headers={"Content-Type": "application/merge-patch+json"},
-            content=patch.model_dump_json(by_alias=True, exclude_none=True),
-        )
+        try:
+            response = self._client.patch(
+                participant.resource_location,
+                headers={"Content-Type": "application/merge-patch+json"},
+                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            )
+        except httpx.TransportError as error:
+            raise HierarchyParticipantAvailabilityError(
+                "participant round patch transport failed"
+            ) from error
+        if response.status_code in {404, 410, 503}:
+            raise HierarchyParticipantAvailabilityError(
+                f"participant round patch failed with {response.status_code}"
+            )
         if response.status_code not in {200, 204}:
             raise RuntimeError(f"participant round patch failed with {response.status_code}")
 
@@ -1697,11 +1925,20 @@ class FLServerEngine:
                 maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
             ),
         )
-        response = self._client.patch(
-            participant.resource_location,
-            headers={"Content-Type": "application/merge-patch+json"},
-            content=patch.model_dump_json(by_alias=True, exclude_none=True),
-        )
+        try:
+            response = self._client.patch(
+                participant.resource_location,
+                headers={"Content-Type": "application/merge-patch+json"},
+                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            )
+        except httpx.TransportError as error:
+            raise HierarchyParticipantAvailabilityError(
+                "participant protocol round patch transport failed"
+            ) from error
+        if response.status_code in {404, 410, 503}:
+            raise HierarchyParticipantAvailabilityError(
+                f"participant protocol round patch failed with {response.status_code}"
+            )
         if response.status_code not in {200, 204}:
             raise RuntimeError(
                 f"participant final validation patch failed with {response.status_code}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from py_mtlf.wire.ml_model_training import (
     FlTopologyReport,
     NwdafMLModelTrainSubsc,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -115,7 +118,7 @@ class FLBranchPreparationCoordinator:
         if reconciliation is not None:
             for intent in reconciliation.delete_intents:
                 try:
-                    self._server.remove_protocol_participant(
+                    failure = self._server.remove_protocol_participant(
                         process_id,
                         intent.nf_instance_id,
                     )
@@ -127,6 +130,12 @@ class FLBranchPreparationCoordinator:
                     )
                 else:
                     pool.complete_delete(intent.nf_instance_id, intent.revision)
+                    if failure:
+                        logger.warning(
+                            "Protocol participant cleanup remains pending nf=%s error=%s",
+                            intent.nf_instance_id,
+                            failure,
+                        )
         records = {record.nf_instance_id: record for record in pool.records()}
         for child in contract.explicit_children:
             record = records[child.nf_instance_id]
@@ -346,7 +355,7 @@ class FLBranchPreparationCoordinator:
                     epochs=_round_epochs(upper_input),
                 )
                 dispatch_model = None
-            lower_global = self._server.execute_hierarchy_round(
+            outcome = self._server.execute_hierarchy_round(
                 process_id=execution.process_id,
                 round_indicator=current_lower_round,
                 round_input_url=current_artifact.url,
@@ -363,6 +372,9 @@ class FLBranchPreparationCoordinator:
                 ),
                 timeout_seconds=per_round_timeout,
             )
+            if not outcome.accepted or outcome.aggregate is None:
+                raise RuntimeError("protocol Branch lower round did not reach completion policy")
+            lower_global = outcome.aggregate
             if not isinstance(lower_global.contract, RoundGlobalArtifact):
                 raise RuntimeError("protocol Branch lower result is not ROUND_GLOBAL")
             current_input = self._loader.load(

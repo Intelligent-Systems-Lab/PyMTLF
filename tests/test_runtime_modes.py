@@ -61,12 +61,6 @@ def with_hierarchy(settings, workspace: Path, topology_path: Path, *, private_ap
         "mode": "hierarchical",
         "participant_source": "static",
     }
-    payload["federated_learning"]["strategy"] = {
-        "algorithm": {"name": "fedprox", "proximal_mu": 0.01},
-        "participant_selection": "all",
-        "waiting_policy": "all",
-        "aggregation": "sample_weighted",
-    }
     payload["federated_learning"]["topology"] = {
         "strategy": "static",
         "config_file": topology_path,
@@ -98,13 +92,32 @@ def with_static_flat(settings, workspace: Path, topology_path: Path):
 def write_topology(path: Path) -> None:
     path.write_text(
         """
-version: 1
 admission:
   mode: complete_required
-branches:
-  - nf_instance_id: 00000000-0000-4000-8000-000000000010
+policy: &policy
+  allow_additional_candidates: false
+  additional_candidate_priority: 0
+  selection_method: priority
+  min_available_nodes: 1
+  fraction_train: 1.0
+  min_train_nodes: 1
+  accept_failures: false
+  min_completion_rate: 1.0
+strategy: &strategy
+  method: fedProx
+  aggregation: sampleWeighted
+  method_parameters: {proximal_mu: 0.01}
+branch_groups:
+  - branches:
+      - nf_instance_id: 00000000-0000-4000-8000-000000000010
+        priority: 100
+        report_after: {count: 1, unit: round}
+    policy: *policy
+    strategy: *strategy
     leaves:
       - nf_instance_id: 00000000-0000-4000-8000-000000000101
+        priority: 100
+        report_after: {count: 1, unit: epoch}
 """.strip()
         + "\n",
         encoding="utf-8",

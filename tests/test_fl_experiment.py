@@ -251,6 +251,47 @@ def test_client_removal_requires_provisional_rollback_or_active_cleanup():
     assert registry.active() is None
 
 
+def test_leaf_rebind_supersedes_old_membership_without_terminating_experiment():
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("subscription-old", "correlation-a")
+    plan_id = str(uuid4())
+    registry.bind_plan(reservation.reservation_id, plan_id, ExperimentRole.LEAF)
+    registry.reserve_client("subscription-new", "correlation-a")
+
+    rebound = registry.supersede_clients(
+        reservation.reservation_id,
+        active_subscription_id="subscription-new",
+        superseded_subscription_ids=("subscription-old",),
+    )
+
+    assert rebound.lifecycle is ExperimentLifecycle.ACTIVE
+    assert rebound.plan_id == plan_id
+    assert rebound.assigned_role is ExperimentRole.LEAF
+    assert rebound.upper_client_subscription_ids == frozenset({"subscription-new"})
+    assert registry.for_client_subscription("subscription-old") is None
+    assert registry.for_client_subscription("subscription-new") == rebound
+
+
+def test_supersede_clients_rejects_unknown_or_active_resource_removal():
+    registry = FLExperimentRegistry()
+    reservation = registry.reserve_client("subscription-old", "correlation-a")
+    registry.bind_plan(reservation.reservation_id, str(uuid4()), ExperimentRole.LEAF)
+    registry.reserve_client("subscription-new", "correlation-a")
+
+    with pytest.raises(ExperimentStateError, match="active subscription"):
+        registry.supersede_clients(
+            reservation.reservation_id,
+            active_subscription_id="subscription-new",
+            superseded_subscription_ids=("subscription-new",),
+        )
+    with pytest.raises(ExperimentStateError, match="not reserved"):
+        registry.supersede_clients(
+            reservation.reservation_id,
+            active_subscription_id="subscription-new",
+            superseded_subscription_ids=("missing",),
+        )
+
+
 def test_concurrent_admission_allows_only_one_top_level_experiment():
     registry = FLExperimentRegistry()
     barrier = threading.Barrier(3)
