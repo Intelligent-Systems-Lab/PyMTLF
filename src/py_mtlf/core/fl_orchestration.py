@@ -83,6 +83,7 @@ class TopLevelCoordinatorUnavailableError(TopLevelCoordinatorError):
 
 class TopLevelRequestSnapshot(Protocol):
     request_id: str
+    plan_id: str | None
     model_family_id: FamilyKey
     state: str
     mode: str

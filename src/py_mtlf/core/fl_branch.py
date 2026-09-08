@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 
 from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_artifacts import (
     RoundGlobalArtifact,
     RoundInputArtifact,
@@ -66,6 +67,7 @@ class FLBranchPreparationCoordinator:
         nwdaf_context: NwdafContextClient,
         artifact_service: HierarchyArtifactService,
         server: FLServerEngine,
+        experiment_recorder: ExperimentRecorder | None = None,
         tombstone_ttl_seconds: int = 3600,
         clock=time.monotonic,
     ) -> None:
@@ -75,6 +77,7 @@ class FLBranchPreparationCoordinator:
         self._nwdaf_context = nwdaf_context
         self._artifact_service = artifact_service
         self._server = server
+        self._experiment_recorder = experiment_recorder
         self._loader = TrustedBundleLoader()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -385,6 +388,17 @@ class FLBranchPreparationCoordinator:
                     url=lower_global.url,
                 )
             )
+            if (
+                self._experiment_recorder is not None
+                and self._experiment_recorder.validation_enabled
+            ):
+                self._experiment_recorder.record_model_evaluation(
+                    ml_correlation_id=ml_correlation_id,
+                    evaluation_stage="BRANCH_DOMAIN",
+                    round_indicator=current_lower_round,
+                    model=current_input.model,
+                    manifest=current_input.manifest,
+                )
             current_artifact = lower_global
         assert lower_global is not None
         return self._artifact_service.publish_hierarchy_aggregate(

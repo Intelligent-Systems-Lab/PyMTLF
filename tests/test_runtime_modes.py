@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from nwdaf_context import context_client, verified_capability_checker
@@ -160,6 +161,45 @@ def test_local_mode_preserves_local_training_lifecycle(settings, tmp_path):
         assert app.state.training_coordinator._workers
         assert "/internal/v1/ml-model-provision/subscriptions" in app.openapi()["paths"]
         assert "/internal/v1/ml-model-training/subscriptions" not in app.openapi()["paths"]
+
+
+def test_hierarchy_app_opens_and_injects_node_local_experiment_recorder(
+    settings,
+    tmp_path,
+):
+    topology_path = tmp_path / "topology.yaml"
+    write_topology(topology_path)
+    validation_path = tmp_path / "validation.npz"
+    np.savez(
+        validation_path,
+        images=np.zeros((2, 1, 28, 28), dtype=np.uint8),
+        labels=np.asarray([0, 1], dtype=np.int64),
+    )
+    configured = with_hierarchy(
+        settings,
+        tmp_path / "workspace",
+        topology_path,
+        private_api=True,
+    )
+    payload = configured.model_dump(mode="python")
+    payload["federated_learning"]["experiment_recording"] = {
+        "directory": tmp_path / "experiment-records",
+        "validation": {
+            "dataset": "mnist",
+            "path": validation_path,
+        },
+    }
+    configured = settings.__class__.model_validate(payload)
+    app = create_app(
+        configured,
+        capability_checker=verified_capability_checker(server=True),
+        nwdaf_context_client=context_client(),
+    )
+
+    with TestClient(app):
+        assert app.state.experiment_recorder is not None
+        assert app.state.fl_root._experiment_recorder is app.state.experiment_recorder
+        assert (tmp_path / "experiment-records").is_dir()
 
 
 def test_fl_server_owns_model_services_without_local_training(settings, tmp_path):

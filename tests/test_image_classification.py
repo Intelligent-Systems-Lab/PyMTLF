@@ -10,6 +10,7 @@ import torch
 
 from py_mtlf.config import (
     ArtifactSettings,
+    ExperimentRecordingSettings,
     FederatedLearningSettings,
     FittingSettings,
     FLClientSettings,
@@ -18,6 +19,7 @@ from py_mtlf.config import (
 )
 from py_mtlf.core.accuracy_policy import ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata, ArtifactRepository
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import RoundLocalArtifact, validate_fl_artifact_manifest
 from py_mtlf.core.fl_client import FLClientEngine, FLClientResource, FLClientState
@@ -106,7 +108,11 @@ def test_image_seed_bundle_records_protocol_event(tmp_path):
     assert bundle.manifest["analytics_event"] == IMAGE_CLASSIFICATION_EVENT
 
 
-def image_round_request(model_url: str) -> NwdafMLModelTrainSubsc:
+def image_round_request(
+    model_url: str,
+    *,
+    ml_correlation_id: str = "image-process-001",
+) -> NwdafMLModelTrainSubsc:
     return NwdafMLModelTrainSubsc.model_validate(
         {
             "mLEventSubscs": [
@@ -127,7 +133,7 @@ def image_round_request(model_url: str) -> NwdafMLModelTrainSubsc:
             ],
             "notifUri": "http://go.internal/training/callback",
             "notifCorreId": "image-round-client-a",
-            "mlCorreId": "image-process-001",
+            "mlCorreId": ml_correlation_id,
             "mLPreFlag": False,
             "roundInd": 0,
             "mLModelInfos": [
@@ -204,6 +210,50 @@ def test_local_image_loader_rejects_wrong_shape_and_extra_arrays(tmp_path):
     )
     with pytest.raises(ImageDatasetError, match="exactly"):
         ImageDatasetLoader().load(extra, "mnist")
+
+
+def test_image_evaluator_returns_exact_mean_cross_entropy_and_accuracy():
+    logits = torch.tensor(
+        [
+            [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    class FixedClassifier(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("fixed_logits", logits)
+
+        def forward(self, inputs):
+            return self.fixed_logits[: inputs.shape[0]]
+
+    model = FixedClassifier()
+    dataset = ImageClassificationDataset(
+        dataset=ImageDatasetName.MNIST,
+        inputs=torch.zeros((2, 1, 28, 28)),
+        targets=torch.tensor([0, 1]),
+    )
+    expected_loss = torch.nn.functional.cross_entropy(logits, dataset.targets).item()
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+
+    result = ImageClassificationEvaluator().evaluate(
+        model,
+        dataset,
+        run_id="known-logits",
+        model_artifact_key="artifact",
+        test_dataset_path="validation.npz",
+        device=torch.device("cpu"),
+        batch_size=2,
+    )
+
+    assert result.test_sample_count == 2
+    assert result.correct_count == 1
+    assert result.accuracy == pytest.approx(0.5)
+    assert result.mean_cross_entropy_loss == pytest.approx(expected_loss)
+    assert all(
+        torch.equal(before[name], value) for name, value in model.state_dict().items()
+    )
 
 
 @pytest.mark.parametrize(
@@ -478,8 +528,9 @@ def test_fl_client_round_uses_local_image_shard_and_publishes_real_result(tmp_pa
     )
     workspace = FLWorkspace(fl_settings, ArtifactSettings())
     workspace.open()
+    plan_id = "550e8400-e29b-41d4-a716-446655440000"
     round_input = workspace.publish_round_input(
-        process_id="image-process-001",
+        process_id=plan_id,
         server_nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         round_indicator=0,
         base=base,
@@ -522,6 +573,21 @@ def test_fl_client_round_uses_local_image_shard_and_publishes_real_result(tmp_pa
     context.get.return_value.nf_instance_id = (
         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     )
+    validation_path = tmp_path / "validation.npz"
+    write_shard(validation_path, channels=1, size=28, sample_count=3, seed=22)
+    recorder = ExperimentRecorder(
+        ExperimentRecordingSettings.model_validate(
+            {
+                "directory": tmp_path / "experiment-records",
+                "validation": {
+                    "dataset": "mnist",
+                    "path": validation_path,
+                    "batch_size": 2,
+                },
+            }
+        )
+    )
+    recorder.open(context.get.return_value.nf_instance_id)
     service = FLClientEngine(
         fl_settings,
         client_settings,
@@ -529,9 +595,10 @@ def test_fl_client_round_uses_local_image_shard_and_publishes_real_result(tmp_pa
         context,
         Mock(),
         transport,
+        experiment_recorder=recorder,
     )
     service._enqueue_delivery = Mock()
-    value = image_round_request(round_input.url)
+    value = image_round_request(round_input.url, ml_correlation_id=plan_id)
     resource = FLClientResource(
         subscription_id="resource-1",
         representation=value,
@@ -571,8 +638,23 @@ def test_fl_client_round_uses_local_image_shard_and_publishes_real_result(tmp_pa
         )
         transport.download.assert_called_once()
         service._enqueue_delivery.assert_called_once()
+        records = [
+            json.loads(line)
+            for line in (
+                tmp_path
+                / "experiment-records"
+                / plan_id
+                / "observations.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert len(records) == 1
+        assert records[0]["evaluationStage"] == "LEAF_LOCAL"
+        assert records[0]["roundInd"] == 0
     finally:
         service.close()
+        recorder.close()
         workspace.close()
 
 

@@ -1,12 +1,15 @@
+import json
 from datetime import UTC, datetime
 from unittest.mock import Mock
 
+import numpy as np
+import torch
 from conftest import training_scope_descriptor
 
+from py_mtlf.config import ExperimentRecordingSettings
 from py_mtlf.core.artifacts import ArtifactMetadata
-from py_mtlf.core.fl_artifacts import (
-    RoundGlobalArtifact,
-)
+from py_mtlf.core.experiment_recording import ExperimentRecorder
+from py_mtlf.core.fl_artifacts import RoundGlobalArtifact
 from py_mtlf.core.fl_branch import FLBranchPreparationCoordinator
 from py_mtlf.core.fl_candidate_orchestration import IntermediateLocalWork
 from py_mtlf.core.fl_hierarchy_discovery import (
@@ -392,11 +395,31 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
         ),
         timed_out_participant_nf_instance_ids=(),
     )
+    validation_path = tmp_path / "validation.npz"
+    np.savez(
+        validation_path,
+        images=np.zeros((2, 1, 28, 28), dtype=np.uint8),
+        labels=np.asarray([0, 1], dtype=np.int64),
+    )
+    recorder = ExperimentRecorder(
+        ExperimentRecordingSettings.model_validate(
+            {
+                "directory": tmp_path / "experiment-records",
+                "validation": {
+                    "dataset": "mnist",
+                    "path": validation_path,
+                    "batch_size": 2,
+                },
+            }
+        )
+    )
+    recorder.open(BRANCH)
     coordinator = _coordinator(
         resolver,
         artifacts,
         server,
         ml_event="X_IMAGE_CLASSIFICATION",
+        experiment_recorder=recorder,
     )
     coordinator.prepare_protocol(
         representation=_protocol_representation(),
@@ -409,15 +432,21 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
         "analytics_event": "X_IMAGE_CLASSIFICATION",
         "model_interoperability": "pymtlf-image-classification-mnist",
         "runtime_compatibility": {"framework": "torch"},
-        "model": {"input_size": 1},
-        "inference": {"seq_length": 1},
+        "dataset": "mnist",
+        "model": {"input_channels": 1, "num_classes": 10},
+        "inference": {
+            "input_shape": [1, 28, 28],
+            "class_count": 10,
+            "normalization": "uint8_to_float32_div_255",
+        },
         "fl_metadata": {
             "ml_corre_id": PLAN,
             "round_ind": 3,
             "client_training": {"epochs": 2},
         },
     }
-    upper_input = Mock(manifest=upper_manifest)
+    model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(28 * 28, 10))
+    upper_input = Mock(manifest=upper_manifest, model=model)
     upper_artifact = ArtifactMetadata(
         key="1" * 64,
         size_bytes=upper_path.stat().st_size,
@@ -443,7 +472,7 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
         ),
     ]
     coordinator._loader = Mock()
-    coordinator._loader.load.return_value = Mock(manifest=upper_manifest)
+    coordinator._loader.load.return_value = Mock(manifest=upper_manifest, model=model)
     local_input = Mock(
         url="http://branch.example/lower-input",
         digest="7" * 64,
@@ -503,6 +532,20 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
     assert second.kwargs["round_input_artifact"] is local_input
     artifacts.publish_round_input.assert_called_once()
     coordinator.close()
+    recorder.close()
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "experiment-records" / PLAN / "observations.jsonl"
+        )
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["evaluationStage"] for record in records] == [
+        "BRANCH_DOMAIN",
+        "BRANCH_DOMAIN",
+    ]
+    assert [record["roundInd"] for record in records] == [0, 1]
 
 
 def _lower_global(tmp_path, round_indicator: int, *, process_id="lower-process"):

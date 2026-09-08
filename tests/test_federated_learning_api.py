@@ -15,6 +15,7 @@ from py_mtlf.core.fl_orchestration import (
 from py_mtlf.core.fl_server import FLProcess
 
 REQUEST_ID = "00000000-0000-4000-8000-000000000701"
+PLAN_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 def app_with(coordinator) -> FastAPI:
@@ -32,6 +33,7 @@ def snapshot(
 ):
     return SimpleNamespace(
         request_id=REQUEST_ID,
+        plan_id=None,
         model_family_id="ue-communication-default",
         state=state,
         mode=mode,
@@ -99,6 +101,25 @@ def test_private_training_request_returns_common_async_resource_and_status():
         model_family_id="ue-communication-default",
     )
     assert coordinator.get.call_count == 2
+
+
+def test_hierarchical_training_status_exposes_the_record_correlation_id():
+    coordinator = Mock()
+    coordinator.submit_manual.return_value = SimpleNamespace(
+        **{**snapshot().__dict__, "plan_id": PLAN_ID},
+    )
+
+    with TestClient(app_with(coordinator)) as client:
+        response = client.post(
+            "/internal/v1/federated-learning/training-requests",
+            json={
+                "requestId": REQUEST_ID,
+                "modelFamilyId": "ue-communication-default",
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["planId"] == PLAN_ID
 
 
 def test_private_training_request_maps_conflict_missing_family_and_unavailable():

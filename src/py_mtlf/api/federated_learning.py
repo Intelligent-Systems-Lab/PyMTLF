@@ -80,6 +80,7 @@ def _status_response(
 ) -> JSONResponse:
     value = FederatedTrainingStatus(
         requestId=snapshot.request_id,
+        planId=snapshot.plan_id,
         modelFamilyId=snapshot.model_family_id,
         mode=snapshot.mode,
         participantSource=snapshot.participant_source,

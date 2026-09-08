@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,15 @@ class ImageClassificationDataset:
 
 
 @dataclass(frozen=True)
+class ImageClassificationMetrics:
+    dataset: ImageDatasetName
+    sample_count: int
+    correct_count: int
+    mean_cross_entropy_loss: float
+    accuracy: float
+
+
+@dataclass(frozen=True)
 class ImageEvaluationResult:
     run_id: str
     model_artifact_key: str
@@ -34,6 +44,7 @@ class ImageEvaluationResult:
     dataset: ImageDatasetName
     test_sample_count: int
     correct_count: int
+    mean_cross_entropy_loss: float
     accuracy: float
     evaluated_at: datetime
 
@@ -83,6 +94,57 @@ class ImageDatasetLoader:
 
 
 class ImageClassificationEvaluator:
+    def evaluate_metrics(
+        self,
+        model: torch.nn.Module,
+        dataset: ImageClassificationDataset,
+        *,
+        device: torch.device,
+        batch_size: int,
+    ) -> ImageClassificationMetrics:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        was_training = model.training
+        first_tensor = next(chain(model.parameters(), model.buffers()), None)
+        original_device = first_tensor.device if first_tensor is not None else torch.device("cpu")
+        model.to(device)
+        model.eval()
+        contract = image_dataset_contract(dataset.dataset)
+        correct = 0
+        loss_sum = 0.0
+        try:
+            with torch.no_grad():
+                for offset in range(0, dataset.sample_count, batch_size):
+                    inputs = dataset.inputs[offset : offset + batch_size].to(device)
+                    targets = dataset.targets[offset : offset + batch_size].to(device)
+                    logits = model(inputs)
+                    if logits.shape != (targets.shape[0], contract.class_count):
+                        raise ImageDatasetError(
+                            "image classifier output shape is incompatible"
+                        )
+                    loss_sum += float(
+                        torch.nn.functional.cross_entropy(
+                            logits,
+                            targets,
+                            reduction="sum",
+                        ).item()
+                    )
+                    correct += int((logits.argmax(dim=1) == targets).sum().item())
+        finally:
+            model.to(original_device)
+            model.train(was_training)
+        accuracy = correct / dataset.sample_count
+        mean_loss = loss_sum / dataset.sample_count
+        if not math.isfinite(accuracy) or not math.isfinite(mean_loss):
+            raise ImageDatasetError("image classifier metrics are not finite")
+        return ImageClassificationMetrics(
+            dataset=dataset.dataset,
+            sample_count=dataset.sample_count,
+            correct_count=correct,
+            mean_cross_entropy_loss=mean_loss,
+            accuracy=accuracy,
+        )
+
     def evaluate(
         self,
         model: torch.nn.Module,
@@ -98,35 +160,20 @@ class ImageClassificationEvaluator:
             raise ValueError("run_id must not be blank")
         if not model_artifact_key.strip():
             raise ValueError("model_artifact_key must not be blank")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        model.to(device)
-        model.eval()
-        contract = image_dataset_contract(dataset.dataset)
-        correct = 0
-        try:
-            with torch.no_grad():
-                for offset in range(0, dataset.sample_count, batch_size):
-                    inputs = dataset.inputs[offset : offset + batch_size].to(device)
-                    targets = dataset.targets[offset : offset + batch_size].to(device)
-                    logits = model(inputs)
-                    if logits.shape != (targets.shape[0], contract.class_count):
-                        raise ImageDatasetError(
-                            "image classifier output shape is incompatible"
-                        )
-                    correct += int((logits.argmax(dim=1) == targets).sum().item())
-        finally:
-            model.to("cpu")
-        accuracy = correct / dataset.sample_count
-        if not math.isfinite(accuracy):
-            raise ImageDatasetError("image classifier accuracy is not finite")
+        metrics = self.evaluate_metrics(
+            model,
+            dataset,
+            device=device,
+            batch_size=batch_size,
+        )
         return ImageEvaluationResult(
             run_id=run_id,
             model_artifact_key=model_artifact_key,
             test_dataset_path=str(Path(test_dataset_path)),
-            dataset=dataset.dataset,
-            test_sample_count=dataset.sample_count,
-            correct_count=correct,
-            accuracy=accuracy,
+            dataset=metrics.dataset,
+            test_sample_count=metrics.sample_count,
+            correct_count=metrics.correct_count,
+            mean_cross_entropy_loss=metrics.mean_cross_entropy_loss,
+            accuracy=metrics.accuracy,
             evaluated_at=datetime.now(UTC),
         )

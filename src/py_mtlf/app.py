@@ -30,6 +30,7 @@ from py_mtlf.core.adrf_discovery import AdrfResolver
 from py_mtlf.core.artifacts import ArtifactRepository
 from py_mtlf.core.collection_relay import CollectionRelayClient
 from py_mtlf.core.dataset import DatasetCoordinator
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_branch import FLBranchPreparationCoordinator
 from py_mtlf.core.fl_client import FLClientEngine
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
@@ -114,6 +115,15 @@ def create_app(
     nwdaf_context = nwdaf_context_client or NwdafContextClient(
         settings.containing_nwdaf.internal_api_root,
         settings.containing_nwdaf.request_timeout_seconds,
+    )
+    experiment_recording_settings = settings.federated_learning.experiment_recording
+    experiment_recorder = (
+        ExperimentRecorder(
+            experiment_recording_settings,
+            nf_instance_id_provider=lambda: nwdaf_context.get().nf_instance_id,
+        )
+        if experiment_recording_settings is not None
+        else None
     )
     capability_checker = capability_checker or CapabilityConsistencyChecker(
         nwdaf_context,
@@ -282,6 +292,7 @@ def create_app(
             tombstone_ttl_seconds=(
                 settings.federated_learning.lifecycle.tombstone_ttl_seconds
             ),
+            experiment_recorder=experiment_recorder,
         )
     fl_client = (
         FLClientEngine(
@@ -294,6 +305,7 @@ def create_app(
             experiments=fl_experiments,
             branch_coordinator=fl_branch,
             round_model_distribution=round_model_distribution,
+            experiment_recorder=experiment_recorder,
         )
         if fl_client_settings is not None
         else None
@@ -324,6 +336,7 @@ def create_app(
                 policy=accuracy_policy,
                 experiments=fl_experiments,
                 round_model_distribution=round_model_distribution,
+                experiment_recorder=experiment_recorder,
                 terminal_status_ttl_seconds=(
                     settings.federated_learning.lifecycle.terminal_status_ttl_seconds
                 ),
@@ -389,6 +402,8 @@ def create_app(
         logger.info("MTLF backend startup begin mode=%s", settings.runtime.mode)
         try:
             nwdaf_context.open()
+            if experiment_recorder is not None:
+                experiment_recorder.open()
             if training_data_collection_manager is not None:
                 training_data_collection_manager.open()
             _prepare_workspace(settings.federated_learning.workspace_root)
@@ -441,6 +456,8 @@ def create_app(
                 provision_notifications.shutdown()
             nwdaf_monitor_resolver.close()
             nwdaf_context.close()
+            if experiment_recorder is not None:
+                experiment_recorder.close()
             runtime.artifact_status = "stopped"
             logger.info("MTLF backend shutdown complete")
 
@@ -474,6 +491,7 @@ def create_app(
         settings.federated_learning.training_trigger.degradation.enabled
     )
     app.state.fl_experiments = fl_experiments
+    app.state.experiment_recorder = experiment_recorder
     app.state.publication = publication
     app.state.round_model_distribution = round_model_distribution
     app.state.state_lock = state_lock

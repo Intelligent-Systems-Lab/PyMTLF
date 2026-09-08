@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from py_mtlf.config import (
     AdrfSettings,
     ArtifactSettings,
+    ExperimentRecordingSettings,
     FederatedLearningSettings,
     FittingSettings,
     FLClientSettings,
@@ -48,6 +49,7 @@ def test_defaults_use_confirmed_phase_one_values():
     assert FLServerSettings().client_training.epochs == 18
     assert FLLifecycleSettings().terminal_status_ttl_seconds == 3600
     assert FLLifecycleSettings().tombstone_ttl_seconds == 3600
+    assert settings.federated_learning.experiment_recording is None
 
 
 def test_workspace_must_not_overlap_durable_roots(tmp_path):
@@ -59,6 +61,62 @@ def test_workspace_must_not_overlap_durable_roots(tmp_path):
             federated_learning=FederatedLearningSettings(
                 workspace_root=workspace_root,
             ),
+        )
+
+
+def test_workspace_must_not_overlap_experiment_records(tmp_path):
+    workspace_root = tmp_path / "fl-workspaces"
+
+    with pytest.raises(ValidationError, match="must not overlap experiment records"):
+        Settings(
+            federated_learning=FederatedLearningSettings(
+                workspace_root=workspace_root,
+                experiment_recording=ExperimentRecordingSettings(
+                    directory=workspace_root / "records"
+                ),
+            ),
+        )
+
+
+def test_load_settings_resolves_experiment_recording_paths(tmp_path):
+    config_path = tmp_path / "config" / "pymtlf.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        """
+federated_learning:
+  experiment_recording:
+    directory: ../records
+    validation:
+      dataset: mnist
+      path: ../datasets/validation.npz
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path)
+
+    recording = settings.federated_learning.experiment_recording
+    assert recording is not None
+    assert recording.directory == (tmp_path / "records").resolve()
+    assert recording.validation is not None
+    assert recording.validation.path == (tmp_path / "datasets/validation.npz").resolve()
+
+
+def test_experiment_recording_rejects_incomplete_or_unknown_settings(tmp_path):
+    with pytest.raises(ValidationError):
+        FederatedLearningSettings.model_validate({"experiment_recording": {}})
+    with pytest.raises(ValidationError):
+        FederatedLearningSettings.model_validate(
+            {
+                "experiment_recording": {
+                    "directory": str(tmp_path / "records"),
+                    "validation": {
+                        "dataset": "mnist",
+                        "path": str(tmp_path / "validation.npz"),
+                        "unknown": True,
+                    },
+                }
+            }
         )
 
 

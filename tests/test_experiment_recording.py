@@ -1,0 +1,205 @@
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pytest
+import torch
+
+from py_mtlf.config import ExperimentRecordingSettings
+from py_mtlf.core.experiment_recording import ExperimentRecorder
+
+PLAN_ID = "550e8400-e29b-41d4-a716-446655440000"
+NF_INSTANCE_ID = "10000000-0000-4000-8000-000000000001"
+
+
+def _recorder(tmp_path, *, validation=False):
+    payload = {"directory": tmp_path / "records"}
+    if validation:
+        validation_path = tmp_path / "validation.npz"
+        np.savez(
+            validation_path,
+            images=np.zeros((2, 1, 28, 28), dtype=np.uint8),
+            labels=np.asarray([0, 1], dtype=np.int64),
+        )
+        payload["validation"] = {
+            "dataset": "mnist",
+            "path": validation_path,
+            "batch_size": 2,
+        }
+    recorder = ExperimentRecorder(ExperimentRecordingSettings.model_validate(payload))
+    recorder.open(NF_INSTANCE_ID)
+    return recorder
+
+
+def _records(tmp_path):
+    path = tmp_path / "records" / PLAN_ID / "observations.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_recorder_appends_reopens_and_keeps_each_line_valid_json(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.record_root_round_outcome(
+        ml_correlation_id=PLAN_ID,
+        round_indicator=0,
+        accepted=False,
+        selected_nf_instance_ids=(NF_INSTANCE_ID,),
+        successful_nf_instance_ids=(),
+        failed_nf_instance_ids=(NF_INSTANCE_ID,),
+    )
+    recorder.close()
+
+    recorder = _recorder(tmp_path)
+    recorder.record_branch_failure_detected(
+        ml_correlation_id=PLAN_ID,
+        round_indicator=0,
+        failed_branch_nf_instance_id=NF_INSTANCE_ID,
+    )
+    recorder.close()
+
+    assert [record["recordType"] for record in _records(tmp_path)] == [
+        "ROOT_ROUND_OUTCOME",
+        "BRANCH_FAILURE_DETECTED",
+    ]
+
+
+def test_start_procedure_creates_an_empty_append_target(tmp_path):
+    recorder = _recorder(tmp_path)
+
+    recorder.start_procedure(PLAN_ID)
+    recorder.close()
+
+    path = tmp_path / "records" / PLAN_ID / "observations.jsonl"
+    assert path.is_file()
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_recorder_defers_nf_identity_lookup_until_the_first_record(tmp_path):
+    requested = []
+    recorder = ExperimentRecorder(
+        ExperimentRecordingSettings(directory=tmp_path / "records"),
+        nf_instance_id_provider=lambda: requested.append(True) or NF_INSTANCE_ID,
+    )
+
+    recorder.open()
+    assert requested == []
+    recorder.start_procedure(PLAN_ID)
+    recorder.record_root_round_outcome(
+        ml_correlation_id=PLAN_ID,
+        round_indicator=0,
+        accepted=True,
+        selected_nf_instance_ids=(NF_INSTANCE_ID,),
+        successful_nf_instance_ids=(NF_INSTANCE_ID,),
+        failed_nf_instance_ids=(),
+    )
+    recorder.close()
+
+    assert requested == [True]
+    assert _records(tmp_path)[0]["nfInstanceId"] == NF_INSTANCE_ID
+
+
+def test_recorder_rejects_writes_before_open_and_duplicate_open(tmp_path):
+    recorder = ExperimentRecorder(
+        ExperimentRecordingSettings(directory=tmp_path / "records"),
+        nf_instance_id_provider=lambda: NF_INSTANCE_ID,
+    )
+
+    with pytest.raises(RuntimeError, match="not open"):
+        recorder.start_procedure(PLAN_ID)
+    recorder.open()
+    with pytest.raises(RuntimeError, match="already open"):
+        recorder.open()
+    recorder.close()
+
+
+def test_recorder_serializes_concurrent_writers_without_corrupting_lines(tmp_path):
+    recorder = _recorder(tmp_path)
+
+    def write(round_indicator):
+        recorder.record_root_round_outcome(
+            ml_correlation_id=PLAN_ID,
+            round_indicator=round_indicator,
+            accepted=True,
+            selected_nf_instance_ids=(NF_INSTANCE_ID,),
+            successful_nf_instance_ids=(NF_INSTANCE_ID,),
+            failed_nf_instance_ids=(),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write, range(40)))
+    recorder.close()
+
+    records = _records(tmp_path)
+    assert len(records) == 40
+    assert {record["roundInd"] for record in records} == set(range(40))
+
+
+def test_recorder_evaluates_real_model_and_rejects_dataset_mismatch(tmp_path):
+    recorder = _recorder(tmp_path, validation=True)
+    model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(28 * 28, 10))
+    manifest = {
+        "dataset": "mnist",
+        "model": {"input_channels": 1, "num_classes": 10},
+        "inference": {
+            "input_shape": [1, 28, 28],
+            "class_count": 10,
+            "normalization": "uint8_to_float32_div_255",
+        },
+    }
+    before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+
+    recorder.record_model_evaluation(
+        ml_correlation_id=PLAN_ID,
+        evaluation_stage="ROOT_INITIAL",
+        model=model,
+        manifest=manifest,
+    )
+
+    record = _records(tmp_path)[0]
+    assert record["sampleCount"] == 2
+    assert np.isfinite(record["validationLoss"])
+    assert 0 <= record["validationAccuracy"] <= 1
+    assert "roundInd" not in record
+    assert all(
+        torch.equal(before[name], value) for name, value in model.state_dict().items()
+    )
+    assert model.training is True
+    with pytest.raises(ValueError, match="does not match"):
+        recorder.record_model_evaluation(
+            ml_correlation_id=PLAN_ID,
+            evaluation_stage="ROOT_GLOBAL",
+            round_indicator=0,
+            model=model,
+            manifest={
+                "dataset": "cifar10",
+                "model": {"input_channels": 3, "num_classes": 10},
+                "inference": {
+                    "input_shape": [3, 32, 32],
+                    "class_count": 10,
+                    "normalization": "uint8_to_float32_div_255",
+                },
+            },
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        recorder.record_model_evaluation(
+            ml_correlation_id=PLAN_ID,
+            evaluation_stage="ROOT_GLOBAL",
+            round_indicator=True,
+            model=model,
+            manifest=manifest,
+        )
+    recorder.close()
+
+
+def test_recorder_startup_rejects_missing_validation_dataset(tmp_path):
+    settings = ExperimentRecordingSettings.model_validate(
+        {
+            "directory": tmp_path / "records",
+            "validation": {
+                "dataset": "mnist",
+                "path": tmp_path / "missing.npz",
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="not found"):
+        ExperimentRecorder(settings).open(NF_INSTANCE_ID)

@@ -7,12 +7,14 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
 from py_mtlf.config import FLServerSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_artifacts import RoundLocalResultType
 from py_mtlf.core.fl_candidate_orchestration import (
     CandidatePool,
@@ -218,6 +220,7 @@ class FLRootCoordinator:
         experiments: FLExperimentRegistry,
         loader: TrustedBundleLoader | None = None,
         round_model_distribution: RoundModelDistribution | None = None,
+        experiment_recorder: ExperimentRecorder | None = None,
         terminal_status_ttl_seconds: int = 3600,
         clock=time.monotonic,
         random_source: random.Random | None = None,
@@ -238,6 +241,7 @@ class FLRootCoordinator:
         self._experiments = experiments
         self._loader = loader or TrustedBundleLoader()
         self._round_model_distribution = round_model_distribution
+        self._experiment_recorder = experiment_recorder
         self._terminal_status_ttl_seconds = terminal_status_ttl_seconds
         self._clock = clock
         self._random = random_source or random.Random()
@@ -507,6 +511,8 @@ class FLRootCoordinator:
         cause = RootFailureCause.VALIDATION_FAILED
         try:
             self._set_state(record, RootRequestState.VALIDATING)
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.start_procedure(record.initiation.plan_id)
             current = self._catalog.current(record.initiation.model_family_id)
             if current is None:
                 raise RuntimeError("FL base model is no longer current")
@@ -529,6 +535,16 @@ class FLRootCoordinator:
                 )
             topology = self._planner.build(root_nf_instance_id=context.nf_instance_id)
             base = self._loader.load(current.artifact)
+            if (
+                self._experiment_recorder is not None
+                and self._experiment_recorder.validation_enabled
+            ):
+                self._experiment_recorder.record_model_evaluation(
+                    ml_correlation_id=record.initiation.plan_id,
+                    evaluation_stage="ROOT_INITIAL",
+                    model=base.model,
+                    manifest=base.manifest,
+                )
 
             cause = RootFailureCause.DISCOVERY_FAILED
             branch_groups = [
@@ -754,6 +770,23 @@ class FLRootCoordinator:
                         self._observe_server_round_state(record, current_round, state)
                     ),
                 )
+                outcome_recorded_at = datetime.now(UTC)
+                if self._experiment_recorder is not None:
+                    self._experiment_recorder.record_root_round_outcome(
+                        ml_correlation_id=record.initiation.plan_id,
+                        round_indicator=round_indicator,
+                        accepted=outcome.accepted,
+                        selected_nf_instance_ids=(
+                            outcome.selected_participant_nf_instance_ids
+                        ),
+                        successful_nf_instance_ids=(
+                            outcome.successful_participant_nf_instance_ids
+                        ),
+                        failed_nf_instance_ids=(
+                            outcome.failed_participant_nf_instance_ids
+                        ),
+                        recorded_at=outcome_recorded_at,
+                    )
             finally:
                 distribution.cleanup(record.initiation.plan_id, round_indicator)
             self._ensure_active_generation(record)
@@ -761,6 +794,13 @@ class FLRootCoordinator:
                 raise RuntimeError("multiple direct Branch failures are not recoverable")
             completed_after_attempt = record.completed_rounds + int(outcome.accepted)
             for failed_branch_id in outcome.failed_participant_nf_instance_ids:
+                if self._experiment_recorder is not None:
+                    self._experiment_recorder.record_branch_failure_detected(
+                        ml_correlation_id=record.initiation.plan_id,
+                        round_indicator=round_indicator,
+                        failed_branch_nf_instance_id=failed_branch_id,
+                        recorded_at=outcome_recorded_at,
+                    )
                 self._retire_failed_branch(
                     record=record,
                     process=process,
@@ -780,6 +820,17 @@ class FLRootCoordinator:
                         url=aggregate.url,
                     )
                 )
+                if (
+                    self._experiment_recorder is not None
+                    and self._experiment_recorder.validation_enabled
+                ):
+                    self._experiment_recorder.record_model_evaluation(
+                        ml_correlation_id=record.initiation.plan_id,
+                        evaluation_stage="ROOT_GLOBAL",
+                        round_indicator=round_indicator,
+                        model=source.model,
+                        manifest=source.manifest,
+                    )
             with self._condition:
                 if (
                     self._closing
@@ -1122,6 +1173,7 @@ class FLRootCoordinator:
                 record,
                 process.process_id,
                 group,
+                failed_branch_nf_instance_id,
                 descriptor.event,
                 descriptor.event_filter,
                 descriptor.model_interoperability,
@@ -1141,6 +1193,7 @@ class FLRootCoordinator:
         record: _RootRequestRecord,
         process_id: str,
         group: _RootBranchGroup,
+        failed_branch_nf_instance_id: str,
         ml_event: str,
         ml_event_filter: dict,
         model_interoperability: str,
@@ -1193,6 +1246,16 @@ class FLRootCoordinator:
                         record.initiation.plan_id,
                         outcome.participant_nf_instance_id,
                     )
+                    if self._experiment_recorder is not None:
+                        self._experiment_recorder.record_branch_replacement_ready(
+                            ml_correlation_id=record.initiation.plan_id,
+                            failed_branch_nf_instance_id=(
+                                failed_branch_nf_instance_id
+                            ),
+                            replacement_branch_nf_instance_id=(
+                                outcome.participant_nf_instance_id
+                            ),
+                        )
                     return
                 if outcome.resource_location:
                     self._server.remove_protocol_participant(

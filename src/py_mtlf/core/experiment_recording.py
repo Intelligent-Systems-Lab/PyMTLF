@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
+
+import torch
+
+from py_mtlf.config import ExperimentRecordingSettings
+from py_mtlf.core.fl_hierarchy import normalize_nf_instance_id, normalize_plan_id
+from py_mtlf.core.image_classification import (
+    ImageClassificationDataset,
+    ImageClassificationEvaluator,
+    ImageDatasetLoader,
+)
+from py_mtlf.core.trainer import resolve_device
+from py_mtlf.core.workloads import validate_image_manifest
+
+EvaluationStage = Literal[
+    "ROOT_INITIAL",
+    "ROOT_GLOBAL",
+    "BRANCH_DOMAIN",
+    "LEAF_LOCAL",
+]
+
+
+class ExperimentRecorder:
+    """Persist node-local hierarchical FL observations as append-only JSONL."""
+
+    def __init__(
+        self,
+        settings: ExperimentRecordingSettings,
+        nf_instance_id_provider: Callable[[], str] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._lock = threading.RLock()
+        self._opened = False
+        self._nf_instance_id: str | None = None
+        self._nf_instance_id_provider = nf_instance_id_provider
+        self._validation_dataset: ImageClassificationDataset | None = None
+        self._evaluator = ImageClassificationEvaluator()
+
+    @property
+    def validation_enabled(self) -> bool:
+        return self._settings.validation is not None
+
+    def open(self, nf_instance_id: str | None = None) -> None:
+        normalized_nf_instance_id = (
+            normalize_nf_instance_id(nf_instance_id)
+            if nf_instance_id is not None
+            else None
+        )
+        directory = self._settings.directory
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise RuntimeError("experiment recording directory is not a directory")
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=directory,
+                prefix=".pymtlf-write-probe-",
+            ):
+                pass
+        except OSError as error:
+            raise RuntimeError("experiment recording directory is not writable") from error
+        validation = self._settings.validation
+        dataset = None
+        if validation is not None:
+            dataset = ImageDatasetLoader().load(validation.path, validation.dataset)
+        with self._lock:
+            if self._opened:
+                raise RuntimeError("experiment recorder is already open")
+            self._opened = True
+            self._nf_instance_id = normalized_nf_instance_id
+            self._validation_dataset = dataset
+
+    def start_procedure(self, ml_correlation_id: str) -> None:
+        with self._lock:
+            self._required_nf_instance_id()
+            path = self._observation_path(normalize_plan_id(ml_correlation_id))
+            path.touch(exist_ok=True)
+
+    def close(self) -> None:
+        with self._lock:
+            self._opened = False
+            self._nf_instance_id = None
+            self._validation_dataset = None
+
+    def record_model_evaluation(
+        self,
+        *,
+        ml_correlation_id: str,
+        evaluation_stage: EvaluationStage,
+        model: torch.nn.Module,
+        manifest: Mapping[str, object],
+        round_indicator: int | None = None,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        validation = self._settings.validation
+        dataset = self._validation_dataset
+        if validation is None:
+            return
+        if dataset is None:
+            raise RuntimeError("experiment recorder is not open")
+        if evaluation_stage == "ROOT_INITIAL":
+            if round_indicator is not None:
+                raise ValueError("ROOT_INITIAL must not have a round indicator")
+        elif round_indicator is None:
+            raise ValueError("model evaluation requires a round indicator")
+        else:
+            round_indicator = _round_indicator(round_indicator)
+        contract = validate_image_manifest(manifest)
+        if contract.name != dataset.dataset or contract.name.value != validation.dataset:
+            raise ValueError("validation dataset does not match model bundle dataset")
+        timestamp = _recorded_at(recorded_at)
+        result = self._evaluator.evaluate_metrics(
+            model,
+            dataset,
+            device=resolve_device(validation.device),
+            batch_size=validation.batch_size,
+        )
+        record: dict[str, object] = {
+            "recordedAt": timestamp,
+            "recordType": "MODEL_EVALUATION",
+            "mlCorreId": normalize_plan_id(ml_correlation_id),
+            "nfInstanceId": self._required_nf_instance_id(),
+            "evaluationStage": evaluation_stage,
+            "dataset": result.dataset.value,
+            "sampleCount": result.sample_count,
+            "validationLoss": result.mean_cross_entropy_loss,
+            "validationAccuracy": result.accuracy,
+        }
+        if round_indicator is not None:
+            record["roundInd"] = round_indicator
+        self._append(record)
+
+    def record_root_round_outcome(
+        self,
+        *,
+        ml_correlation_id: str,
+        round_indicator: int,
+        accepted: bool,
+        selected_nf_instance_ids: tuple[str, ...],
+        successful_nf_instance_ids: tuple[str, ...],
+        failed_nf_instance_ids: tuple[str, ...],
+        recorded_at: datetime | None = None,
+    ) -> None:
+        self._append_base(
+            ml_correlation_id,
+            "ROOT_ROUND_OUTCOME",
+            recorded_at,
+            roundInd=_round_indicator(round_indicator),
+            accepted=accepted,
+            selectedNfInstanceIds=_nf_instance_ids(selected_nf_instance_ids),
+            successfulNfInstanceIds=_nf_instance_ids(successful_nf_instance_ids),
+            failedNfInstanceIds=_nf_instance_ids(failed_nf_instance_ids),
+        )
+
+    def record_branch_failure_detected(
+        self,
+        *,
+        ml_correlation_id: str,
+        round_indicator: int,
+        failed_branch_nf_instance_id: str,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        self._append_base(
+            ml_correlation_id,
+            "BRANCH_FAILURE_DETECTED",
+            recorded_at,
+            roundInd=_round_indicator(round_indicator),
+            failedBranchNfInstanceId=normalize_nf_instance_id(
+                failed_branch_nf_instance_id
+            ),
+        )
+
+    def record_branch_replacement_ready(
+        self,
+        *,
+        ml_correlation_id: str,
+        failed_branch_nf_instance_id: str,
+        replacement_branch_nf_instance_id: str,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        self._append_base(
+            ml_correlation_id,
+            "BRANCH_REPLACEMENT_READY",
+            recorded_at,
+            failedBranchNfInstanceId=normalize_nf_instance_id(
+                failed_branch_nf_instance_id
+            ),
+            replacementBranchNfInstanceId=normalize_nf_instance_id(
+                replacement_branch_nf_instance_id
+            ),
+        )
+
+    def _append_base(
+        self,
+        ml_correlation_id: str,
+        record_type: str,
+        recorded_at: datetime | None,
+        **fields: object,
+    ) -> None:
+        self._append(
+            {
+                "recordedAt": _recorded_at(recorded_at),
+                "recordType": record_type,
+                "mlCorreId": normalize_plan_id(ml_correlation_id),
+                "nfInstanceId": self._required_nf_instance_id(),
+                **fields,
+            }
+        )
+
+    def _append(self, record: Mapping[str, object]) -> None:
+        ml_correlation_id = normalize_plan_id(str(record["mlCorreId"]))
+        serialized = json.dumps(
+            dict(record),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self._required_nf_instance_id()
+            path = self._observation_path(ml_correlation_id)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(serialized + "\n")
+                stream.flush()
+
+    def _observation_path(self, ml_correlation_id: str) -> Path:
+        procedure_directory = self._settings.directory / ml_correlation_id
+        procedure_directory.mkdir(parents=True, exist_ok=True)
+        return procedure_directory / "observations.jsonl"
+
+    def _required_nf_instance_id(self) -> str:
+        if not self._opened:
+            raise RuntimeError("experiment recorder is not open")
+        if self._nf_instance_id is None:
+            if self._nf_instance_id_provider is None:
+                raise RuntimeError("experiment recorder has no NF instance identity")
+            self._nf_instance_id = normalize_nf_instance_id(
+                self._nf_instance_id_provider()
+            )
+        return self._nf_instance_id
+
+
+def _recorded_at(value: datetime | None) -> str:
+    timestamp = value or datetime.now(UTC)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("recordedAt must include a timezone")
+    return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _round_indicator(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("round indicator must be a non-negative integer")
+    return value
+
+
+def _nf_instance_ids(values: tuple[str, ...]) -> list[str]:
+    return [normalize_nf_instance_id(value) for value in values]

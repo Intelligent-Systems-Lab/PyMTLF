@@ -50,6 +50,7 @@ class FlatRequestSnapshot:
     mode: str
     participant_source: str
     trigger_source: str
+    plan_id: str | None = None
     current_round: int | None = None
     completed_rounds: int = 0
     candidate_digest: str = ""

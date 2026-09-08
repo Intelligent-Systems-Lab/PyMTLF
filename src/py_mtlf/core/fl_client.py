@@ -22,6 +22,7 @@ from py_mtlf.config import (
 from py_mtlf.core.accuracy_policy import RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJob, DatasetJobState, DatasetSnapshot
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
     RoundGlobalArtifact,
@@ -192,6 +193,7 @@ class FLClientEngine:
         experiments: FLExperimentRegistry | None = None,
         branch_coordinator: BranchPreparationDispatcher | None = None,
         round_model_distribution: RoundModelDistribution | None = None,
+        experiment_recorder: ExperimentRecorder | None = None,
         clock=time.monotonic,
     ) -> None:
         self._settings = settings
@@ -203,6 +205,7 @@ class FLClientEngine:
         self._experiments = experiments or FLExperimentRegistry()
         self._branch_coordinator = branch_coordinator
         self._round_model_distribution = round_model_distribution
+        self._experiment_recorder = experiment_recorder
         self._trainer = FederatedTrainer(client_settings.training)
         self._device = resolve_device(client_settings.training.device)
         self._dataset_builder = TrainingDatasetBuilder(client_settings.training)
@@ -1319,6 +1322,17 @@ class FLClientEngine:
                 if current is not resource or current.revision != revision:
                     return
             participant_id = self._participant_id()
+            if (
+                self._experiment_recorder is not None
+                and self._experiment_recorder.validation_enabled
+            ):
+                self._experiment_recorder.record_model_evaluation(
+                    ml_correlation_id=value.ml_correlation_id or "",
+                    evaluation_stage="LEAF_LOCAL",
+                    round_indicator=value.round_indicator,
+                    model=result.model,
+                    manifest=base.manifest,
+                )
             metadata = {
                 "artifact_role": "ROUND_LOCAL",
                 "result_type": "TRAINING",

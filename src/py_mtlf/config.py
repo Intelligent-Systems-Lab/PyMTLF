@@ -561,6 +561,47 @@ class FLLifecycleSettings(FrozenSettings):
     tombstone_ttl_seconds: int = Field(default=3600, gt=0)
 
 
+class ExperimentValidationSettings(FrozenSettings):
+    dataset: Literal["mnist", "cifar10"]
+    path: Path
+    device: str = "cpu"
+    batch_size: int = Field(default=128, gt=0)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def validate_path(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)):
+            raise ValueError("experiment validation path must be a filesystem path")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("experiment validation path must not be blank")
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("experiment validation path must be resolved from config")
+        return path
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        return FittingRuntimeSettings.validate_device(value)
+
+
+class ExperimentRecordingSettings(FrozenSettings):
+    directory: Path
+    validation: ExperimentValidationSettings | None = None
+
+    @field_validator("directory", mode="before")
+    @classmethod
+    def validate_directory(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)):
+            raise ValueError("experiment recording directory must be a filesystem path")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("experiment recording directory must not be blank")
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("experiment recording directory must be resolved from config")
+        return path
+
+
 class FederatedLearningSettings(FrozenSettings):
     workspace_root: Path = Path("data/fl-workspaces")
     workspace_ttl_seconds: int = Field(default=3600, gt=0)
@@ -573,6 +614,7 @@ class FederatedLearningSettings(FrozenSettings):
     topology: TopologySettings | None = None
     training_trigger: TrainingTriggerSettings = TrainingTriggerSettings()
     lifecycle: FLLifecycleSettings = FLLifecycleSettings()
+    experiment_recording: ExperimentRecordingSettings | None = None
 
     @field_validator("workspace_root", mode="before")
     @classmethod
@@ -863,6 +905,14 @@ class Settings(FrozenSettings):
             raise ValueError(
                 "federated_learning.workspace_root must not overlap durable storage"
             )
+        experiment_recording = self.federated_learning.experiment_recording
+        if experiment_recording is not None and _paths_overlap(
+            workspace_root,
+            experiment_recording.directory.resolve(),
+        ):
+            raise ValueError(
+                "federated_learning.workspace_root must not overlap experiment records"
+            )
         return self
 
 
@@ -873,6 +923,24 @@ def load_settings(path: str | Path) -> Settings:
     if isinstance(raw, dict):
         federated_learning = raw.get("federated_learning")
         if isinstance(federated_learning, dict):
+            experiment_recording = federated_learning.get("experiment_recording")
+            if isinstance(experiment_recording, dict):
+                directory = experiment_recording.get("directory")
+                if isinstance(directory, str) and directory.strip():
+                    candidate = Path(directory)
+                    if not candidate.is_absolute():
+                        experiment_recording["directory"] = str(
+                            (config_path.parent / candidate).resolve()
+                        )
+                validation = experiment_recording.get("validation")
+                if isinstance(validation, dict):
+                    validation_path = validation.get("path")
+                    if isinstance(validation_path, str) and validation_path.strip():
+                        candidate = Path(validation_path)
+                        if not candidate.is_absolute():
+                            validation["path"] = str(
+                                (config_path.parent / candidate).resolve()
+                            )
             topology = federated_learning.get("topology")
             if isinstance(topology, dict):
                 topology_path = topology.get("config_file")

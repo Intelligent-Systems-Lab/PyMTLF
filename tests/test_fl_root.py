@@ -1,12 +1,16 @@
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import UUID
 
+import numpy as np
 import pytest
+import torch
 
-from py_mtlf.config import FLServerSettings
+from py_mtlf.config import ExperimentRecordingSettings, FLServerSettings
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_experiment import FLExperimentRegistry
 from py_mtlf.core.fl_hierarchy_discovery import (
     HierarchyDiscoveryError,
@@ -38,6 +42,45 @@ LEAF_C_ID = "00000000-0000-4000-8000-000000000201"
 LEAF_D_ID = "00000000-0000-4000-8000-000000000202"
 REQUEST_A_ID = "00000000-0000-4000-8000-000000000701"
 REQUEST_B_ID = "00000000-0000-4000-8000-000000000702"
+
+
+def experiment_recorder(tmp_path: Path, *, validation: bool) -> ExperimentRecorder:
+    settings = {"directory": tmp_path / "experiment-records"}
+    if validation:
+        validation_path = tmp_path / "validation.npz"
+        np.savez(
+            validation_path,
+            images=np.zeros((2, 1, 28, 28), dtype=np.uint8),
+            labels=np.asarray([0, 1], dtype=np.int64),
+        )
+        settings["validation"] = {
+            "dataset": "mnist",
+            "path": validation_path,
+            "batch_size": 2,
+        }
+    recorder = ExperimentRecorder(ExperimentRecordingSettings.model_validate(settings))
+    recorder.open(ROOT_ID)
+    return recorder
+
+
+def image_loaded_bundle():
+    return SimpleNamespace(
+        model=torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(28 * 28, 10)),
+        manifest={
+            "dataset": "mnist",
+            "model": {"input_channels": 1, "num_classes": 10},
+            "inference": {
+                "input_shape": [1, 28, 28],
+                "class_count": 10,
+                "normalization": "uint8_to_float32_div_255",
+            },
+        },
+    )
+
+
+def recorded_observations(tmp_path: Path, plan_id: str) -> list[dict]:
+    path = tmp_path / "experiment-records" / plan_id / "observations.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def hierarchy_topology(*groups: tuple[str, tuple[str, ...]]) -> str:
@@ -180,6 +223,8 @@ def root_coordinator(
     ml_event: str = "X_IMAGE_CLASSIFICATION",
     model_interoperability: str = "pymtlf-image-classification-mnist",
     topology_text: str | None = None,
+    experiment_recorder: ExperimentRecorder | None = None,
+    loaded_bundle=None,
 ):
     topology_path = tmp_path / "topology.yaml"
     topology_path.write_text(
@@ -263,7 +308,7 @@ def root_coordinator(
     policy = Mock()
     policy.take_intents.return_value = ()
     loader = Mock()
-    loader.load.return_value = SimpleNamespace()
+    loader.load.return_value = loaded_bundle or SimpleNamespace()
     root_kwargs = {}
     if clock is not None:
         root_kwargs["clock"] = clock
@@ -284,6 +329,7 @@ def root_coordinator(
         loader=loader,
         round_model_distribution=round_model_distribution or Mock(),
         terminal_status_ttl_seconds=terminal_status_ttl_seconds,
+        experiment_recorder=experiment_recorder,
         **root_kwargs,
     )
     return (
@@ -653,6 +699,7 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
         ),
     )
     distribution.store.return_value = stored
+    recorder = experiment_recorder(tmp_path, validation=True)
     (
         coordinator,
         _resolver,
@@ -669,6 +716,8 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
         ml_event="X_IMAGE_CLASSIFICATION",
         model_interoperability="pymtlf-image-classification-mnist",
         topology_text=topology_text,
+        experiment_recorder=recorder,
+        loaded_bundle=image_loaded_bundle(),
     )
     round_path = tmp_path / "round.tar.gz"
     round_path.write_bytes(b"round")
@@ -785,6 +834,18 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
     server.close_hierarchy_training.assert_called_once_with(process_id)
     workspace.release_plan.assert_not_called()
     coordinator.close()
+    recorder.close()
+    records = recorded_observations(tmp_path, completed.plan_id)
+    assert [record["recordType"] for record in records] == [
+        "MODEL_EVALUATION",
+        "ROOT_ROUND_OUTCOME",
+        "MODEL_EVALUATION",
+    ]
+    assert [
+        record.get("evaluationStage")
+        for record in records
+        if record["recordType"] == "MODEL_EVALUATION"
+    ] == ["ROOT_INITIAL", "ROOT_GLOBAL"]
     workspace.release_plan.assert_called_once_with(completed.plan_id)
 
 
@@ -970,6 +1031,7 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
             storTransId="round-store",
         ),
     )
+    recorder = experiment_recorder(tmp_path, validation=True)
     (
         coordinator,
         _resolver,
@@ -985,6 +1047,8 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
         round_count=1,
         round_model_distribution=distribution,
         topology_text=branch_replacement_topology(),
+        experiment_recorder=recorder,
+        loaded_bundle=image_loaded_bundle(),
     )
     round_paths = [tmp_path / f"rejected-round-{index}.tar.gz" for index in range(2)]
     aggregate_path = tmp_path / "accepted-aggregate.tar.gz"
@@ -1115,6 +1179,18 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
     workspace.republish_validation_candidate.assert_not_called()
     assert [call.args[1] for call in distribution.cleanup.call_args_list] == [0, 1]
     coordinator.close()
+    recorder.close()
+    records = recorded_observations(tmp_path, completed.plan_id)
+    outcomes = [
+        record for record in records if record["recordType"] == "ROOT_ROUND_OUTCOME"
+    ]
+    globals_ = [
+        record
+        for record in records
+        if record.get("evaluationStage") == "ROOT_GLOBAL"
+    ]
+    assert [record["accepted"] for record in outcomes] == [False, True]
+    assert [record["roundInd"] for record in globals_] == [1]
 
 
 def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_cohort(
@@ -1128,6 +1204,7 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
             storTransId="round-store",
         ),
     )
+    recorder = experiment_recorder(tmp_path, validation=False)
     (
         coordinator,
         _resolver,
@@ -1143,6 +1220,7 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
         round_count=3,
         round_model_distribution=distribution,
         topology_text=branch_replacement_topology(root_minimum=1),
+        experiment_recorder=recorder,
     )
     round_inputs = []
     aggregates = []
@@ -1317,10 +1395,25 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
         assert server.execute_hierarchy_round.call_args_list[2].kwargs[
             "selected_participant_nf_instance_ids"
         ] == (BRANCH_REPLACEMENT_ID, BRANCH_B_ID)
+        records = recorded_observations(tmp_path, completed.plan_id)
+        assert len(
+            [record for record in records if record["recordType"] == "ROOT_ROUND_OUTCOME"]
+        ) == 3
+        assert any(
+            record["recordType"] == "BRANCH_FAILURE_DETECTED"
+            and record["failedBranchNfInstanceId"] == BRANCH_ID
+            for record in records
+        )
+        assert any(
+            record["recordType"] == "BRANCH_REPLACEMENT_READY"
+            and record["replacementBranchNfInstanceId"] == BRANCH_REPLACEMENT_ID
+            for record in records
+        )
     finally:
         allow_replacement_completion.set()
         allow_second_round_completion.set()
         coordinator.close()
+        recorder.close()
 
 
 @pytest.mark.parametrize(

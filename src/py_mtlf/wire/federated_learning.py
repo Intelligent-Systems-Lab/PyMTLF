@@ -32,6 +32,7 @@ class FederatedTrainingRequest(FederatedLearningPrivateModel):
 
 class FederatedTrainingStatus(FederatedLearningPrivateModel):
     request_id: str = Field(alias="requestId")
+    plan_id: str | None = Field(default=None, alias="planId")
     model_family_id: str = Field(alias="modelFamilyId")
     mode: str
     participant_source: str = Field(alias="participantSource")
@@ -46,3 +47,16 @@ class FederatedTrainingStatus(FederatedLearningPrivateModel):
     )
     failure_cause: str | None = Field(default=None, alias="failureCause")
     failure_detail: str | None = Field(default=None, alias="failureDetail")
+
+    @field_validator("plan_id")
+    @classmethod
+    def validate_plan_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = UUID(value)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("planId must be a canonical UUIDv4") from error
+        if parsed.version != 4 or str(parsed) != value:
+            raise ValueError("planId must be a canonical UUIDv4")
+        return value

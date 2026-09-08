@@ -34,6 +34,14 @@ federated_learning:
       - "http://127.0.0.1:9093"
       - "http://127.0.0.1:9094"
     timeout_seconds: 300
+  # Optional node-local experiment output. Keep it outside workspace_root.
+  # experiment_recording:
+  #   directory: "data/experiment-records"
+  #   validation:
+  #     dataset: "mnist"
+  #     path: "data/datasets/mnist-validation.npz"
+  #     device: "cpu"
+  #     batch_size: 128
   orchestration:
     mode: "hierarchical"
     participant_source: "static"
