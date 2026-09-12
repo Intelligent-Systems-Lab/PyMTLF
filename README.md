@@ -118,10 +118,13 @@ clears its existing contents before readiness, and readiness includes
 
 Hierarchical experiment profiles may configure
 `federated_learning.experiment_recording` to append node-local observations to
-`<directory>/<mlCorreId>/observations.jsonl`. Its directory must not overlap
-`workspace_root`. An optional validation block selects a local MNIST or CIFAR-10
-`.npz` dataset for non-gating model evaluation; the path and resulting metrics
-remain local to that PyMTLF process and are not added to Model Training messages.
+`<directory>/<mlCorreId>/observations.jsonl`. A successful Root procedure also
+copies its final accepted `ROUND_GLOBAL` bundle to
+`<directory>/<mlCorreId>/final-model.tar.gz` before the temporary FL workspace
+is released. The record directory must not overlap `workspace_root`. An optional
+validation block selects a local MNIST or CIFAR-10 `.npz` dataset for non-gating
+model evaluation; the path and resulting metrics remain local to that PyMTLF
+process and are not added to Model Training messages.
 
 See [`docs/api.md`](docs/api.md) for the complete private HTTP surface and the
 standard-shaped operations PyMTLF sends through the containing Go NWDAF.

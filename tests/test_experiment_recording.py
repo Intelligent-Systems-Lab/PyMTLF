@@ -73,6 +73,59 @@ def test_start_procedure_creates_an_empty_append_target(tmp_path):
     assert path.read_text(encoding="utf-8") == ""
 
 
+def test_recorder_persists_final_model_atomically_and_rejects_conflicts(tmp_path):
+    recorder = _recorder(tmp_path)
+    source = tmp_path / "round-global.tar.gz"
+    source.write_bytes(b"final-model-bundle")
+
+    saved = recorder.save_final_model(
+        ml_correlation_id=PLAN_ID,
+        round_indicator=3,
+        artifact_path=source,
+        artifact_digest="a" * 64,
+    )
+
+    assert saved == tmp_path / "records" / PLAN_ID / "final-model.tar.gz"
+    assert saved.read_bytes() == source.read_bytes()
+    records = _records(tmp_path)
+    assert records == [
+        {
+            "recordedAt": records[0]["recordedAt"],
+            "recordType": "FINAL_MODEL_SAVED",
+            "mlCorreId": PLAN_ID,
+            "nfInstanceId": NF_INSTANCE_ID,
+            "roundInd": 3,
+            "artifactFile": "final-model.tar.gz",
+            "artifactDigest": "a" * 64,
+            "sizeBytes": len(b"final-model-bundle"),
+        }
+    ]
+
+    assert (
+        recorder.save_final_model(
+            ml_correlation_id=PLAN_ID,
+            round_indicator=3,
+            artifact_path=source,
+            artifact_digest="a" * 64,
+        )
+        == saved
+    )
+    assert len(_records(tmp_path)) == 1
+    source.unlink()
+    assert saved.read_bytes() == b"final-model-bundle"
+
+    conflict = tmp_path / "conflict.tar.gz"
+    conflict.write_bytes(b"different-model")
+    with pytest.raises(RuntimeError, match="conflicts"):
+        recorder.save_final_model(
+            ml_correlation_id=PLAN_ID,
+            round_indicator=4,
+            artifact_path=conflict,
+            artifact_digest="b" * 64,
+        )
+    recorder.close()
+
+
 def test_recorder_defers_nf_identity_lookup_until_the_first_record(tmp_path):
     requested = []
     recorder = ExperimentRecorder(

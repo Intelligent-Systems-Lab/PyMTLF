@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import filecmp
 import json
+import os
+import shutil
 import tempfile
 import threading
 from collections.abc import Callable, Mapping
@@ -26,6 +29,8 @@ EvaluationStage = Literal[
     "BRANCH_DOMAIN",
     "LEAF_LOCAL",
 ]
+
+FINAL_MODEL_FILENAME = "final-model.tar.gz"
 
 
 class ExperimentRecorder:
@@ -137,6 +142,65 @@ class ExperimentRecorder:
             record["roundInd"] = round_indicator
         self._append(record)
 
+    def save_final_model(
+        self,
+        *,
+        ml_correlation_id: str,
+        round_indicator: int,
+        artifact_path: Path,
+        artifact_digest: str,
+        recorded_at: datetime | None = None,
+    ) -> Path:
+        normalized_correlation_id = normalize_plan_id(ml_correlation_id)
+        normalized_round_indicator = _round_indicator(round_indicator)
+        source = Path(artifact_path)
+        if not source.is_file():
+            raise RuntimeError("final model artifact is not a file")
+        if (
+            len(artifact_digest) != 64
+            or artifact_digest != artifact_digest.lower()
+            or any(character not in "0123456789abcdef" for character in artifact_digest)
+        ):
+            raise ValueError("final model artifact digest must be lowercase SHA-256")
+
+        with self._lock:
+            self._required_nf_instance_id()
+            procedure_directory = self._procedure_directory(normalized_correlation_id)
+            destination = procedure_directory / FINAL_MODEL_FILENAME
+            if destination.exists():
+                if not destination.is_file() or not filecmp.cmp(
+                    source,
+                    destination,
+                    shallow=False,
+                ):
+                    raise RuntimeError("saved final model conflicts with existing artifact")
+                return destination
+
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".final-model-",
+                suffix=".tar.gz",
+                dir=procedure_directory,
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                shutil.copyfile(source, temporary)
+                os.replace(temporary, destination)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+
+            self._append_base(
+                normalized_correlation_id,
+                "FINAL_MODEL_SAVED",
+                recorded_at,
+                roundInd=normalized_round_indicator,
+                artifactFile=FINAL_MODEL_FILENAME,
+                artifactDigest=artifact_digest,
+                sizeBytes=destination.stat().st_size,
+            )
+            return destination
+
     def record_root_round_outcome(
         self,
         *,
@@ -230,9 +294,12 @@ class ExperimentRecorder:
                 stream.flush()
 
     def _observation_path(self, ml_correlation_id: str) -> Path:
+        return self._procedure_directory(ml_correlation_id) / "observations.jsonl"
+
+    def _procedure_directory(self, ml_correlation_id: str) -> Path:
         procedure_directory = self._settings.directory / ml_correlation_id
         procedure_directory.mkdir(parents=True, exist_ok=True)
-        return procedure_directory / "observations.jsonl"
+        return procedure_directory
 
     def _required_nf_instance_id(self) -> str:
         if not self._opened:

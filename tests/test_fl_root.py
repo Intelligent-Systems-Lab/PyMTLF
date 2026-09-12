@@ -840,12 +840,22 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
         "MODEL_EVALUATION",
         "ROOT_ROUND_OUTCOME",
         "MODEL_EVALUATION",
+        "FINAL_MODEL_SAVED",
     ]
     assert [
         record.get("evaluationStage")
         for record in records
         if record["recordType"] == "MODEL_EVALUATION"
     ] == ["ROOT_INITIAL", "ROOT_GLOBAL"]
+    final_model = (
+        tmp_path
+        / "experiment-records"
+        / completed.plan_id
+        / "final-model.tar.gz"
+    )
+    assert final_model.read_bytes() == aggregate_path.read_bytes()
+    assert records[-1]["roundInd"] == 0
+    assert records[-1]["artifactDigest"] == aggregate.digest
     workspace.release_plan.assert_called_once_with(completed.plan_id)
 
 
@@ -1189,8 +1199,15 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
         for record in records
         if record.get("evaluationStage") == "ROOT_GLOBAL"
     ]
+    final_models = [
+        record for record in records if record["recordType"] == "FINAL_MODEL_SAVED"
+    ]
     assert [record["accepted"] for record in outcomes] == [False, True]
     assert [record["roundInd"] for record in globals_] == [1]
+    assert [record["roundInd"] for record in final_models] == [1]
+    assert (
+        tmp_path / "experiment-records" / completed.plan_id / "final-model.tar.gz"
+    ).read_bytes() == aggregate_path.read_bytes()
 
 
 def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_cohort(

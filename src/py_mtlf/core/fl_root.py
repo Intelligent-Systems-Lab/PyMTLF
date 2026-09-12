@@ -52,7 +52,7 @@ from py_mtlf.core.fl_server import (
     ProtocolPreparationTarget,
 )
 from py_mtlf.core.fl_topology import TopologyBranchGroupAssignment, TopologyPlanner
-from py_mtlf.core.fl_workspace import FLWorkspace
+from py_mtlf.core.fl_workspace import FLWorkspace, FLWorkspaceArtifact
 from py_mtlf.core.nwdaf_context import FLCapabilityType, NwdafContextClient
 from py_mtlf.core.seed_catalog import FamilyKey, ModelCatalog
 from py_mtlf.core.trainer import TrustedBundleLoader
@@ -681,6 +681,7 @@ class FLRootCoordinator:
 
         source = base
         aggregate = None
+        final_accepted_round_indicator: int | None = None
         round_indicator = 0
         while record.completed_rounds < self._server_settings.round_count:
             self._wait_for_root_readiness(record, topology)
@@ -812,6 +813,7 @@ class FLRootCoordinator:
                 if outcome.aggregate is None:
                     raise RuntimeError("accepted Root round has no aggregate")
                 aggregate = outcome.aggregate
+                final_accepted_round_indicator = round_indicator
                 source = self._loader.load(
                     ArtifactMetadata(
                         key=aggregate.digest,
@@ -859,8 +861,15 @@ class FLRootCoordinator:
 
         if aggregate is None:
             raise RuntimeError("protocol hierarchy completed without an aggregate")
+        if final_accepted_round_indicator is None:
+            raise RuntimeError("protocol hierarchy completed without an accepted round")
         self._ensure_active_generation(record)
-        self._complete_protocol_training(record, process.process_id)
+        self._complete_protocol_training(
+            record,
+            process.process_id,
+            final_aggregate=aggregate,
+            final_round_indicator=final_accepted_round_indicator,
+        )
         return process
 
     def _protocol_branch_node(self, group, branch) -> FlTopologyNode:
@@ -1355,8 +1364,18 @@ class FLRootCoordinator:
         self,
         record: _RootRequestRecord,
         process_id: str,
+        *,
+        final_aggregate: FLWorkspaceArtifact,
+        final_round_indicator: int,
     ) -> None:
         self._server.close_hierarchy_training(process_id)
+        if self._experiment_recorder is not None:
+            self._experiment_recorder.save_final_model(
+                ml_correlation_id=record.initiation.plan_id,
+                round_indicator=final_round_indicator,
+                artifact_path=final_aggregate.path,
+                artifact_digest=final_aggregate.digest,
+            )
         self._release_reservation(record, RootRequestState.COMPLETE.value)
         with self._condition:
             if (
