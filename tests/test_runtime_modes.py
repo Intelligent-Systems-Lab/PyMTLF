@@ -68,7 +68,7 @@ def with_hierarchy(settings, workspace: Path, topology_path: Path, *, private_ap
     }
     payload["federated_learning"]["training_trigger"] = {
         "degradation": {"enabled": True},
-        "private_api": {"enabled": private_api}
+        "private_api": {"enabled": private_api},
     }
     return settings.__class__.model_validate(payload)
 
@@ -221,6 +221,7 @@ def test_fl_server_owns_model_services_without_local_training(settings, tmp_path
         assert "/internal/v1/ml-model-monitor/registrations" in paths
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=_training_subscription_body(),
         )
         assert response.status_code == 503
@@ -278,6 +279,7 @@ def test_combined_profile_enables_both_fl_engines(settings, tmp_path):
         assert "/internal/v1/ml-model-training/notifications" in paths
         subscription_response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=_training_subscription_body(),
         )
         notification_response = client.post(
@@ -359,9 +361,7 @@ def test_generic_training_api_is_mounted_only_when_enabled(settings, tmp_path):
         )
 
 
-def test_static_flat_constructs_the_only_top_level_owner_and_generic_route(
-    settings, tmp_path
-):
+def test_static_flat_constructs_the_only_top_level_owner_and_generic_route(settings, tmp_path):
     topology_path = tmp_path / "flat-topology.yaml"
     write_flat_topology(topology_path)
     app = create_app(
@@ -393,9 +393,7 @@ def test_static_flat_constructs_the_only_top_level_owner_and_generic_route(
             },
         )
         assert unavailable.status_code == 503
-        assert unavailable.headers["content-type"].startswith(
-            "application/problem+json"
-        )
+        assert unavailable.headers["content-type"].startswith("application/problem+json")
 
 
 def test_hierarchy_app_construction_rejects_invalid_topology(settings, tmp_path):
@@ -403,14 +401,10 @@ def test_hierarchy_app_construction_rejects_invalid_topology(settings, tmp_path)
     topology_path.write_text("version: 2\n", encoding="utf-8")
 
     with pytest.raises(ValidationError):
-        create_app(
-            with_hierarchy(settings, tmp_path / "invalid", topology_path, private_api=False)
-        )
+        create_app(with_hierarchy(settings, tmp_path / "invalid", topology_path, private_api=False))
 
 
-def test_combined_profile_exposes_upper_client_lower_server_pairing_seam(
-    settings, tmp_path
-):
+def test_combined_profile_exposes_upper_client_lower_server_pairing_seam(settings, tmp_path):
     app = create_app(
         with_engines(settings, tmp_path / "combined", server=True, client=True),
         capability_checker=verified_capability_checker(server=True, client=True),
@@ -432,9 +426,7 @@ def test_combined_profile_exposes_upper_client_lower_server_pairing_seam(
             "lower-process",
         )
 
-        assert attached.upper_client_subscription_ids == frozenset(
-            {"upper-subscription"}
-        )
+        assert attached.upper_client_subscription_ids == frozenset({"upper-subscription"})
         assert attached.server_process_id == "lower-process"
 
 

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
-from uuid import uuid4
 
 import httpx
 
@@ -139,6 +138,7 @@ class BranchPreparationDispatcher(Protocol):
         callback_margin_seconds: int,
         local_work: IntermediateLocalWork,
     ) -> BranchArtifactView: ...
+
 
 @dataclass
 class FLClientResource:
@@ -297,7 +297,7 @@ class FLClientEngine:
                     plan_id,
                 )
 
-    def create(self, value: NwdafMLModelTrainSubsc) -> FLClientResource:
+    def create(self, subscription_id: str, value: NwdafMLModelTrainSubsc) -> FLClientResource:
         validate_fl_subscription(value)
         candidate_contract = has_candidate_subscription_fields(value)
         if candidate_contract:
@@ -329,10 +329,13 @@ class FLClientEngine:
         if not self._outbox_capacity.acquire(blocking=False):
             self._capacity.release()
             raise FLClientCapacityError("FL client callback outbox is full")
-        resource_id = ""
+        resource_id = subscription_id
         reservation_id = ""
+        resource: FLClientResource | None = None
         try:
-            resource_id = str(uuid4())
+            with self._lock:
+                if resource_id in self._resources or resource_id in self._deleting:
+                    raise ValueError("subscription ID is already in use")
             try:
                 reservation = self._experiments.reserve_client(
                     resource_id,
@@ -356,6 +359,8 @@ class FLClientEngine:
                 ),
             )
             with self._lock:
+                if resource_id in self._resources or resource_id in self._deleting:
+                    raise ValueError("subscription ID is already in use")
                 if any(
                     item.representation.notification_correlation_id
                     == value.notification_correlation_id
@@ -371,7 +376,7 @@ class FLClientEngine:
             return self.get(resource_id)
         except Exception:
             with self._lock:
-                if resource_id:
+                if resource is not None and self._resources.get(resource_id) is resource:
                     self._cancel_delay(resource_id)
                     self._resources.pop(resource_id, None)
             if reservation_id:
@@ -548,22 +553,25 @@ class FLClientEngine:
                 and experiment.plan_id is not None
                 and experiment.assigned_role in {ExperimentRole.BRANCH, ExperimentRole.LEAF}
             )
-            if resource.state in {
-                FLClientState.PREPARING,
-                FLClientState.ROUND_RUNNING,
-                FLClientState.VALIDATION_RUNNING,
-                FLClientState.RESULT_PENDING,
-                FLClientState.PREPARATION_RESULT_PENDING,
-            } and not hierarchy_bound:
+            if (
+                resource.state
+                in {
+                    FLClientState.PREPARING,
+                    FLClientState.ROUND_RUNNING,
+                    FLClientState.VALIDATION_RUNNING,
+                    FLClientState.RESULT_PENDING,
+                    FLClientState.PREPARATION_RESULT_PENDING,
+                }
+                and not hierarchy_bound
+            ):
                 raise RuntimeError("ML_TRAINING_NOT_COMPLETE")
             reservation_id = resource.experiment_reservation_id
             self._deleting.add(subscription_id)
             if hierarchy_bound:
                 resource.revision += 1
                 self._cancel_delay(subscription_id)
-                release_callback_slot = (
-                    resource.callback_slot_owned
-                    and not any(key[0] == subscription_id for key in self._outbox_keys)
+                release_callback_slot = resource.callback_slot_owned and not any(
+                    key[0] == subscription_id for key in self._outbox_keys
                 )
                 if release_callback_slot:
                     resource.callback_slot_owned = False
@@ -698,8 +706,7 @@ class FLClientEngine:
         except ValueError:
             return False
         intermediate_role = bool(node.children) or (
-            node.policy is not None
-            and node.policy.allow_additional_candidates is True
+            node.policy is not None and node.policy.allow_additional_candidates is True
         )
         required_capabilities = (
             {FLCapabilityType.SERVER_AND_CLIENT}
@@ -738,8 +745,7 @@ class FLClientEngine:
             )
             and isinstance(local_data, LocalImageTrainingDataSettings)
             and local_data.dataset == contract.name.value
-            and event.model_interoperability
-            in self._client_settings.model_interoperability_ids
+            and event.model_interoperability in self._client_settings.model_interoperability_ids
             and node.strategy is not None
             and node.report_after is not None
             and node.report_after.unit == "epoch"
@@ -780,10 +786,7 @@ class FLClientEngine:
                     "must provide exactly one final candidate for validation",
                 )
             )
-        if (
-            resource.preparation_base_artifact is None
-            or resource.dataset_snapshot is None
-        ):
+        if resource.preparation_base_artifact is None or resource.dataset_snapshot is None:
             violations.append(
                 InvalidParameter(
                     "mLAccChkFlg",
@@ -894,9 +897,7 @@ class FLClientEngine:
                 self._release_work_slot(subscription_id, revision)
                 return
             if self._client_settings.training_data is None:
-                raise RuntimeError(
-                    "image classification local training data is not configured"
-                )
+                raise RuntimeError("image classification local training data is not configured")
             collection_trigger = self._client_settings.training_data.collection_trigger
             self._datasets.validate_external_scope(intent, collection_trigger)
             job_id = self._datasets.submit_external(
@@ -966,8 +967,7 @@ class FLClientEngine:
         contract = image_training_contract(event.ml_event, event.model_interoperability)
         context = self._nwdaf_context.get()
         intermediate_role = bool(node.children) or (
-            node.policy is not None
-            and node.policy.allow_additional_candidates is True
+            node.policy is not None and node.policy.allow_additional_candidates is True
         )
         required_capabilities = (
             {FLCapabilityType.SERVER_AND_CLIENT}
@@ -988,11 +988,7 @@ class FLClientEngine:
         with self._lock:
             current = self._resources.get(subscription_id)
             reservation_id = "" if current is None else current.experiment_reservation_id
-        assigned_role = (
-            ExperimentRole.BRANCH
-            if intermediate_role
-            else ExperimentRole.LEAF
-        )
+        assigned_role = ExperimentRole.BRANCH if intermediate_role else ExperimentRole.LEAF
         experiment = self._experiments.for_client_subscription(subscription_id)
         if experiment is None or experiment.plan_id is None:
             self._experiments.bind_plan(
@@ -1007,12 +1003,8 @@ class FLClientEngine:
             raise RuntimeError("protocol hierarchy binding changed")
         if intermediate_role:
             if node.report_after is None or node.report_after.unit != "round":
-                raise RuntimeError(
-                    "protocol Branch requires reportAfter with round unit"
-                )
-            intermediate_work = IntermediateLocalWork(
-                lower_round_count=node.report_after.count
-            )
+                raise RuntimeError("protocol Branch requires reportAfter with round unit")
+            intermediate_work = IntermediateLocalWork(lower_round_count=node.report_after.count)
             if self._branch_coordinator is None or not hasattr(
                 self._branch_coordinator, "prepare_protocol"
             ):
@@ -1027,24 +1019,15 @@ class FLClientEngine:
                 self._client_settings.workload,
                 ImageClassificationWorkloadSettings,
             ) or not isinstance(local_data, LocalImageTrainingDataSettings):
-                raise RuntimeError(
-                    "protocol image classification local training is not configured"
-                )
+                raise RuntimeError("protocol image classification local training is not configured")
             if local_data.dataset != contract.name.value:
                 raise RuntimeError(
                     "protocol image dataset is incompatible with local configuration"
                 )
-            if (
-                event.model_interoperability
-                not in self._client_settings.model_interoperability_ids
-            ):
-                raise RuntimeError(
-                    "protocol model interoperability is not supported locally"
-                )
+            if event.model_interoperability not in self._client_settings.model_interoperability_ids:
+                raise RuntimeError("protocol model interoperability is not supported locally")
             if node.strategy is None or node.report_after is None:
-                raise RuntimeError(
-                    "protocol Leaf requires strategy and reportAfter"
-                )
+                raise RuntimeError("protocol Leaf requires strategy and reportAfter")
             if node.report_after.unit != "epoch":
                 raise RuntimeError("protocol Leaf reportAfter unit must be epoch")
             client_work = ClientLocalWork(
@@ -1203,12 +1186,9 @@ class FLClientEngine:
             round_input = validate_fl_artifact_manifest(base.manifest)
             if not isinstance(round_input, RoundInputArtifact):
                 raise RuntimeError("FL round input is not a ROUND_INPUT artifact")
-            if (
-                round_input.fl_metadata.ml_corre_id != value.ml_correlation_id
-                or (
-                    not resource.candidate_contract
-                    and round_input.fl_metadata.round_ind != value.round_indicator
-                )
+            if round_input.fl_metadata.ml_corre_id != value.ml_correlation_id or (
+                not resource.candidate_contract
+                and round_input.fl_metadata.round_ind != value.round_indicator
             ):
                 raise RuntimeError("FL round input identity does not match the command")
             if preparation_base_artifact is None:
@@ -1235,10 +1215,7 @@ class FLClientEngine:
                     preparation_base_artifact = artifact
             prepared_base = self._loader.load(preparation_base_artifact)
             validate_model_compatibility(prepared_base, base)
-            if (
-                resource.candidate_contract
-                and resource.intermediate_local_work is not None
-            ):
+            if resource.candidate_contract and resource.intermediate_local_work is not None:
                 if self._branch_coordinator is None:
                     raise RuntimeError("protocol Branch round executor is unavailable")
                 if resource.intermediate_local_work is None:
@@ -1292,9 +1269,7 @@ class FLClientEngine:
                     self._client_settings.workload,
                     ImageClassificationWorkloadSettings,
                 ):
-                    raise RuntimeError(
-                        "image classification local training data is not configured"
-                    )
+                    raise RuntimeError("image classification local training data is not configured")
                 if snapshot is None:
                     raise RuntimeError("FL round has no prepared ADRF dataset")
                 dataset = self._dataset_builder.build(snapshot, base.manifest)
@@ -1415,16 +1390,12 @@ class FLClientEngine:
                 ml_event != IMAGE_CLASSIFICATION_EVENT
                 or bundle.manifest.get("analytics_event") != ml_event
             ):
-                raise RuntimeError(
-                    "FL preparation image analytics event is incompatible"
-                )
+                raise RuntimeError("FL preparation image analytics event is incompatible")
             if not isinstance(
                 self._client_settings.training_data,
                 LocalImageTrainingDataSettings,
             ):
-                raise RuntimeError(
-                    "image classification local training data is not configured"
-                )
+                raise RuntimeError("image classification local training data is not configured")
             contract = validate_image_manifest(bundle.manifest)
             if contract.name.value != self._client_settings.training_data.dataset:
                 raise RuntimeError("FL preparation image dataset is incompatible")
@@ -1458,10 +1429,7 @@ class FLClientEngine:
         try:
             with self._lock:
                 resource = self._required(subscription_id)
-                if (
-                    resource.revision != revision
-                    or resource.preparation_base_artifact is None
-                ):
+                if resource.revision != revision or resource.preparation_base_artifact is None:
                     raise RuntimeError("final validation has no frozen preparation inputs")
                 value = resource.representation.model_copy(deep=True)
                 snapshot = resource.dataset_snapshot
@@ -1487,9 +1455,7 @@ class FLClientEngine:
             ):
                 raise RuntimeError("final validation candidate identity does not match the command")
             if candidate_contract.fl_metadata.ml_corre_id != value.ml_correlation_id:
-                raise RuntimeError(
-                    "final validation candidate does not match the upper process"
-                )
+                raise RuntimeError("final validation candidate does not match the upper process")
             if snapshot is None:
                 raise RuntimeError("final validation has no frozen preparation dataset")
             dataset = self._dataset_builder.build(snapshot, base.manifest)
@@ -1831,8 +1797,7 @@ class FLClientEngine:
                 last_error = str(error)
             if attempt + 1 < self._notification_settings.max_attempts:
                 delay = min(
-                    self._notification_settings.initial_backoff_seconds
-                    * (2**attempt),
+                    self._notification_settings.initial_backoff_seconds * (2**attempt),
                     self._notification_settings.max_backoff_seconds,
                 )
                 if self._closing.wait(delay):
@@ -1845,12 +1810,10 @@ class FLClientEngine:
                 and current.state is FLClientState.TERMINATING
             ):
                 current.last_error = (
-                    "superseded termination delivery remains pending: "
-                    f"{last_error}"
+                    f"superseded termination delivery remains pending: {last_error}"
                 )
         logger.warning(
-            "Superseded FL Client termination delivery remains pending "
-            "subscription_id=%s error=%s",
+            "Superseded FL Client termination delivery remains pending subscription_id=%s error=%s",
             resource.subscription_id,
             last_error,
         )
@@ -1881,11 +1844,7 @@ class FLClientEngine:
                 self._abandoned_work_keys.discard(key)
                 return
             resource = self._resources.get(subscription_id)
-            if (
-                resource is None
-                or resource.revision != revision
-                or not resource.work_slot_owned
-            ):
+            if resource is None or resource.revision != revision or not resource.work_slot_owned:
                 return
             resource.work_slot_owned = False
         self._capacity.release()

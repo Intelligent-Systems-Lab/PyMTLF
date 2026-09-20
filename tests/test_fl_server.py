@@ -645,6 +645,21 @@ def test_protocol_replacement_prepares_independently_of_ready_process_cohort(tmp
         client.close()
 
 
+def test_participant_identity_decodes_target_scoped_resource_id():
+    participant_id = "22222222-2222-4222-8222-222222222222"
+    participant = FLParticipant(
+        scope=scope("existing", "000001", participant_id),
+        candidate=candidate(participant_id, "000001"),
+        notification_correlation_id="candidate-correlation",
+        resource_location=(
+            "http://root-go.internal/internal/v1/ml-model-training/targets/"
+            f"{participant_id}/subscriptions/shared%20resource"
+        ),
+    )
+
+    assert participant.identity.subscription_id == "shared resource"
+
+
 def test_protocol_participant_retirement_fences_local_identity_when_peer_cleanup_fails(
     tmp_path,
 ):

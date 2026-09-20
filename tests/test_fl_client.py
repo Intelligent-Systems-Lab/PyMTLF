@@ -3,6 +3,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
+from uuid import uuid4
 
 import httpx
 import numpy as np
@@ -279,9 +280,7 @@ def round_global_bundle():
         "round_ind": 1,
         "participants": [
             {
-                "participant_nf_instance_id": (
-                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-                ),
+                "participant_nf_instance_id": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
                 "training_sample_count": 10,
                 "local_artifact_digest": "4" * 64,
             }
@@ -308,7 +307,9 @@ def test_create_admits_before_async_adrf_preparation(tmp_path):
         "model_interoperability": "001122",
     }
     try:
-        resource = service.create(NwdafMLModelTrainSubsc.model_validate(preparation_payload()))
+        resource = service.create(
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
         assert resource.state is FLClientState.PREPARING
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -345,7 +346,7 @@ def test_candidate_create_rejects_retained_instruction_before_resource_creation(
         payload["x-retainedResultReq"] = True
         payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
         with pytest.raises(RequirementsError) as captured:
-            service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+            service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(payload))
 
         assert [item.parameter for item in captured.value.violations] == [
             "x-retainedResultReq",
@@ -406,9 +407,7 @@ def test_protocol_leaf_preparation_reports_ready_without_model_or_dataset_read(t
     )
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(
-                protocol_leaf_preparation_payload()
-            )
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(protocol_leaf_preparation_payload())
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -508,9 +507,7 @@ def test_protocol_leaf_rebind_terminates_old_resource_until_standard_delete(tmp_
     )
     try:
         first = service.create(
-            NwdafMLModelTrainSubsc.model_validate(
-                protocol_leaf_preparation_payload()
-            )
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(protocol_leaf_preparation_payload())
         )
         deadline = time.monotonic() + 2
         while service.get(first.subscription_id).state is not FLClientState.PREPARED:
@@ -528,7 +525,7 @@ def test_protocol_leaf_rebind_terminates_old_resource_until_standard_delete(tmp_
         replacement_payload = protocol_leaf_preparation_payload()
         replacement_payload["notifCorreId"] = "prep-client-replacement"
         second = service.create(
-            NwdafMLModelTrainSubsc.model_validate(replacement_payload)
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(replacement_payload)
         )
 
         assert second_prepared.wait(2)
@@ -557,16 +554,12 @@ def test_protocol_leaf_rebind_terminates_old_resource_until_standard_delete(tmp_
         with pytest.raises(KeyError):
             service.patch(
                 first.subscription_id,
-                NwdafMLModelTrainSubscPatch.model_validate(
-                    {"mLTrainRepInfo": {"maxResTime": 300}}
-                ),
+                NwdafMLModelTrainSubscPatch.model_validate({"mLTrainRepInfo": {"maxResTime": 300}}),
             )
         active = registry.active()
         assert active is not None
         assert active.lifecycle is ExperimentLifecycle.ACTIVE
-        assert active.upper_client_subscription_ids == frozenset(
-            {second.subscription_id}
-        )
+        assert active.upper_client_subscription_ids == frozenset({second.subscription_id})
         assert [item["notifCorreId"] for item in callbacks] == [
             "prep-client-a",
             "prep-client-replacement",
@@ -650,9 +643,7 @@ def test_protocol_leaf_rebind_handles_termination_delivery_failure(
     )
     try:
         first = service.create(
-            NwdafMLModelTrainSubsc.model_validate(
-                protocol_leaf_preparation_payload()
-            )
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(protocol_leaf_preparation_payload())
         )
         deadline = time.monotonic() + 2
         while service.get(first.subscription_id).state is not FLClientState.PREPARED:
@@ -663,7 +654,7 @@ def test_protocol_leaf_rebind_handles_termination_delivery_failure(
         replacement_payload = protocol_leaf_preparation_payload()
         replacement_payload["notifCorreId"] = "prep-client-replacement"
         second = service.create(
-            NwdafMLModelTrainSubsc.model_validate(replacement_payload)
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(replacement_payload)
         )
 
         assert termination_attempted.wait(2)
@@ -734,7 +725,7 @@ def test_protocol_preparation_with_model_reference_refuses_hierarchy_feature(
         }
     ]
     try:
-        resource = service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+        resource = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(payload))
 
         assert resource.state is FLClientState.READY
         assert resource.representation.supported_features == ""
@@ -781,9 +772,7 @@ def test_protocol_leaf_refuses_feature_for_unsupported_image_contract(
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        containing_nwdaf_process_instance_id=(
-            "11111111-1111-4111-8111-111111111111"
-        ),
+        containing_nwdaf_process_instance_id=("11111111-1111-4111-8111-111111111111"),
         api_root="http://nwdaf.example",
         internal_api_root="http://nwdaf-internal.example",
         ml_analytics_capabilities=(
@@ -814,7 +803,7 @@ def test_protocol_leaf_refuses_feature_for_unsupported_image_contract(
     try:
         payload = protocol_leaf_preparation_payload()
         payload["mLEventSubscs"][0]["modelInterInfo"] = model_interoperability
-        resource = service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+        resource = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(payload))
 
         assert resource.representation.supported_features == ""
         assert resource.state is FLClientState.READY
@@ -870,9 +859,7 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        containing_nwdaf_process_instance_id=(
-            "11111111-1111-4111-8111-111111111111"
-        ),
+        containing_nwdaf_process_instance_id=("11111111-1111-4111-8111-111111111111"),
         api_root="http://nwdaf.example",
         internal_api_root="http://nwdaf-internal.example",
         ml_analytics_capabilities=(
@@ -886,12 +873,8 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
     workspace = Mock()
     branch = Mock()
     branch.prepare_protocol.side_effect = [
-        FlTopologyReport(
-            nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        ),
-        FlTopologyReport(
-            nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        ),
+        FlTopologyReport(nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        FlTopologyReport(nfInstanceId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
     ]
     client = httpx.Client(transport=httpx.MockTransport(handler))
     service = FLClientEngine(
@@ -903,9 +886,7 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
                 "dataset": "mnist",
                 "shard_path": str(tmp_path / "branch.npz"),
             },
-            model_interoperability_ids=(
-                "pymtlf-image-classification-mnist",
-            ),
+            model_interoperability_ids=("pymtlf-image-classification-mnist",),
         ),
         NotificationSettings(),
         context,
@@ -917,9 +898,8 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
     )
     try:
         created = service.create(
-            NwdafMLModelTrainSubsc.model_validate(
-                protocol_branch_preparation_payload()
-            )
+            str(uuid4()),
+            NwdafMLModelTrainSubsc.model_validate(protocol_branch_preparation_payload()),
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -931,9 +911,7 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
         topology["children"][0]["enabled"] = False
         updated = service.patch(
             created.subscription_id,
-            NwdafMLModelTrainSubscPatch.model_validate(
-                {"x-flTopology": topology}
-            ),
+            NwdafMLModelTrainSubscPatch.model_validate({"x-flTopology": topology}),
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -973,7 +951,7 @@ def test_candidate_create_validates_containing_nwdaf_identity(tmp_path):
     try:
         with pytest.raises(InvalidMessageError) as captured:
             service.create(
-                NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+                str(uuid4()), NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
             )
         assert captured.value.violations[0].parameter == "x-flTopology.nfInstanceId"
     finally:
@@ -986,9 +964,7 @@ def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutat
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        containing_nwdaf_process_instance_id=(
-            "11111111-1111-4111-8111-111111111111"
-        ),
+        containing_nwdaf_process_instance_id=("11111111-1111-4111-8111-111111111111"),
         api_root="http://nwdaf.example",
         internal_api_root="http://nwdaf-internal.example",
     )
@@ -1002,7 +978,7 @@ def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutat
     )
     try:
         created = service.create(
-            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
         )
         updated = service.patch(
             created.subscription_id,
@@ -1031,10 +1007,7 @@ def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutat
         assert captured.value.violations[0].parameter == "suppFeats"
         after_rejected_patch = service.get(created.subscription_id)
         assert after_rejected_patch.revision == before_rejected_patch.revision
-        assert (
-            after_rejected_patch.representation
-            == before_rejected_patch.representation
-        )
+        assert after_rejected_patch.representation == before_rejected_patch.representation
 
         replacement_payload = candidate_preparation_payload()
         replacement_payload["x-flTopology"]["children"][0]["priority"] = 80
@@ -1058,9 +1031,7 @@ def test_candidate_resource_delete_and_generation_reset_remove_contract(tmp_path
     context = Mock()
     context.get.return_value = NwdafContext(
         nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        containing_nwdaf_process_instance_id=(
-            "11111111-1111-4111-8111-111111111111"
-        ),
+        containing_nwdaf_process_instance_id=("11111111-1111-4111-8111-111111111111"),
         api_root="http://nwdaf.example",
         internal_api_root="http://nwdaf-internal.example",
     )
@@ -1076,7 +1047,7 @@ def test_candidate_resource_delete_and_generation_reset_remove_contract(tmp_path
     )
     try:
         first = service.create(
-            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
         )
         service.delete(first.subscription_id)
         with pytest.raises(KeyError):
@@ -1085,9 +1056,7 @@ def test_candidate_resource_delete_and_generation_reset_remove_contract(tmp_path
 
         second_payload = candidate_preparation_payload()
         second_payload["notifCorreId"] = "prep-client-b"
-        second = service.create(
-            NwdafMLModelTrainSubsc.model_validate(second_payload)
-        )
+        second = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(second_payload))
         service.abort_generation("containing NWDAF process generation changed")
         with pytest.raises(KeyError):
             service.get(second.subscription_id)
@@ -1106,9 +1075,7 @@ def test_unnegotiated_candidate_put_is_gated_before_context_lookup(tmp_path):
     context.get.side_effect = [
         NwdafContext(
             nf_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            containing_nwdaf_process_instance_id=(
-                "11111111-1111-4111-8111-111111111111"
-            ),
+            containing_nwdaf_process_instance_id=("11111111-1111-4111-8111-111111111111"),
             api_root="http://nwdaf.example",
             internal_api_root="http://nwdaf-internal.example",
         ),
@@ -1124,23 +1091,19 @@ def test_unnegotiated_candidate_put_is_gated_before_context_lookup(tmp_path):
     )
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
         )
         with pytest.raises(RequirementsError):
             service.replace(
                 resource.subscription_id,
-                NwdafMLModelTrainSubsc.model_validate(
-                    candidate_preparation_payload()
-                ),
+                NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload()),
             )
         assert context.get.call_count == 1
     finally:
         service.close()
 
 
-def test_create_defers_training_scope_resolution_to_preparation_worker(
-    tmp_path, monkeypatch
-):
+def test_create_defers_training_scope_resolution_to_preparation_worker(tmp_path, monkeypatch):
     datasets = Mock()
     service = FLClientEngine(
         fl_settings(tmp_path),
@@ -1154,7 +1117,7 @@ def test_create_defers_training_scope_resolution_to_preparation_worker(
     monkeypatch.setattr(service, "_submit", submit)
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
         )
 
         assert resource.state is FLClientState.PREPARING
@@ -1188,8 +1151,8 @@ def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, mo
     conflict_payload["mlCorreId"] = "fl-process-002"
 
     try:
-        first = service.create(NwdafMLModelTrainSubsc.model_validate(first_payload))
-        second = service.create(NwdafMLModelTrainSubsc.model_validate(second_payload))
+        first = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(first_payload))
+        second = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(second_payload))
 
         active = registry.active()
         assert active is not None
@@ -1197,7 +1160,7 @@ def test_create_reserves_same_correlation_group_and_rejects_another(tmp_path, mo
             {first.subscription_id, second.subscription_id}
         )
         with pytest.raises(FLClientCapacityError, match="top-level experiment"):
-            service.create(NwdafMLModelTrainSubsc.model_validate(conflict_payload))
+            service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(conflict_payload))
     finally:
         service.close()
 
@@ -1222,7 +1185,7 @@ def test_create_failure_rolls_back_experiment_reservation(tmp_path, monkeypatch)
     try:
         with pytest.raises(RuntimeError, match="start failed"):
             service.create(
-                NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+                str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
             )
         assert registry.active() is None
     finally:
@@ -1256,7 +1219,7 @@ def test_go_generation_reset_discards_idle_prepared_client_resource(
 
     monkeypatch.setattr(service, "_start_operation", finish_immediately)
     resource = service.create(
-        NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
     )
     plan_id = "11111111-1111-4111-8111-111111111111"
     registry.bind_plan(
@@ -1295,7 +1258,7 @@ def test_go_generation_reset_releases_active_client_capacity_for_new_work(
     monkeypatch.setattr(service, "_start_operation", Mock())
 
     first = service.create(
-        NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
     )
     service.abort_generation("containing NWDAF process generation changed")
     registry.reset_generation()
@@ -1303,9 +1266,7 @@ def test_go_generation_reset_releases_active_client_capacity_for_new_work(
     try:
         second_payload = preparation_payload()
         second_payload["notifCorreId"] = "notify-new"
-        second = service.create(
-            NwdafMLModelTrainSubsc.model_validate(second_payload)
-        )
+        second = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(second_payload))
 
         assert second.subscription_id != first.subscription_id
     finally:
@@ -1329,7 +1290,7 @@ def test_delete_rolls_back_unbound_client_reservation(tmp_path, monkeypatch):
 
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
         )
         service.delete(resource.subscription_id)
         assert registry.active() is None
@@ -1353,7 +1314,7 @@ def test_delete_cancels_bound_leaf_and_is_idempotent(tmp_path, monkeypatch):
 
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
         )
         active = registry.active()
         plan_id = "11111111-1111-4111-8111-111111111111"
@@ -1391,7 +1352,7 @@ def test_cancelled_client_resource_tombstone_is_pruned_lazily(tmp_path, monkeypa
     monkeypatch.setattr(service, "_start_operation", Mock())
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
         )
         active = registry.active()
         registry.bind_plan(
@@ -1439,7 +1400,7 @@ def test_delete_still_rejects_in_progress_flat_preparation(tmp_path, monkeypatch
 
     try:
         resource = service.create(
-            NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
         )
         service._resources[resource.subscription_id].state = FLClientState.PREPARING
 
@@ -1468,9 +1429,9 @@ def test_duplicate_notification_correlation_is_rejected(tmp_path):
     }
     value = NwdafMLModelTrainSubsc.model_validate(preparation_payload())
     try:
-        service.create(value)
+        service.create(str(uuid4()), value)
         try:
-            service.create(value)
+            service.create(str(uuid4()), value)
         except ValueError as error:
             assert "notifCorreId" in str(error)
         else:
@@ -1508,7 +1469,7 @@ def test_preparation_rejects_unsupported_contract_requirements(
     )
     try:
         with pytest.raises(RequirementsError) as captured:
-            service.create(NwdafMLModelTrainSubsc.model_validate(payload))
+            service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(payload))
         assert [item.parameter for item in captured.value.violations] == [parameter]
     finally:
         service.close()
@@ -1579,9 +1540,7 @@ def test_preparation_success_returns_validated_input_model_url(tmp_path, caplog)
     )
     service._resources[resource.subscription_id] = resource
     service._dataset_builder = Mock()
-    service._dataset_builder.build.return_value.training_scopes = (
-        Mock(training_sample_count=1),
-    )
+    service._dataset_builder.build.return_value.training_scopes = (Mock(training_sample_count=1),)
     service._enqueue_delivery = Mock()
     snapshot = Mock(records=[Mock()])
     job = Mock(state=DatasetJobState.READY, snapshot=snapshot, failure="")
@@ -1751,7 +1710,7 @@ def test_flat_preparation_uses_consumer_collected_absolute_window_snapshot(
 
     service._enqueue_delivery = Mock(side_effect=record_delivery)
     try:
-        created = service.create(request)
+        created = service.create(str(uuid4()), request)
         assert terminal.wait(timeout=2)
         resource = service.get(created.subscription_id)
 
@@ -1889,7 +1848,9 @@ def test_deadline_extension_patch_does_not_restart_preparation(tmp_path):
         "model_interoperability": "001122",
     }
     try:
-        resource = service.create(NwdafMLModelTrainSubsc.model_validate(preparation_payload()))
+        resource = service.create(
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
         updated = service.patch(
             resource.subscription_id,
             NwdafMLModelTrainSubscPatch.model_validate({"mLTrainRepInfo": {"maxResTime": 600}}),
@@ -1987,9 +1948,7 @@ def test_final_validation_uses_configured_training_device(
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://server.example/final-candidate.tar.gz"
-                    },
+                    "mLFileAddr": {"mLModelUrl": "http://server.example/final-candidate.tar.gz"},
                 }
             ],
         }
@@ -2023,9 +1982,7 @@ def test_final_validation_uses_configured_training_device(
     service._dataset_builder.build.return_value = dataset
     service._trainer = Mock()
     service._enqueue_delivery = Mock()
-    predict = Mock(
-        side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0]))
-    )
+    predict = Mock(side_effect=(np.asarray([1.0, 3.0]), np.asarray([2.0, 3.0])))
     monkeypatch.setattr(LocalTrainer, "_predict", predict)
     assert service._capacity.acquire(blocking=False)
     try:
@@ -2055,9 +2012,7 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://server.example/round-input.tar.gz"
-                    },
+                    "mLFileAddr": {"mLModelUrl": "http://server.example/round-input.tar.gz"},
                 }
             ],
         }
@@ -2094,9 +2049,7 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
         training_sample_count=10,
     )
     service._enqueue_delivery = Mock()
-    predict = Mock(
-        side_effect=(np.asarray([[1.0, 3.0]]), np.asarray([[2.0, 3.0]]))
-    )
+    predict = Mock(side_effect=(np.asarray([[1.0, 3.0]]), np.asarray([[2.0, 3.0]])))
     monkeypatch.setattr(LocalTrainer, "_predict", predict)
     snapshot = Mock()
     snapshot.time_window.start_time = datetime(2026, 7, 1, tzinfo=UTC)
@@ -2125,24 +2078,21 @@ def test_flat_round_and_final_validation_reuse_the_prepared_snapshot(
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {
-                            "mLModelUrl": "http://server.example/candidate.tar.gz"
-                        },
+                        "mLFileAddr": {"mLModelUrl": "http://server.example/candidate.tar.gz"},
                     }
                 ],
             }
         )
-        resource.representation = NwdafMLModelTrainSubsc.model_validate(
-            validation_payload
-        )
+        resource.representation = NwdafMLModelTrainSubsc.model_validate(validation_payload)
         resource.state = FLClientState.VALIDATION_RUNNING
         resource.work_slot_owned = True
         assert service._capacity.acquire(blocking=False)
         service._run_validation(resource.subscription_id, resource.revision)
 
-        assert [
-            item.args[0] for item in service._dataset_builder.build.call_args_list
-        ] == [snapshot, snapshot]
+        assert [item.args[0] for item in service._dataset_builder.build.call_args_list] == [
+            snapshot,
+            snapshot,
+        ]
         assert resource.dataset_snapshot is snapshot
         assert service._trainer.train.call_count == 1
         assert predict.call_count == 2
@@ -2189,7 +2139,9 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         "model_interoperability": "001122",
     }
     try:
-        resource = service.create(NwdafMLModelTrainSubsc.model_validate(preparation_payload()))
+        resource = service.create(
+            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
+        )
         notification = NwdafMLModelTrainNotif.model_validate(
             {
                 "notifCorreId": "prep-client-a",
@@ -2197,9 +2149,7 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {
-                            "mLModelUrl": "http://server.example/base.tar.gz"
-                        },
+                        "mLFileAddr": {"mLModelUrl": "http://server.example/base.tar.gz"},
                     }
                 ],
             }
@@ -2302,9 +2252,7 @@ def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_pat
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",
-                    "mLFileAddr": {
-                        "mLModelUrl": "http://server.example/round-input.tar.gz"
-                    },
+                    "mLFileAddr": {"mLModelUrl": "http://server.example/round-input.tar.gz"},
                 }
             ],
         }
@@ -2315,9 +2263,7 @@ def test_flat_client_uses_server_epochs_without_changing_local_objective(tmp_pat
     workspace.download.return_value = Mock()
     workspace.publish.return_value = Mock(url="http://client.example/local.tar.gz")
     context = Mock()
-    context.get.return_value.nf_instance_id = (
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    )
+    context.get.return_value.nf_instance_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),

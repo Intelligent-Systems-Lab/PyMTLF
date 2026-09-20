@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Request, status
+from uuid import UUID
+
+from fastapi import APIRouter, Header, Request, status
 from fastapi.responses import JSONResponse, Response
 
 from py_mtlf.api.problems import problem_response
@@ -34,11 +36,23 @@ def _resource_response(
 def create_training_subscription(
     payload: NwdafMLModelTrainSubsc,
     request: Request,
+    subscription_id: str | None = Header(default=None, alias="X-NWDAF-Subscription-Id"),
 ) -> Response:
     if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
     try:
-        resource = request.app.state.fl_client.create(payload)
+        parsed_id = UUID(subscription_id or "")
+        if parsed_id.version != 4 or str(parsed_id) != subscription_id:
+            raise ValueError("invalid subscription ID")
+    except ValueError:
+        return problem_response(
+            status.HTTP_400_BAD_REQUEST,
+            "Bad Request",
+            "X-NWDAF-Subscription-Id must be a UUIDv4",
+            cause="INVALID_MSG_FORMAT",
+        )
+    try:
+        resource = request.app.state.fl_client.create(subscription_id, payload)
     except InvalidMessageError as error:
         return _invalid_message(error)
     except RequirementsError as error:

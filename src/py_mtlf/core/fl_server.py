@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -145,7 +146,7 @@ class FLParticipant:
     @property
     def identity(self) -> TrainingResourceIdentity:
         return TrainingResourceIdentity(
-            subscription_id=self.resource_location.rsplit("/", 1)[-1],
+            subscription_id=unquote(urlsplit(self.resource_location).path.rsplit("/", 1)[-1]),
             ml_correlation_id="",
             notification_correlation_id=self.notification_correlation_id,
             expected_round_indicator=self.expected_round,
@@ -402,8 +403,8 @@ class FLServerEngine:
                     if participant.resource_location:
                         failure = self._cleanup_participant(process, participant)
                         if failure:
-                            process.cleanup_failure = (
-                                f"{process.cleanup_failure}; {failure}".strip("; ")
+                            process.cleanup_failure = f"{process.cleanup_failure}; {failure}".strip(
+                                "; "
                             )
                         participant.resource_location = ""
                 family_key = _flat_family_key(process)
@@ -496,18 +497,14 @@ class FLServerEngine:
         if participant_ids != tuple(sorted(participant_ids)) or len(participant_ids) != len(
             set(participant_ids)
         ):
-            raise ValueError(
-                "protocol participant targets must be unique and canonically ordered"
-            )
+            raise ValueError("protocol participant targets must be unique and canonically ordered")
         for target in targets:
             if target.candidate.target.nf_instance_id != target.participant_nf_instance_id:
                 raise ValueError(
                     "protocol participant target identity does not match its candidate"
                 )
             if target.topology.nf_instance_id != target.participant_nf_instance_id:
-                raise ValueError(
-                    "protocol participant target identity does not match its topology"
-                )
+                raise ValueError("protocol participant target identity does not match its topology")
         process = FLProcess(
             process_id=ml_correlation_id,
             intent=None,
@@ -525,8 +522,7 @@ class FLServerEngine:
             FLParticipant(
                 scope=ScopeReference(
                     scope_key=(
-                        f"hierarchy:{ml_correlation_id}:"
-                        f"{target.participant_nf_instance_id}"
+                        f"hierarchy:{ml_correlation_id}:{target.participant_nf_instance_id}"
                     ),
                     consumer_id=target.participant_nf_instance_id,
                     model_ids=(),
@@ -546,9 +542,7 @@ class FLServerEngine:
                 raise RuntimeError("containing NWDAF process generation changed")
             self._processes[process.process_id] = process
             for participant in process.participants:
-                self._correlations[participant.notification_correlation_id] = (
-                    process.process_id
-                )
+                self._correlations[participant.notification_correlation_id] = process.process_id
         process.state = FLServerState.PREPARATION_CREATING
         for participant, target in zip(process.participants, targets, strict=True):
             self._attempt_protocol_preparation(
@@ -585,9 +579,7 @@ class FLServerEngine:
             set(participant_ids)
         ):
             raise ValueError("protocol participant targets must be unique and canonically ordered")
-        existing_ids = {
-            item.candidate.target.nf_instance_id for item in process.participants
-        }
+        existing_ids = {item.candidate.target.nf_instance_id for item in process.participants}
         for target in targets:
             if target.participant_nf_instance_id in existing_ids:
                 raise ValueError("protocol participant target already exists")
@@ -596,9 +588,7 @@ class FLServerEngine:
                     "protocol participant target identity does not match its candidate"
                 )
             if target.topology.nf_instance_id != target.participant_nf_instance_id:
-                raise ValueError(
-                    "protocol participant target identity does not match its topology"
-                )
+                raise ValueError("protocol participant target identity does not match its topology")
         added = [
             FLParticipant(
                 scope=ScopeReference(
@@ -618,9 +608,7 @@ class FLServerEngine:
         with self._lock:
             self._ensure_process_generation(process)
             process.participants.extend(added)
-            process.participants.sort(
-                key=lambda item: item.candidate.target.nf_instance_id
-            )
+            process.participants.sort(key=lambda item: item.candidate.target.nf_instance_id)
             for participant in added:
                 self._correlations[participant.notification_correlation_id] = process.process_id
         process.state = FLServerState.PREPARATION_CREATING
@@ -668,15 +656,12 @@ class FLServerEngine:
         with self._lock:
             self._ensure_process_generation(process)
             if any(
-                item.candidate.target.nf_instance_id
-                == target.participant_nf_instance_id
+                item.candidate.target.nf_instance_id == target.participant_nf_instance_id
                 for item in process.participants
             ):
                 raise ValueError("protocol replacement target already exists")
             process.participants.append(participant)
-            process.participants.sort(
-                key=lambda item: item.candidate.target.nf_instance_id
-            )
+            process.participants.sort(key=lambda item: item.candidate.target.nf_instance_id)
             self._correlations[participant.notification_correlation_id] = process.process_id
         self._attempt_protocol_preparation(
             process,
@@ -782,10 +767,14 @@ class FLServerEngine:
             )
             if participant is None:
                 raise KeyError(notification.notification_correlation_id)
-            active_preparation = process.state in {
-                FLServerState.PREPARATION_CREATING,
-                FLServerState.PREPARATION_WAITING,
-            } or participant.preparation_in_progress
+            active_preparation = (
+                process.state
+                in {
+                    FLServerState.PREPARATION_CREATING,
+                    FLServerState.PREPARATION_WAITING,
+                }
+                or participant.preparation_in_progress
+            )
             active_round = not active_preparation and process.state in {
                 FLServerState.ROUND_DISPATCH,
                 FLServerState.ROUND_WAITING,
@@ -832,10 +821,7 @@ class FLServerEngine:
                     process.condition.notify_all()
                     return
                 if terminal_outcome and (
-                    (
-                        notification.round_indicator is None
-                        and participant.preparation_complete
-                    )
+                    (notification.round_indicator is None and participant.preparation_complete)
                     or (
                         notification.round_indicator == participant.expected_round
                         and participant.round_complete
@@ -880,8 +866,7 @@ class FLServerEngine:
                     not notification.ml_model_infos
                     and not notification.termination_request
                     and not (
-                        process.protocol_hierarchy
-                        and notification.fl_topology_report is not None
+                        process.protocol_hierarchy and notification.fl_topology_report is not None
                     )
                 ):
                     participant.preparation_failure = (
@@ -899,8 +884,7 @@ class FLServerEngine:
                 participant.preparation_in_progress = False
                 if notification.termination_request and not process.hierarchy_plan_id:
                     process.failure = (
-                        "participant terminated training: "
-                        f"{notification.termination_request}"
+                        f"participant terminated training: {notification.termination_request}"
                     )
                 elif notification.termination_request:
                     self._schedule_terminated_participant_cleanup(process, participant)
@@ -1154,9 +1138,7 @@ class FLServerEngine:
             raise KeyError(process_id)
         with process.condition:
             if process.state is not FLServerState.PREPARATION_EVALUATING:
-                raise RuntimeError(
-                    "hierarchy Server process is not awaiting preparation admission"
-                )
+                raise RuntimeError("hierarchy Server process is not awaiting preparation admission")
             process.state = FLServerState.READY
             process.condition.notify_all()
 
@@ -1207,8 +1189,7 @@ class FLServerEngine:
             tuple(all_participants)
             if selected_participant_nf_instance_ids is None
             else tuple(
-                normalize_nf_instance_id(value)
-                for value in selected_participant_nf_instance_ids
+                normalize_nf_instance_id(value) for value in selected_participant_nf_instance_ids
             )
         )
         if not selected_ids or len(selected_ids) != len(set(selected_ids)):
@@ -1216,8 +1197,7 @@ class FLServerEngine:
         missing = sorted(set(selected_ids) - set(all_participants))
         if missing:
             raise ValueError(
-                "hierarchy round selection contains unknown participants: "
-                + ",".join(missing)
+                "hierarchy round selection contains unknown participants: " + ",".join(missing)
             )
         selected = [all_participants[nf_id] for nf_id in selected_ids]
         timeout = min(
@@ -1295,8 +1275,8 @@ class FLServerEngine:
                 if item.candidate.target.nf_instance_id not in failed
             )
             completion_rate = len(successful_ids) / len(selected)
-            accepted = not failed if not accept_failures else (
-                completion_rate >= minimum_completion_rate
+            accepted = (
+                not failed if not accept_failures else (completion_rate >= minimum_completion_rate)
             )
             if not accepted:
                 process.state = FLServerState.READY
@@ -1360,8 +1340,7 @@ class FLServerEngine:
                 (
                     item
                     for item in self._processes.values()
-                    if item.published_model_id == model_id
-                    and _flat_family_key(item) == family_key
+                    if item.published_model_id == model_id and _flat_family_key(item) == family_key
                 ),
                 None,
             )
@@ -1585,9 +1564,7 @@ class FLServerEngine:
                         execution.required_cutover_scope_keys,
                     )
                     if self._provision_notifications is not None:
-                        self._provision_notifications.reconcile_family(
-                            execution.model_family_id
-                        )
+                        self._provision_notifications.reconcile_family(execution.model_family_id)
                     process.state = (
                         FLServerState.CUTOVER_PENDING
                         if execution.required_cutover_scope_keys
@@ -1713,8 +1690,7 @@ class FLServerEngine:
             )
         participant.resource_location = response.headers["Location"]
         logger.info(
-            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s "
-            "location=%s",
+            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s location=%s",
             process.process_id,
             participant.candidate.target.nf_instance_id,
             participant.notification_correlation_id,
@@ -1761,17 +1737,13 @@ class FLServerEngine:
                             TimeWindow(
                                 startTime=now
                                 - timedelta(
-                                    seconds=(
-                                        self._server_settings.preparation_data_window_seconds
-                                    )
+                                    seconds=(self._server_settings.preparation_data_window_seconds)
                                 ),
                                 stopTime=now,
                             )
                         ],
                     ),
-                    timeAvReq=(
-                        f"PT{self._server_settings.preparation_timeout_seconds}S"
-                    ),
+                    timeAvReq=(f"PT{self._server_settings.preparation_timeout_seconds}S"),
                 )
             ],
             mLTrainRepInfo=MLTrainReportInfo(
@@ -1806,24 +1778,19 @@ class FLServerEngine:
         ):
             cleanup_failure = self._cleanup_participant(process, participant)
             participant.resource_location = ""
-            participant.preparation_failure = (
-                "FEATURE_NOT_SUPPORTED"
-                + (f": {cleanup_failure}" if cleanup_failure else "")
+            participant.preparation_failure = "FEATURE_NOT_SUPPORTED" + (
+                f": {cleanup_failure}" if cleanup_failure else ""
             )
             raise RuntimeError(participant.preparation_failure)
         if (
             accepted.ml_correlation_id != process.process_id
-            or accepted.notification_correlation_id
-            != participant.notification_correlation_id
+            or accepted.notification_correlation_id != participant.notification_correlation_id
         ):
             self._cleanup_participant(process, participant)
             participant.resource_location = ""
-            raise RuntimeError(
-                "protocol participant changed the accepted resource identity"
-            )
+            raise RuntimeError("protocol participant changed the accepted resource identity")
         logger.info(
-            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s "
-            "location=%s",
+            "FL participant resource created process_id=%s nf=%s notif_corre_id=%s location=%s",
             process.process_id,
             participant.candidate.target.nf_instance_id,
             participant.notification_correlation_id,
@@ -2147,17 +2114,11 @@ class FLServerEngine:
         if (
             input_contract.fl_metadata.ml_corre_id != process.process_id
             or input_contract.fl_metadata.round_ind
-            != (
-                round_indicator
-                if expected_input_round is None
-                else expected_input_round
-            )
+            != (round_indicator if expected_input_round is None else expected_input_round)
         ):
             raise RuntimeError("Server aggregation input identity does not match round")
         included_ids = (
-            None
-            if participant_nf_instance_ids is None
-            else frozenset(participant_nf_instance_ids)
+            None if participant_nf_instance_ids is None else frozenset(participant_nf_instance_ids)
         )
         local_bundles: list[tuple[LoadedBundle, int]] = []
         participant_metadata = []
@@ -2201,8 +2162,7 @@ class FLServerEngine:
                     participant.candidate.target.nf_instance_id
                 )
                 actual = tuple(
-                    item.participant_nf_instance_id
-                    for item in metadata.subordinate_participants
+                    item.participant_nf_instance_id for item in metadata.subordinate_participants
                 )
                 if expected is None or actual != expected:
                     raise RuntimeError(
@@ -2348,10 +2308,7 @@ class FLServerEngine:
                 continue
             regression = (wape(summary.candidate) or 0.0) - (wape(summary.base) or 0.0)
             if regression > self._server_settings.final_validation.max_scope_wape_regression:
-                reasons.append(
-                    "scope_regression_exceeded:"
-                    f"{participant.scope.scope_key}"
-                )
+                reasons.append(f"scope_regression_exceeded:{participant.scope.scope_key}")
         process.validation_summaries = tuple(item for _participant, item in summaries)
         process.gate_would_accept = not reasons
         process.gate_rejection_reasons = tuple(reasons)
@@ -2374,6 +2331,7 @@ class FLServerEngine:
     def _future_done(self, future: Future) -> None:
         with self._lock:
             self._futures.discard(future)
+
 
 def _flat_execution(process: FLProcess) -> FlatExecutionRequest:
     if process.execution is not None:

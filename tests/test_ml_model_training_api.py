@@ -1,4 +1,5 @@
 from unittest.mock import Mock
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -80,6 +81,40 @@ def candidate_context() -> Mock:
     return client
 
 
+def test_training_create_requires_go_resource_id_and_does_not_replace_existing(
+    settings,
+    tmp_path,
+):
+    configured = candidate_settings(settings, tmp_path)
+    resource_id = str(uuid4())
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
+        for value in (None, "not-a-uuid"):
+            response = client.post(
+                "/internal/v1/ml-model-training/subscriptions",
+                headers={"X-NWDAF-Subscription-Id": value} if value else {},
+                json=candidate_payload(),
+            )
+            assert response.status_code == 400
+
+        first = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": resource_id},
+            json=candidate_payload(),
+        )
+        assert first.status_code == 201
+        assert first.headers["Location"].endswith("/" + resource_id)
+
+        duplicate_payload = candidate_payload()
+        duplicate_payload["notifCorreId"] = "correlation-2"
+        duplicate = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": resource_id},
+            json=duplicate_payload,
+        )
+        assert duplicate.status_code == 403
+        assert client.app.state.fl_client.get(resource_id).subscription_id == resource_id
+
+
 def test_training_requirements_failure_identifies_invalid_parameters(
     settings,
     tmp_path,
@@ -99,6 +134,7 @@ def test_training_requirements_failure_identifies_invalid_parameters(
     with TestClient(create_app(configured)) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json={
                 "mLEventSubscs": [
                     {
@@ -150,6 +186,7 @@ def test_training_admission_is_unavailable_without_containing_go_generation(
     with TestClient(create_app(configured)) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json={
                 "mLEventSubscs": [
                     {
@@ -165,17 +202,13 @@ def test_training_admission_is_unavailable_without_containing_go_generation(
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {
-                            "mLModelUrl": "http://server.example/base.tar.gz"
-                        },
+                        "mLFileAddr": {"mLModelUrl": "http://server.example/base.tar.gz"},
                     }
                 ],
                 "mLModelTrainInfos": [
                     {
                         "dataAvReq": {
-                            "inpEvents": [
-                                {"upfEvent": "USER_DATA_USAGE_TRENDS"}
-                            ],
+                            "inpEvents": [{"upfEvent": "USER_DATA_USAGE_TRENDS"}],
                             "minNumSamples": 1,
                             "timeWindows": [
                                 {
@@ -199,11 +232,10 @@ def test_candidate_create_returns_lossless_persistent_contract_without_feature(
     tmp_path,
 ):
     configured = candidate_settings(settings, tmp_path)
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=candidate_payload(),
         )
 
@@ -221,15 +253,15 @@ def test_candidate_retained_result_instruction_is_rejected_atomically(settings, 
     payload = candidate_payload()
     payload["x-retainedResultReq"] = True
     payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         rejected = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=payload,
         )
         valid = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=candidate_payload(),
         )
 
@@ -246,11 +278,10 @@ def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):
         "aggregation": "sampleWeighted",
         "methodParameters": {"proximalMu": 0.01, "unknown": True},
     }
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=payload,
         )
 
@@ -266,11 +297,10 @@ def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):
 
 def test_candidate_patch_is_rejected_when_feature_was_not_negotiated(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         created = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=candidate_payload(),
         )
         response = client.patch(
@@ -292,11 +322,10 @@ def test_candidate_patch_is_rejected_when_feature_was_not_negotiated(settings, t
 
 def test_candidate_put_is_rejected_when_feature_was_not_negotiated(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         created = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=candidate_payload(),
         )
         replacement = candidate_payload()
@@ -312,14 +341,11 @@ def test_candidate_put_is_rejected_when_feature_was_not_negotiated(settings, tmp
 def test_candidate_receiver_mismatch_is_structured_bad_request(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
     payload = candidate_payload()
-    payload["x-flTopology"]["nfInstanceId"] = (
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    )
-    with TestClient(
-        create_app(configured, nwdaf_context_client=candidate_context())
-    ) as client:
+    payload["x-flTopology"]["nfInstanceId"] = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": str(uuid4())},
             json=payload,
         )
 
