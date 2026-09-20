@@ -1,3 +1,7 @@
+import inspect
+import json
+from datetime import UTC, datetime
+from functools import wraps
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Request, status
@@ -19,6 +23,99 @@ router = APIRouter(
 )
 
 
+def _record_received(operation: str):
+    def decorate(handler):
+        signature = inspect.signature(handler)
+
+        @wraps(handler)
+        def wrapped(*args, **kwargs):
+            arguments = signature.bind(*args, **kwargs).arguments
+            request = arguments["request"]
+            recorder = getattr(request.app.state, "experiment_recorder", None)
+            started_at = datetime.now(UTC)
+            payload = arguments.get("payload")
+            subscription_id = arguments.get("subscription_id")
+            ml_correlation_id = getattr(payload, "ml_correlation_id", None)
+            source_nf_instance_id = None
+            if operation in {"PUT", "PATCH", "DELETE"}:
+                client = getattr(request.app.state, "fl_client", None)
+                try:
+                    resource = client.get(subscription_id) if client is not None else None
+                except KeyError:
+                    resource = None
+                ml_correlation_id = resource.representation.ml_correlation_id if resource else None
+            elif operation == "NOTIFY":
+                server = getattr(request.app.state, "fl_server", None)
+                context = (
+                    server.notification_record_context(payload.notification_correlation_id)
+                    if server is not None
+                    else None
+                )
+                if context is not None:
+                    ml_correlation_id, subscription_id, source_nf_instance_id = context
+            try:
+                response = handler(*args, **kwargs)
+            except Exception as error:
+                if recorder is not None and ml_correlation_id:
+                    recorder.record_training_operation(
+                        ml_correlation_id=ml_correlation_id,
+                        operation=operation,
+                        direction="RECEIVED",
+                        started_at=started_at,
+                        outcome="FAILED",
+                        subscription_id=subscription_id,
+                        source_nf_instance_id=source_nf_instance_id,
+                        message=(
+                            payload.model_dump(
+                                by_alias=True, exclude_none=True, exclude_unset=True, mode="json"
+                            )
+                            if payload is not None
+                            else None
+                        ),
+                        cause=str(error),
+                    )
+                raise
+            if recorder is not None and ml_correlation_id:
+                cause = None
+                if response.status_code >= 400:
+                    try:
+                        cause = json.loads(response.body).get("cause") if response.body else None
+                    except (ValueError, AttributeError):
+                        cause = None
+                recorder.record_training_operation(
+                    ml_correlation_id=ml_correlation_id,
+                    operation=operation,
+                    direction="RECEIVED",
+                    started_at=started_at,
+                    outcome=(
+                        "SUCCESS"
+                        if response.status_code < 400
+                        else "REJECTED"
+                        if response.status_code < 500
+                        else "FAILED"
+                    ),
+                    subscription_id=(
+                        subscription_id
+                        if operation != "CREATE" or response.status_code == 201
+                        else None
+                    ),
+                    source_nf_instance_id=source_nf_instance_id,
+                    message=(
+                        payload.model_dump(
+                            by_alias=True, exclude_none=True, exclude_unset=True, mode="json"
+                        )
+                        if payload is not None
+                        else None
+                    ),
+                    cause=cause,
+                )
+            return response
+
+        return wrapped
+
+    return decorate
+
+
 def _resource_response(
     resource: FLClientResource,
     status_code: int,
@@ -33,6 +130,7 @@ def _resource_response(
 
 
 @router.post("/subscriptions", status_code=status.HTTP_201_CREATED)
+@_record_received("CREATE")
 def create_training_subscription(
     payload: NwdafMLModelTrainSubsc,
     request: Request,
@@ -88,6 +186,7 @@ def create_training_subscription(
 
 
 @router.put("/subscriptions/{subscription_id}")
+@_record_received("PUT")
 def replace_training_subscription(
     subscription_id: str,
     payload: NwdafMLModelTrainSubsc,
@@ -121,6 +220,7 @@ def replace_training_subscription(
 
 
 @router.patch("/subscriptions/{subscription_id}")
+@_record_received("PATCH")
 def patch_training_subscription(
     subscription_id: str,
     payload: NwdafMLModelTrainSubscPatch,
@@ -157,6 +257,7 @@ def patch_training_subscription(
     "/subscriptions/{subscription_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
+@_record_received("DELETE")
 def delete_training_subscription(subscription_id: str, request: Request) -> Response:
     if request.app.state.fl_client is None:
         return _role_unavailable("FL Client")
@@ -175,6 +276,7 @@ def delete_training_subscription(subscription_id: str, request: Request) -> Resp
 
 
 @router.post("/notifications", status_code=status.HTTP_204_NO_CONTENT)
+@_record_received("NOTIFY")
 def receive_training_notification(
     payload: NwdafMLModelTrainNotif,
     request: Request,

@@ -1,5 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -49,16 +50,17 @@ def test_recorder_appends_reopens_and_keeps_each_line_valid_json(tmp_path):
     recorder.close()
 
     recorder = _recorder(tmp_path)
-    recorder.record_branch_failure_detected(
+    recorder.record_decision(
         ml_correlation_id=PLAN_ID,
-        round_indicator=0,
-        failed_branch_nf_instance_id=NF_INSTANCE_ID,
+        record_type="EDGE_UNAVAILABLE",
+        roundInd=0,
+        childNfInstanceId=NF_INSTANCE_ID,
     )
     recorder.close()
 
     assert [record["recordType"] for record in _records(tmp_path)] == [
-        "ROOT_ROUND_OUTCOME",
-        "BRANCH_FAILURE_DETECTED",
+        "ROUND_AGGREGATION",
+        "EDGE_UNAVAILABLE",
     ]
 
 
@@ -91,13 +93,11 @@ def test_recorder_persists_final_model_atomically_and_rejects_conflicts(tmp_path
     assert records == [
         {
             "recordedAt": records[0]["recordedAt"],
-            "recordType": "FINAL_MODEL_SAVED",
+            "recordType": "MODEL_ARTIFACT_SAVED",
             "mlCorreId": PLAN_ID,
             "nfInstanceId": NF_INSTANCE_ID,
             "roundInd": 3,
             "artifactFile": "final-model.tar.gz",
-            "artifactDigest": "a" * 64,
-            "sizeBytes": len(b"final-model-bundle"),
         }
     ]
 
@@ -186,6 +186,94 @@ def test_recorder_serializes_concurrent_writers_without_corrupting_lines(tmp_pat
     assert {record["roundInd"] for record in records} == set(range(40))
 
 
+def test_training_operation_keeps_wire_topology_but_not_callback_uri_or_model_payload(tmp_path):
+    recorder = _recorder(tmp_path)
+    started = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+    child = "10000000-0000-4000-8000-000000000002"
+    subscription_id = "22222222-2222-4222-8222-222222222222"
+    recorder.record_training_operation(
+        ml_correlation_id=PLAN_ID,
+        operation="CREATE",
+        direction="SENT",
+        started_at=started,
+        outcome="SUCCESS",
+        target_nf_instance_id=child,
+        subscription_id=subscription_id,
+        recorded_at=started + timedelta(seconds=2),
+        message={
+            "notifUri": "http://callback.example/private",
+            "notifCorreId": "root-to-branch",
+            "x-flTopology": {
+                "nfInstanceId": child,
+                "children": [{"nfInstanceId": NF_INSTANCE_ID, "priority": 50}],
+            },
+            "mLModelInfos": [
+                {
+                    "event": "UE_COMMUNICATION",
+                    "mLFileAddr": {"mLModelUrl": "http://adrf.example/model"},
+                    "mlFile": {"secret": "not-for-recording"},
+                }
+            ],
+        },
+    )
+    recorder.close()
+
+    record = _records(tmp_path)[0]
+    assert record["startedAt"] == "2026-09-21T10:00:00Z"
+    assert record["recordedAt"] >= record["startedAt"]
+    assert record["subscriptionId"] == subscription_id
+    assert record["targetNfInstanceId"] == child
+    assert record["message"]["x-flTopology"]["children"][0]["priority"] == 50
+    assert "notifUri" not in record["message"]
+    assert "mlFile" not in record["message"]["mLModelInfos"][0]
+
+
+def test_training_operation_rejected_create_does_not_invent_subscription_id(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.record_training_operation(
+        ml_correlation_id=PLAN_ID,
+        operation="CREATE",
+        direction="RECEIVED",
+        started_at=datetime.now(UTC),
+        outcome="REJECTED",
+        cause="ML_MODEL_TRAINING_REQS_NOT_MET",
+        message={"notifCorreId": "root-to-branch"},
+    )
+    recorder.close()
+    record = _records(tmp_path)[0]
+    assert record["outcome"] == "REJECTED"
+    assert record["cause"] == "ML_MODEL_TRAINING_REQS_NOT_MET"
+    assert "subscriptionId" not in record
+
+
+def test_recorder_write_failure_propagates_and_preserves_prior_evidence(tmp_path, monkeypatch):
+    recorder = _recorder(tmp_path)
+    recorder.record_decision(
+        ml_correlation_id=PLAN_ID,
+        record_type="TOPOLOGY_ACCEPTANCE",
+        accepted=True,
+        realizedTopology={"nfInstanceId": NF_INSTANCE_ID, "children": []},
+    )
+    original_open = type(tmp_path).open
+
+    def fail_observation_open(path, *args, **kwargs):
+        if path.name == "observations.jsonl" and args and args[0] == "a":
+            raise OSError("recording disk unavailable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(tmp_path), "open", fail_observation_open)
+    with pytest.raises(OSError, match="recording disk unavailable"):
+        recorder.record_decision(
+            ml_correlation_id=PLAN_ID,
+            record_type="EDGE_CONFIRMED",
+            childNfInstanceId=NF_INSTANCE_ID,
+            subscriptionId="22222222-2222-4222-8222-222222222222",
+        )
+    monkeypatch.setattr(type(tmp_path), "open", original_open)
+    assert [record["recordType"] for record in _records(tmp_path)] == ["TOPOLOGY_ACCEPTANCE"]
+    recorder.close()
+
+
 def test_recorder_evaluates_real_model_and_rejects_dataset_mismatch(tmp_path):
     recorder = _recorder(tmp_path, validation=True)
     model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(28 * 28, 10))
@@ -209,8 +297,9 @@ def test_recorder_evaluates_real_model_and_rejects_dataset_mismatch(tmp_path):
 
     record = _records(tmp_path)[0]
     assert record["sampleCount"] == 2
-    assert np.isfinite(record["validationLoss"])
-    assert 0 <= record["validationAccuracy"] <= 1
+    assert np.isfinite(record["loss"])
+    assert 0 <= record["accuracy"] <= 1
+    assert record["dataSplit"] == "VALIDATION"
     assert "roundInd" not in record
     assert all(
         torch.equal(before[name], value) for name, value in model.state_dict().items()

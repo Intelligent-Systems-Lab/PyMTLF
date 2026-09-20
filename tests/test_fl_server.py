@@ -13,9 +13,11 @@ import torch
 from conftest import training_scope_descriptor
 from nwdaf_context import context_client
 
-from py_mtlf.config import FederatedLearningSettings, FLServerSettings
+from py_mtlf.api.ml_model_training import receive_training_notification
+from py_mtlf.config import ExperimentRecordingSettings, FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_artifacts import (
     RoundLocalArtifact,
     RoundLocalResultType,
@@ -185,7 +187,7 @@ def test_assignment_does_not_substitute_another_eligible_same_tai_client():
         )
 
 
-def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(caplog):
+def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(caplog, tmp_path):
     caplog.set_level(logging.INFO, logger="py_mtlf.core.fl_server")
     root_id = "11111111-1111-4111-8111-111111111111"
     branch_id = "22222222-2222-4222-8222-222222222222"
@@ -205,6 +207,8 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
+    recorder = ExperimentRecorder(ExperimentRecordingSettings(directory=tmp_path / "records"))
+    recorder.open(root_id)
     registry = FLExperimentRegistry()
     reservation = registry.reserve_root(procedure_id)
     orchestrator = FLServerEngine(
@@ -221,6 +225,7 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
         Mock(),
         client=client,
         experiments=registry,
+        experiment_recorder=recorder,
     )
     topology = FlTopologyNode.model_validate(
         {
@@ -289,17 +294,22 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
             f"notif_corre_id={participant.notification_correlation_id} "
             "location=http://branch.example/subscriptions/resource-a"
         ) in caplog.text
-        orchestrator.receive_notification(
-            NwdafMLModelTrainNotif.model_validate(
-                {
-                    "notifCorreId": participant.notification_correlation_id,
-                    "mlCorreId": procedure_id,
-                    "x-flTopologyReport": {
-                        "nfInstanceId": branch_id,
-                    },
-                }
+        notification = NwdafMLModelTrainNotif.model_validate(
+            {
+                "notifCorreId": participant.notification_correlation_id,
+                "mlCorreId": procedure_id,
+                "x-flTopologyReport": {"nfInstanceId": branch_id},
+            }
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    fl_server=orchestrator,
+                    experiment_recorder=recorder,
+                )
             )
         )
+        assert receive_training_notification(notification, request).status_code == 204
         collected = orchestrator.collect_hierarchy_preparation(process.process_id)
 
         assert collected.participants[0].notification.fl_topology_report.nf_instance_id == branch_id
@@ -308,6 +318,34 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
         orchestrator.close()
         registry.reset_generation()
         client.close()
+        recorder.close()
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "records" / procedure_id / "observations.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    sent_create = next(
+        record
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION"
+        and record["operation"] == "CREATE"
+        and record["direction"] == "SENT"
+    )
+    assert sent_create["targetNfInstanceId"] == branch_id
+    assert sent_create["subscriptionId"] == "resource-a"
+    assert sent_create["message"]["x-flTopology"]["children"][0]["priority"] == 10
+    assert "notifUri" not in sent_create["message"]
+    received_notify = next(
+        record
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION"
+        and record["operation"] == "NOTIFY"
+        and record["direction"] == "RECEIVED"
+    )
+    assert received_notify["subscriptionId"] == "resource-a"
+    assert received_notify["sourceNfInstanceId"] == branch_id
+    assert received_notify["message"]["x-flTopologyReport"]["nfInstanceId"] == branch_id
 
 
 def test_protocol_feature_mismatch_is_a_participant_failure():
@@ -503,9 +541,10 @@ def test_protocol_process_adds_and_removes_participants_after_admission():
         collected = orchestrator.collect_hierarchy_preparation(process.process_id)
         orchestrator.admit_hierarchy_preparation(process.process_id)
 
-        assert tuple(
-            item.participant_nf_instance_id for item in collected.participants
-        ) == (branch_a, branch_b)
+        assert tuple(item.participant_nf_instance_id for item in collected.participants) == (
+            branch_a,
+            branch_b,
+        )
         orchestrator.remove_protocol_participant(process.process_id, branch_a)
         assert tuple(
             participant.candidate.target.nf_instance_id
@@ -691,9 +730,7 @@ def test_protocol_participant_retirement_fences_local_identity_when_peer_cleanup
         client=client,
     )
     orchestrator._processes[process.process_id] = process
-    orchestrator._correlations[participant.notification_correlation_id] = (
-        process.process_id
-    )
+    orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     try:
         cleanup_failure = orchestrator.remove_protocol_participant(
             process.process_id,
@@ -1138,9 +1175,7 @@ def test_flat_server_publishes_round_input_with_server_owned_epochs(tmp_path):
         (candidate(second_owner_id, "000002"),),
     )
     context = Mock()
-    context.get.return_value.nf_instance_id = (
-        "33333333-3333-4333-8333-333333333333"
-    )
+    context.get.return_value.nf_instance_id = "33333333-3333-4333-8333-333333333333"
     workspace = Mock()
     source = SimpleNamespace(name="flat-base")
     round_inputs = (
@@ -2061,9 +2096,7 @@ def test_hierarchy_round_freezes_selected_set_and_aggregates_only_successful_res
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     aggregate = Mock(url="http://server.example/aggregate")
     orchestrator._aggregate_round = Mock(return_value=aggregate)
     completed = threading.Event()
@@ -2187,9 +2220,7 @@ def test_hierarchy_round_treats_peer_unavailable_as_typed_participant_failure(
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     aggregate = Mock(url="http://server.example/aggregate")
     orchestrator._aggregate_round = Mock(return_value=aggregate)
     results = []
@@ -2284,9 +2315,7 @@ def test_hierarchy_round_completion_gate_rejects_without_aggregating(tmp_path):
     orchestrator._processes[process.process_id] = process
     orchestrator._aggregate_round = Mock()
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     failures = []
     results = []
 
@@ -2392,9 +2421,7 @@ def test_hierarchy_round_timeout_can_accept_completed_selected_subset(tmp_path):
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     aggregate = Mock(url="http://server.example/aggregate")
     orchestrator._aggregate_round = Mock(return_value=aggregate)
     results = []
@@ -2505,9 +2532,7 @@ def test_hierarchy_round_patch_failure_cleans_lower_resources_before_return(tmp_
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     try:
         with pytest.raises(RuntimeError, match="round patch failed"):
             orchestrator.execute_hierarchy_round(
@@ -2570,12 +2595,8 @@ def test_hierarchy_round_deadline_marks_every_missing_participant_and_skips_aggr
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
-    orchestrator._wait = Mock(
-        side_effect=RuntimeError("federated stage deadline expired")
-    )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
+    orchestrator._wait = Mock(side_effect=RuntimeError("federated stage deadline expired"))
     try:
         outcome = orchestrator.execute_hierarchy_round(
             process_id=process.process_id,
@@ -2712,9 +2733,7 @@ def test_parent_cancel_during_lower_patch_fanout_fences_remaining_dispatches(
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
 
     def patch_then_cancel(*_args, **_kwargs):
         orchestrator.cancel_hierarchy_preparation(
@@ -2784,9 +2803,7 @@ def test_go_generation_reset_during_lower_patch_fences_remaining_fanout(tmp_path
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     failures = []
 
     def execute_round():
@@ -3049,9 +3066,7 @@ def test_hierarchy_wrong_round_records_failure_but_still_collects_other_outcomes
     )
     orchestrator._processes[process.process_id] = process
     for participant in participants:
-        orchestrator._correlations[participant.notification_correlation_id] = (
-            process.process_id
-        )
+        orchestrator._correlations[participant.notification_correlation_id] = process.process_id
     completed = threading.Event()
     failures = []
 
@@ -3663,12 +3678,7 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
                 "local_artifact_digest": "5" * 64,
             },
         ]
-        assert (
-            publication["metadata"]["fl_metadata"][
-                "aggregated_training_sample_count"
-            ]
-            == 4
-        )
+        assert publication["metadata"]["fl_metadata"]["aggregated_training_sample_count"] == 4
 
         workspace.download.reset_mock()
         workspace.download.side_effect = [SimpleNamespace(key="4" * 64)]
@@ -3689,9 +3699,9 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         assert [item.args[0] for item in workspace.download.call_args_list] == [
             "http://branch-1.example/aggregate.tar.gz"
         ]
-        assert partial_publication["metadata"]["fl_metadata"][
-            "aggregated_training_sample_count"
-        ] == 1
+        assert (
+            partial_publication["metadata"]["fl_metadata"]["aggregated_training_sample_count"] == 1
+        )
     finally:
         orchestrator.close()
 
@@ -3772,7 +3782,9 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {"mLModelUrl": "http://client.example/local.tar.gz"},
+                        "mLFileAddr": {
+                            "mLModelUrl": "http://client.example/local.tar.gz"
+                        },
                     }
                 ],
             }
@@ -3801,9 +3813,7 @@ def test_aggregation_rejects_local_artifact_with_different_model_contract(tmp_pa
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
-                        "mLFileAddr": {
-                            "mLModelUrl": "http://client.example/local.tar.gz"
-                        },
+                        "mLFileAddr": {"mLModelUrl": "http://client.example/local.tar.gz"},
                     }
                 ],
             }

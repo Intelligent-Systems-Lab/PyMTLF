@@ -16,6 +16,7 @@ import httpx
 from py_mtlf.config import FederatedLearningSettings, FLServerSettings
 from py_mtlf.core.accuracy_policy import AccuracyPolicy, RetrainIntent, ScopeReference
 from py_mtlf.core.artifacts import ArtifactMetadata
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.federated_trainer import FederatedTrainer
 from py_mtlf.core.fl_artifacts import (
     RoundInputArtifact,
@@ -336,6 +337,7 @@ class FLServerEngine:
         publication: PublicationCoordinator | None = None,
         provision_notifications: ProvisionNotificationDispatcher | None = None,
         experiments: FLExperimentRegistry | None = None,
+        experiment_recorder: ExperimentRecorder | None = None,
     ) -> None:
         self._settings = settings
         self._server_settings = server_settings
@@ -347,6 +349,7 @@ class FLServerEngine:
         self._publication = publication
         self._provision_notifications = provision_notifications
         self._experiments = experiments or FLExperimentRegistry()
+        self._experiment_recorder = experiment_recorder
         self._loader = TrustedBundleLoader()
         self._client = client or httpx.Client(
             timeout=settings.request_timeout_seconds, follow_redirects=False
@@ -750,6 +753,103 @@ class FLServerEngine:
         with self._lock:
             self._processes.pop(process_id, None)
 
+    def notification_record_context(self, notif_correlation_id: str) -> tuple[str, str, str] | None:
+        with self._lock:
+            process_id = self._correlations.get(notif_correlation_id)
+            process = self._processes.get(process_id or "")
+        if process is None:
+            return None
+        with process.condition:
+            participant = next(
+                (
+                    item
+                    for item in process.participants
+                    if item.notification_correlation_id == notif_correlation_id
+                ),
+                None,
+            )
+            if participant is None:
+                return None
+            return (
+                process.process_id,
+                participant.identity.subscription_id,
+                participant.candidate.target.nf_instance_id,
+            )
+
+    def _send_training_operation(
+        self,
+        process: FLProcess,
+        participant: FLParticipant,
+        operation: str,
+        perform: Callable[[], httpx.Response],
+        message: dict | None = None,
+    ) -> httpx.Response:
+        recorder = self._experiment_recorder
+        started_at = datetime.now(UTC)
+        try:
+            response = perform()
+        except Exception as error:
+            if recorder is not None:
+                recorder.record_training_operation(
+                    ml_correlation_id=process.process_id,
+                    operation=operation,
+                    direction="SENT",
+                    started_at=started_at,
+                    outcome="FAILED",
+                    target_nf_instance_id=participant.candidate.target.nf_instance_id,
+                    subscription_id=(
+                        participant.identity.subscription_id
+                        if participant.resource_location
+                        else None
+                    ),
+                    message=message,
+                    cause=str(error),
+                )
+            raise
+        if recorder is not None:
+            location = (
+                response.headers.get("Location", "")
+                if operation == "CREATE"
+                else participant.resource_location
+            )
+            subscription_id = (
+                unquote(urlsplit(location).path.rsplit("/", 1)[-1]) if location else None
+            )
+            successful = (
+                response.status_code == 201 and bool(subscription_id)
+                if operation == "CREATE"
+                else response.status_code
+                in ({200, 204, 404} if operation == "DELETE" else {200, 204})
+            )
+            if operation == "CREATE" and not successful:
+                subscription_id = None
+            cause = None
+            if not successful:
+                try:
+                    cause = response.json().get("cause")
+                except (ValueError, AttributeError):
+                    cause = f"HTTP_{response.status_code}"
+            recorder.record_training_operation(
+                ml_correlation_id=process.process_id,
+                operation=operation,
+                direction="SENT",
+                started_at=started_at,
+                outcome=(
+                    "SUCCESS"
+                    if successful
+                    else "FAILED"
+                    if response.status_code < 400
+                    else "REJECTED"
+                    if response.status_code < 500
+                    else "FAILED"
+                ),
+                target_nf_instance_id=participant.candidate.target.nf_instance_id,
+                subscription_id=subscription_id,
+                message=message,
+                cause=cause,
+            )
+        return response
+
     def receive_notification(self, notification: NwdafMLModelTrainNotif) -> None:
         with self._lock:
             process_id = self._correlations.get(notification.notification_correlation_id)
@@ -1019,7 +1119,7 @@ class FLServerEngine:
                     process.condition.wait(timeout=remaining)
                     continue
             try:
-                self._grant_extension(participant, extension)
+                self._grant_extension(process, participant, extension)
             except Exception as error:
                 with process.condition:
                     participant.preparation_failure = str(error)
@@ -1089,7 +1189,7 @@ class FLServerEngine:
                     process.condition.wait(timeout=remaining)
                     continue
             try:
-                self._grant_extension(extension_participant, extension_seconds)
+                self._grant_extension(process, extension_participant, extension_seconds)
             except Exception as error:
                 with process.condition:
                     extension_participant.preparation_failure = str(error)
@@ -1678,10 +1778,17 @@ class FLServerEngine:
             ),
         )
         go_base = self._go_base()
-        response = self._client.post(
-            go_base + "/internal/v1/ml-model-training/subscriptions",
-            headers=selected_target_headers(participant.candidate.target),
-            json=value.model_dump(by_alias=True, exclude_none=True, mode="json"),
+        wire = value.model_dump(by_alias=True, exclude_none=True, mode="json")
+        response = self._send_training_operation(
+            process,
+            participant,
+            "CREATE",
+            lambda: self._client.post(
+                go_base + "/internal/v1/ml-model-training/subscriptions",
+                headers=selected_target_headers(participant.candidate.target),
+                json=wire,
+            ),
+            wire,
         )
         if response.status_code != 201 or not response.headers.get("Location"):
             raise RuntimeError(
@@ -1751,10 +1858,17 @@ class FLServerEngine:
             ),
             fl_topology=topology,
         )
-        response = self._client.post(
-            self._go_base() + "/internal/v1/ml-model-training/subscriptions",
-            headers=selected_target_headers(participant.candidate.target),
-            json=value.model_dump(by_alias=True, exclude_none=True, mode="json"),
+        wire = value.model_dump(by_alias=True, exclude_none=True, mode="json")
+        response = self._send_training_operation(
+            process,
+            participant,
+            "CREATE",
+            lambda: self._client.post(
+                self._go_base() + "/internal/v1/ml-model-training/subscriptions",
+                headers=selected_target_headers(participant.candidate.target),
+                json=wire,
+            ),
+            wire,
         )
         location = response.headers.get("Location", "")
         if response.status_code != 201 or not location:
@@ -1853,10 +1967,16 @@ class FLServerEngine:
             ),
         )
         try:
-            response = self._client.patch(
-                participant.resource_location,
-                headers={"Content-Type": "application/merge-patch+json"},
-                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            response = self._send_training_operation(
+                process,
+                participant,
+                "PATCH",
+                lambda: self._client.patch(
+                    participant.resource_location,
+                    headers={"Content-Type": "application/merge-patch+json"},
+                    content=patch.model_dump_json(by_alias=True, exclude_none=True),
+                ),
+                patch.model_dump(by_alias=True, exclude_none=True, mode="json"),
             )
         except httpx.TransportError as error:
             raise HierarchyParticipantAvailabilityError(
@@ -1893,10 +2013,16 @@ class FLServerEngine:
             ),
         )
         try:
-            response = self._client.patch(
-                participant.resource_location,
-                headers={"Content-Type": "application/merge-patch+json"},
-                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            response = self._send_training_operation(
+                process,
+                participant,
+                "PATCH",
+                lambda: self._client.patch(
+                    participant.resource_location,
+                    headers={"Content-Type": "application/merge-patch+json"},
+                    content=patch.model_dump_json(by_alias=True, exclude_none=True),
+                ),
+                patch.model_dump(by_alias=True, exclude_none=True, mode="json"),
             )
         except httpx.TransportError as error:
             raise HierarchyParticipantAvailabilityError(
@@ -1930,10 +2056,16 @@ class FLServerEngine:
                 maxResTime=timeout_seconds or self._server_settings.round_timeout_seconds
             ),
         )
-        response = self._client.patch(
-            participant.resource_location,
-            headers={"Content-Type": "application/merge-patch+json"},
-            content=patch.model_dump_json(by_alias=True, exclude_none=True),
+        response = self._send_training_operation(
+            process,
+            participant,
+            "PATCH",
+            lambda: self._client.patch(
+                participant.resource_location,
+                headers={"Content-Type": "application/merge-patch+json"},
+                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            ),
+            patch.model_dump(by_alias=True, exclude_none=True, mode="json"),
         )
         if response.status_code not in {200, 204}:
             raise RuntimeError(
@@ -1990,7 +2122,7 @@ class FLServerEngine:
                                 continue
                             raise RuntimeError("participant delay extension budget is exhausted")
                         try:
-                            self._grant_extension(participant, extension)
+                            self._grant_extension(process, participant, extension)
                         except Exception as error:
                             if collect_participant_failures:
                                 participant.round_failure = (
@@ -2042,7 +2174,12 @@ class FLServerEngine:
         last_error = ""
         for attempt in range(self._server_settings.cleanup.max_attempts):
             try:
-                response = self._client.delete(participant.resource_location)
+                response = self._send_training_operation(
+                    process,
+                    participant,
+                    "DELETE",
+                    lambda: self._client.delete(participant.resource_location),
+                )
                 if response.status_code in {200, 204, 404}:
                     logger.info(
                         "FL participant resource deleted process_id=%s nf=%s location=%s status=%s",
@@ -2082,12 +2219,20 @@ class FLServerEngine:
                 self._correlations.pop(participant.notification_correlation_id, None)
         process.hierarchy_cleanup_complete = True
 
-    def _grant_extension(self, participant: FLParticipant, extension: int) -> None:
+    def _grant_extension(
+        self, process: FLProcess, participant: FLParticipant, extension: int
+    ) -> None:
         patch = NwdafMLModelTrainSubscPatch(mLTrainRepInfo=MLTrainReportInfo(maxResTime=extension))
-        response = self._client.patch(
-            participant.resource_location,
-            headers={"Content-Type": "application/merge-patch+json"},
-            content=patch.model_dump_json(by_alias=True, exclude_none=True),
+        response = self._send_training_operation(
+            process,
+            participant,
+            "PATCH",
+            lambda: self._client.patch(
+                participant.resource_location,
+                headers={"Content-Type": "application/merge-patch+json"},
+                content=patch.model_dump_json(by_alias=True, exclude_none=True),
+            ),
+            patch.model_dump(by_alias=True, exclude_none=True, mode="json"),
         )
         if response.status_code not in {200, 204}:
             raise RuntimeError("participant delay extension PATCH failed")

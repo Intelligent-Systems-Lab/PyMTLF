@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from urllib.parse import unquote, urlsplit
 from uuid import UUID, uuid4
 
 from py_mtlf.config import FLServerSettings
@@ -563,6 +564,7 @@ class FLRootCoordinator:
                             group,
                             descriptor.event,
                             descriptor.model_interoperability,
+                            record.initiation.plan_id,
                         ),
                     )
                 )
@@ -647,7 +649,9 @@ class FLRootCoordinator:
         self._validate_preparation_collection(record, process, collection)
         for group, intent, target in resolved_branches:
             outcome = self._preparation_outcome(collection, target.participant_nf_instance_id)
-            while not self._apply_group_preparation(group, intent, outcome):
+            while not self._apply_group_preparation(
+                group, intent, outcome, record.initiation.plan_id
+            ):
                 if outcome.resource_location:
                     self._server.remove_protocol_participant(
                         process.process_id,
@@ -657,6 +661,7 @@ class FLRootCoordinator:
                     group,
                     descriptor.event,
                     descriptor.model_interoperability,
+                    record.initiation.plan_id,
                 )
                 self._server.add_protocol_preparation_targets(
                     process_id=process.process_id,
@@ -678,6 +683,7 @@ class FLRootCoordinator:
             self._refresh_admission_locked(record)
             record.state = RootRequestState.ADMITTED
             self._condition.notify_all()
+        self._record_accepted_topology(record)
 
         source = base
         aggregate = None
@@ -796,16 +802,26 @@ class FLRootCoordinator:
             completed_after_attempt = record.completed_rounds + int(outcome.accepted)
             for failed_branch_id in outcome.failed_participant_nf_instance_ids:
                 if self._experiment_recorder is not None:
-                    self._experiment_recorder.record_branch_failure_detected(
+                    failed_group = next(
+                        group
+                        for group in record.branch_groups
+                        if group.active_branch_nf_instance_id == failed_branch_id
+                    )
+                    self._experiment_recorder.record_decision(
                         ml_correlation_id=record.initiation.plan_id,
-                        round_indicator=round_indicator,
-                        failed_branch_nf_instance_id=failed_branch_id,
+                        record_type="EDGE_UNAVAILABLE",
+                        roundInd=round_indicator,
+                        childNfInstanceId=failed_branch_id,
+                        subscriptionId=unquote(
+                            urlsplit(failed_group.upper_resource_location).path.rsplit("/", 1)[-1]
+                        ),
                         recorded_at=outcome_recorded_at,
                     )
                 self._retire_failed_branch(
                     record=record,
                     process=process,
                     descriptor=descriptor,
+                    topology=topology,
                     failed_branch_nf_instance_id=failed_branch_id,
                     replace=(completed_after_attempt < self._server_settings.round_count),
                 )
@@ -941,6 +957,7 @@ class FLRootCoordinator:
         group: _RootBranchGroup,
         ml_event: str,
         model_interoperability: str,
+        ml_correlation_id: str,
     ) -> tuple[object, ProtocolPreparationTarget]:
         while True:
             intents = group.candidate_pool.next_establishment_intents(1)
@@ -950,6 +967,15 @@ class FLRootCoordinator:
                     "Branch candidate pool is exhausted",
                 )
             intent = intents[0]
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.record_decision(
+                    ml_correlation_id=ml_correlation_id,
+                    record_type="CANDIDATE_SELECTION",
+                    candidateNfInstanceIds=[
+                        item.nf_instance_id for item in group.candidate_pool.records()
+                    ],
+                    selectedNfInstanceIds=[intent.nf_instance_id],
+                )
             try:
                 resolved = self._resolver.resolve(
                     nf_instance_id=intent.nf_instance_id,
@@ -1013,6 +1039,7 @@ class FLRootCoordinator:
         group: _RootBranchGroup,
         intent,
         outcome: HierarchyParticipantPreparationOutcome,
+        ml_correlation_id: str,
     ) -> bool:
         if outcome.participant_nf_instance_id != intent.nf_instance_id:
             raise RootPreparationError(
@@ -1048,6 +1075,13 @@ class FLRootCoordinator:
             group.state = RootBranchGroupState.ACTIVE
             group.replacement_error = None
             self._condition.notify_all()
+        if self._experiment_recorder is not None:
+            self._experiment_recorder.record_decision(
+                ml_correlation_id=ml_correlation_id,
+                record_type="EDGE_CONFIRMED",
+                childNfInstanceId=intent.nf_instance_id,
+                subscriptionId=unquote(urlsplit(outcome.resource_location).path.rsplit("/", 1)[-1]),
+            )
         return True
 
     @staticmethod
@@ -1062,13 +1096,10 @@ class FLRootCoordinator:
                 "Branch topology report identity does not match",
             )
         active_children = _active_report_children(report)
-        configured = {
-            leaf.nf_instance_id for leaf in group.assignment.leaves if leaf.enabled
-        }
-        if (
-            not group.assignment.policy.allow_additional_candidates
-            and not set(active_children).issubset(configured)
-        ):
+        configured = {leaf.nf_instance_id for leaf in group.assignment.leaves if leaf.enabled}
+        if not group.assignment.policy.allow_additional_candidates and not set(
+            active_children
+        ).issubset(configured):
             raise RootPreparationError(
                 RootFailureCause.RESULT_VALIDATION_FAILED,
                 "Branch topology report contains an unassigned active child",
@@ -1131,6 +1162,7 @@ class FLRootCoordinator:
         record: _RootRequestRecord,
         process: FLProcess,
         descriptor,
+        topology,
         failed_branch_nf_instance_id: str,
         replace: bool,
     ) -> None:
@@ -1169,6 +1201,17 @@ class FLRootCoordinator:
             )
             self._refresh_admission_locked(record)
             self._condition.notify_all()
+        if self._experiment_recorder is not None:
+            active_count = len(self._active_branch_groups(record))
+            self._experiment_recorder.record_decision(
+                ml_correlation_id=record.initiation.plan_id,
+                record_type="TOPOLOGY_ACCEPTANCE",
+                accepted=(
+                    active_count >= topology.policy.minimum_available_nodes
+                    and active_count >= topology.policy.minimum_train_nodes
+                ),
+                realizedTopology=self._realized_topology(record),
+            )
         if not replace:
             return
         logger.info(
@@ -1215,6 +1258,7 @@ class FLRootCoordinator:
                         group,
                         ml_event,
                         model_interoperability,
+                        record.initiation.plan_id,
                     )
                 except RootPreparationError as error:
                     if error.cause is RootFailureCause.PREPARATION_FAILED:
@@ -1223,6 +1267,16 @@ class FLRootCoordinator:
                             self._condition.notify_all()
                         return
                     raise
+                if self._experiment_recorder is not None:
+                    self._experiment_recorder.record_decision(
+                        ml_correlation_id=record.initiation.plan_id,
+                        record_type="REPAIR_SELECTION",
+                        childNfInstanceId=failed_branch_nf_instance_id,
+                        candidateNfInstanceIds=[
+                            item.nf_instance_id for item in group.candidate_pool.records()
+                        ],
+                        selectedNfInstanceIds=[intent.nf_instance_id],
+                    )
                 outcome = self._server.prepare_protocol_replacement_target(
                     process_id=process_id,
                     ml_event=ml_event,
@@ -1241,12 +1295,11 @@ class FLRootCoordinator:
                             )
                         except (KeyError, RuntimeError):
                             logger.info(
-                                "Replacement resource was already removed during Root reset "
-                                "nf=%s",
+                                "Replacement resource was already removed during Root reset nf=%s",
                                 outcome.participant_nf_instance_id,
                             )
                     raise
-                if self._apply_group_preparation(group, intent, outcome):
+                if self._apply_group_preparation(group, intent, outcome, record.initiation.plan_id):
                     with self._condition:
                         self._refresh_admission_locked(record)
                         self._condition.notify_all()
@@ -1256,15 +1309,7 @@ class FLRootCoordinator:
                         outcome.participant_nf_instance_id,
                     )
                     if self._experiment_recorder is not None:
-                        self._experiment_recorder.record_branch_replacement_ready(
-                            ml_correlation_id=record.initiation.plan_id,
-                            failed_branch_nf_instance_id=(
-                                failed_branch_nf_instance_id
-                            ),
-                            replacement_branch_nf_instance_id=(
-                                outcome.participant_nf_instance_id
-                            ),
-                        )
+                        self._record_accepted_topology(record)
                     return
                 if outcome.resource_location:
                     self._server.remove_protocol_participant(
@@ -1293,6 +1338,28 @@ class FLRootCoordinator:
                 and group.active_report is not None
             ),
         )
+
+    def _record_accepted_topology(self, record: _RootRequestRecord) -> None:
+        if self._experiment_recorder is None:
+            return
+        self._experiment_recorder.record_decision(
+            ml_correlation_id=record.initiation.plan_id,
+            record_type="TOPOLOGY_ACCEPTANCE",
+            accepted=True,
+            realizedTopology=self._realized_topology(record),
+        )
+
+    def _realized_topology(self, record: _RootRequestRecord) -> dict[str, object]:
+        with self._condition:
+            children = [
+                _realized_report(group.active_report)
+                for group in record.branch_groups
+                if group.state is RootBranchGroupState.ACTIVE and group.active_report is not None
+            ]
+        return {
+            "nfInstanceId": self._nwdaf_context.get().nf_instance_id,
+            "children": children,
+        }
 
     def _validate_preparation_collection(
         self,
@@ -1439,9 +1506,7 @@ class FLRootCoordinator:
             record.candidate_url = ""
         if record.terminal_deadline is None:
             record.terminal_at = self._clock()
-            record.terminal_deadline = (
-                record.terminal_at + self._terminal_status_ttl_seconds
-            )
+            record.terminal_deadline = record.terminal_at + self._terminal_status_ttl_seconds
 
     def _prune_terminal_records_locked(self) -> None:
         now = self._clock()
@@ -1528,6 +1593,23 @@ def _active_report_children(report: FlTopologyReport | None) -> tuple[str, ...]:
             if child.status == "ACTIVE"
         )
     )
+
+
+def _realized_report(report: FlTopologyReport) -> dict[str, object]:
+    def confirmed_children(nodes) -> list[dict[str, object]]:
+        return [
+            {
+                "nfInstanceId": node.nf_instance_id,
+                "children": confirmed_children(node.children or ()),
+            }
+            for node in nodes
+            if node.status == "ACTIVE"
+        ]
+
+    return {
+        "nfInstanceId": report.nf_instance_id,
+        "children": confirmed_children(report.children or ()),
+    }
 
 
 def _active_report_descendants(report: FlTopologyReport | None) -> tuple[str, ...]:

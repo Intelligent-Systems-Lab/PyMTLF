@@ -268,6 +268,7 @@ def create_app(
             publication=publication,
             provision_notifications=provision_notifications,
             experiments=fl_experiments,
+            experiment_recorder=experiment_recorder,
         )
         if fl_server_settings is not None and fl_client_resolver is not None
         else None

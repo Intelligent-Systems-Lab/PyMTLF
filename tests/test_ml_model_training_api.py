@@ -1,3 +1,4 @@
+import json
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -113,6 +114,65 @@ def test_training_create_requires_go_resource_id_and_does_not_replace_existing(
         )
         assert duplicate.status_code == 403
         assert client.app.state.fl_client.get(resource_id).subscription_id == resource_id
+
+
+def test_receiving_create_records_actual_subscription_and_rejection(settings, tmp_path):
+    configured = candidate_settings(settings, tmp_path)
+    values = configured.model_dump(mode="python")
+    values["federated_learning"]["experiment_recording"] = {"directory": tmp_path / "records"}
+    configured = Settings.model_validate(values)
+    resource_id = str(uuid4())
+    procedure_id = str(uuid4())
+    payload = candidate_payload()
+    payload["mlCorreId"] = procedure_id
+
+    with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
+        first = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": resource_id},
+            json=payload,
+        )
+        assert first.status_code == 201
+        duplicate = client.post(
+            "/internal/v1/ml-model-training/subscriptions",
+            headers={"X-NWDAF-Subscription-Id": resource_id},
+            json=payload,
+        )
+        assert duplicate.status_code == 403
+        patch = client.patch(
+            first.headers["location"],
+            json={"x-flTopology": {"policy": {"minTrainNodes": 1}}},
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        assert patch.status_code == 403
+        delete = client.delete(first.headers["location"])
+        assert delete.status_code in {204, 403}
+
+    path = tmp_path / "records" / procedure_id / "observations.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    creates = [
+        record
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION"
+        and record["operation"] == "CREATE"
+        and record["direction"] == "RECEIVED"
+    ]
+    assert [record["outcome"] for record in creates] == ["SUCCESS", "REJECTED"]
+    assert creates[0]["subscriptionId"] == resource_id
+    assert "subscriptionId" not in creates[1]
+    assert creates[0]["message"]["x-flTopology"]["children"][0]["priority"] == 100
+    received_patch = next(
+        record
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION" and record["operation"] == "PATCH"
+    )
+    assert received_patch["subscriptionId"] == resource_id
+    assert received_patch["message"]["x-flTopology"] == {"policy": {"minTrainNodes": 1}}
+    assert any(
+        record["operation"] == "DELETE" and record["subscriptionId"] == resource_id
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION"
+    )
 
 
 def test_training_requirements_failure_identifies_invalid_parameters(

@@ -541,11 +541,17 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    assert [record["evaluationStage"] for record in records] == [
+    assert [
+        record["evaluationStage"]
+        for record in records
+        if record["recordType"] == "MODEL_EVALUATION"
+    ] == [
         "BRANCH_DOMAIN",
         "BRANCH_DOMAIN",
     ]
-    assert [record["roundInd"] for record in records] == [0, 1]
+    assert [
+        record["roundInd"] for record in records if record["recordType"] == "ROUND_AGGREGATION"
+    ] == [0, 1]
 
 
 def _lower_global(tmp_path, round_indicator: int, *, process_id="lower-process"):

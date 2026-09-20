@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.experiment_recording import ExperimentRecorder
@@ -185,6 +186,13 @@ class FLBranchPreparationCoordinator:
             if not intents:
                 raise RuntimeError("protocol Branch candidate pool did not reach readiness")
             intent = intents[0]
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.record_decision(
+                    ml_correlation_id=representation.ml_correlation_id,
+                    record_type="CANDIDATE_SELECTION",
+                    candidateNfInstanceIds=[item.nf_instance_id for item in pool.records()],
+                    selectedNfInstanceIds=[intent.nf_instance_id],
+                )
             target = self._protocol_target(intent, contract)
             if not process_id:
                 process = self._server.start_protocol_preparation(
@@ -228,6 +236,15 @@ class FLBranchPreparationCoordinator:
                 raise RuntimeError("protocol Branch candidate completion became stale")
             if report is not None and not failure:
                 pool.attach_child_report(intent.nf_instance_id, report)
+                if self._experiment_recorder is not None:
+                    self._experiment_recorder.record_decision(
+                        ml_correlation_id=representation.ml_correlation_id,
+                        record_type="EDGE_CONFIRMED",
+                        childNfInstanceId=intent.nf_instance_id,
+                        subscriptionId=unquote(
+                            urlsplit(outcome.resource_location).path.rsplit("/", 1)[-1]
+                        ),
+                    )
             established = True
         if not pool.ready():
             raise RuntimeError("protocol Branch candidate pool did not reach readiness")
@@ -375,6 +392,16 @@ class FLBranchPreparationCoordinator:
                 ),
                 timeout_seconds=per_round_timeout,
             )
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.record_decision(
+                    ml_correlation_id=ml_correlation_id,
+                    record_type="ROUND_AGGREGATION",
+                    roundInd=current_lower_round,
+                    accepted=outcome.accepted,
+                    selectedNfInstanceIds=list(outcome.selected_participant_nf_instance_ids),
+                    successfulNfInstanceIds=list(outcome.successful_participant_nf_instance_ids),
+                    failedNfInstanceIds=list(outcome.failed_participant_nf_instance_ids),
+                )
             if not outcome.accepted or outcome.aggregate is None:
                 raise RuntimeError("protocol Branch lower round did not reach completion policy")
             lower_global = outcome.aggregate
@@ -424,9 +451,7 @@ class FLBranchPreparationCoordinator:
     def cancel(self, plan_id: str, reason: str) -> None:
         with self._condition:
             self._prune_cancelled_locked()
-            self._cancelled_plan_ids[plan_id] = (
-                self._clock() + self._tombstone_ttl_seconds
-            )
+            self._cancelled_plan_ids[plan_id] = self._clock() + self._tombstone_ttl_seconds
             protocol_execution = self._protocol_executions.pop(plan_id, None)
             self._next_lower_round.pop(plan_id, None)
             self._condition.notify_all()

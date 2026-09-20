@@ -1609,9 +1609,18 @@ class FLClientEngine:
         payload: dict,
         success_state: FLClientState,
     ) -> None:
+        started_at = datetime.now(UTC)
+        with self._lock:
+            recorded_resource = self._resources.get(subscription_id)
+        ml_correlation_id = (
+            recorded_resource.representation.ml_correlation_id
+            if recorded_resource is not None
+            else None
+        )
         last_error = ""
         attempt = 0
         terminal = False
+        outcome = "FAILED"
         while not self._closing.is_set():
             with self._lock:
                 current = self._resources.get(subscription_id)
@@ -1621,6 +1630,7 @@ class FLClientEngine:
             try:
                 response = self._client.post(notification_uri, json=payload)
                 if response.status_code == 204:
+                    outcome = "SUCCESS"
                     superseded = ()
                     with self._lock:
                         current = self._resources.get(subscription_id)
@@ -1637,6 +1647,7 @@ class FLClientEngine:
                     break
                 last_error = f"callback returned {response.status_code}"
                 if 400 <= response.status_code < 500:
+                    outcome = "REJECTED"
                     with self._lock:
                         current = self._resources.get(subscription_id)
                         if current is not None and current.revision == revision:
@@ -1674,6 +1685,17 @@ class FLClientEngine:
                 current.callback_slot_owned = False
         if terminal and not abandoned:
             self._outbox_capacity.release()
+        if self._experiment_recorder is not None and ml_correlation_id:
+            self._experiment_recorder.record_training_operation(
+                ml_correlation_id=ml_correlation_id,
+                operation="NOTIFY",
+                direction="SENT",
+                started_at=started_at,
+                outcome=outcome,
+                subscription_id=subscription_id,
+                message=payload,
+                cause=(last_error or "DELIVERY_INTERRUPTED") if outcome != "SUCCESS" else None,
+            )
 
     def _supersede_prepared_leaf_resource(
         self,
@@ -1763,6 +1785,7 @@ class FLClientEngine:
             exclude_none=True,
             mode="json",
         )
+        started_at = datetime.now(UTC)
         last_error = ""
         for attempt in range(self._notification_settings.max_attempts):
             with self._lock:
@@ -1779,12 +1802,20 @@ class FLClientEngine:
                     json=payload,
                 )
                 if response.status_code == 204:
+                    self._record_sent_notification(resource, payload, started_at, "SUCCESS")
                     logger.info(
                         "Delivered superseded FL Client termination subscription_id=%s",
                         resource.subscription_id,
                     )
                     return
                 last_error = f"termination delivery returned {response.status_code}"
+                self._record_sent_notification(
+                    resource,
+                    payload,
+                    started_at,
+                    "REJECTED" if response.status_code < 500 else "FAILED",
+                    last_error,
+                )
                 self._discard_terminal_resource(resource.subscription_id, resource.revision)
                 logger.info(
                     "Discarded superseded FL Client resource after explicit delivery "
@@ -1817,6 +1848,7 @@ class FLClientEngine:
             resource.subscription_id,
             last_error,
         )
+        self._record_sent_notification(resource, payload, started_at, "FAILED", last_error)
 
     def _discard_terminal_resource(self, subscription_id: str, revision: int) -> None:
         with self._lock:
@@ -1925,16 +1957,21 @@ class FLClientEngine:
         notification: NwdafMLModelTrainNotif,
     ) -> None:
         payload = notification.model_dump(by_alias=True, exclude_none=True, mode="json")
+        started_at = datetime.now(UTC)
         last_error = ""
+        last_status = None
         for attempt in range(self._notification_settings.max_attempts):
             try:
                 response = self._client.post(
                     str(resource.representation.notification_uri), json=payload
                 )
+                last_status = response.status_code
                 if response.status_code == 204:
+                    self._record_sent_notification(resource, payload, started_at, "SUCCESS")
                     return
                 last_error = f"delay callback returned {response.status_code}"
             except httpx.TransportError as error:
+                last_status = None
                 last_error = str(error)
             if attempt + 1 < self._notification_settings.max_attempts:
                 delay = min(
@@ -1947,6 +1984,33 @@ class FLClientEngine:
             current = self._resources.get(resource.subscription_id)
             if current is not None and current.revision == resource.revision:
                 current.last_error = f"delay callback delivery failed: {last_error}"
+        self._record_sent_notification(
+            resource,
+            payload,
+            started_at,
+            "REJECTED" if last_status is not None and last_status < 500 else "FAILED",
+            last_error,
+        )
+
+    def _record_sent_notification(
+        self,
+        resource: FLClientResource,
+        payload: dict,
+        started_at: datetime,
+        outcome: str,
+        cause: str | None = None,
+    ) -> None:
+        if self._experiment_recorder is not None and resource.representation.ml_correlation_id:
+            self._experiment_recorder.record_training_operation(
+                ml_correlation_id=resource.representation.ml_correlation_id,
+                operation="NOTIFY",
+                direction="SENT",
+                started_at=started_at,
+                outcome=outcome,
+                subscription_id=resource.subscription_id,
+                message=payload,
+                cause=cause,
+            )
 
     def _submit(self, function, *args) -> None:
         future = self._executor.submit(function, *args)

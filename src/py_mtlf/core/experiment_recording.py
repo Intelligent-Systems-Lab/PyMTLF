@@ -31,6 +31,32 @@ EvaluationStage = Literal[
 ]
 
 FINAL_MODEL_FILENAME = "final-model.tar.gz"
+_REQUEST_FIELDS = frozenset(
+    {
+        "notifCorreId",
+        "suppFeats",
+        "mLEventSubscs",
+        "mLModelTrainInfos",
+        "mLPreFlag",
+        "mLTrainRepInfo",
+        "roundInd",
+        "mLModelInfos",
+        "x-flTopology",
+        "skipFlInd",
+        "mLAccChkFlg",
+    }
+)
+_NOTIFICATION_FIELDS = frozenset(
+    {
+        "notifCorreId",
+        "roundInd",
+        "x-flTopologyReport",
+        "mLModelInfos",
+        "statusReport",
+        "termTrainReq",
+        "delayEventNotif",
+    }
+)
 
 
 class ExperimentRecorder:
@@ -120,7 +146,6 @@ class ExperimentRecorder:
         contract = validate_image_manifest(manifest)
         if contract.name != dataset.dataset or contract.name.value != validation.dataset:
             raise ValueError("validation dataset does not match model bundle dataset")
-        timestamp = _recorded_at(recorded_at)
         result = self._evaluator.evaluate_metrics(
             model,
             dataset,
@@ -128,15 +153,16 @@ class ExperimentRecorder:
             batch_size=validation.batch_size,
         )
         record: dict[str, object] = {
-            "recordedAt": timestamp,
+            "recordedAt": _recorded_at(recorded_at),
             "recordType": "MODEL_EVALUATION",
             "mlCorreId": normalize_plan_id(ml_correlation_id),
             "nfInstanceId": self._required_nf_instance_id(),
             "evaluationStage": evaluation_stage,
+            "dataSplit": "VALIDATION",
             "dataset": result.dataset.value,
             "sampleCount": result.sample_count,
-            "validationLoss": result.mean_cross_entropy_loss,
-            "validationAccuracy": result.accuracy,
+            "loss": result.mean_cross_entropy_loss,
+            "accuracy": result.accuracy,
         }
         if round_indicator is not None:
             record["roundInd"] = round_indicator
@@ -192,12 +218,10 @@ class ExperimentRecorder:
 
             self._append_base(
                 normalized_correlation_id,
-                "FINAL_MODEL_SAVED",
+                "MODEL_ARTIFACT_SAVED",
                 recorded_at,
                 roundInd=normalized_round_indicator,
                 artifactFile=FINAL_MODEL_FILENAME,
-                artifactDigest=artifact_digest,
-                sizeBytes=destination.stat().st_size,
             )
             return destination
 
@@ -214,7 +238,7 @@ class ExperimentRecorder:
     ) -> None:
         self._append_base(
             ml_correlation_id,
-            "ROOT_ROUND_OUTCOME",
+            "ROUND_AGGREGATION",
             recorded_at,
             roundInd=_round_indicator(round_indicator),
             accepted=accepted,
@@ -223,43 +247,55 @@ class ExperimentRecorder:
             failedNfInstanceIds=_nf_instance_ids(failed_nf_instance_ids),
         )
 
-    def record_branch_failure_detected(
+    def record_training_operation(
         self,
         *,
         ml_correlation_id: str,
-        round_indicator: int,
-        failed_branch_nf_instance_id: str,
+        operation: Literal["CREATE", "PUT", "PATCH", "DELETE", "NOTIFY"],
+        direction: Literal["SENT", "RECEIVED"],
+        started_at: datetime,
+        outcome: Literal["SUCCESS", "REJECTED", "FAILED"],
+        message: Mapping[str, object] | None = None,
+        subscription_id: str | None = None,
+        target_nf_instance_id: str | None = None,
+        source_nf_instance_id: str | None = None,
+        cause: str | None = None,
         recorded_at: datetime | None = None,
     ) -> None:
-        self._append_base(
-            ml_correlation_id,
-            "BRANCH_FAILURE_DETECTED",
-            recorded_at,
-            roundInd=_round_indicator(round_indicator),
-            failedBranchNfInstanceId=normalize_nf_instance_id(
-                failed_branch_nf_instance_id
-            ),
-        )
+        fields: dict[str, object] = {
+            "operation": operation,
+            "direction": direction,
+            "startedAt": _recorded_at(started_at),
+            "outcome": outcome,
+        }
+        if subscription_id:
+            fields["subscriptionId"] = subscription_id
+        if target_nf_instance_id:
+            fields["targetNfInstanceId"] = normalize_nf_instance_id(target_nf_instance_id)
+        if source_nf_instance_id:
+            fields["sourceNfInstanceId"] = normalize_nf_instance_id(source_nf_instance_id)
+        if cause:
+            fields["cause"] = cause
+        if message is not None and operation != "DELETE":
+            fields["message"] = _message_excerpt(message, operation)
+        self._append_base(ml_correlation_id, "MODEL_TRAINING_OPERATION", recorded_at, **fields)
 
-    def record_branch_replacement_ready(
+    def record_decision(
         self,
         *,
         ml_correlation_id: str,
-        failed_branch_nf_instance_id: str,
-        replacement_branch_nf_instance_id: str,
+        record_type: Literal[
+            "CANDIDATE_SELECTION",
+            "EDGE_CONFIRMED",
+            "EDGE_UNAVAILABLE",
+            "REPAIR_SELECTION",
+            "TOPOLOGY_ACCEPTANCE",
+            "ROUND_AGGREGATION",
+        ],
         recorded_at: datetime | None = None,
+        **fields: object,
     ) -> None:
-        self._append_base(
-            ml_correlation_id,
-            "BRANCH_REPLACEMENT_READY",
-            recorded_at,
-            failedBranchNfInstanceId=normalize_nf_instance_id(
-                failed_branch_nf_instance_id
-            ),
-            replacementBranchNfInstanceId=normalize_nf_instance_id(
-                replacement_branch_nf_instance_id
-            ),
-        )
+        self._append_base(ml_correlation_id, record_type, recorded_at, **fields)
 
     def _append_base(
         self,
@@ -328,3 +364,20 @@ def _round_indicator(value: int) -> int:
 
 def _nf_instance_ids(values: tuple[str, ...]) -> list[str]:
     return [normalize_nf_instance_id(value) for value in values]
+
+
+def _message_excerpt(message: Mapping[str, object], operation: str) -> dict[str, object]:
+    allowed = _NOTIFICATION_FIELDS if operation == "NOTIFY" else _REQUEST_FIELDS
+    excerpt = {key: value for key, value in message.items() if key in allowed}
+    infos = excerpt.get("mLModelInfos")
+    if isinstance(infos, list):
+        excerpt["mLModelInfos"] = [
+            {
+                key: value
+                for key, value in info.items()
+                if key in {"event", "modelUniqueId", "mLFileAddr", "mLModelAdrf"}
+            }
+            for info in infos
+            if isinstance(info, dict)
+        ]
+    return excerpt

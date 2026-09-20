@@ -12,12 +12,14 @@ import torch
 
 from py_mtlf.config import (
     DatasetSettings,
+    ExperimentRecordingSettings,
     FederatedLearningSettings,
     FLClientSettings,
     NotificationSettings,
 )
 from py_mtlf.core.artifacts import ArtifactMetadata
 from py_mtlf.core.dataset import DatasetCoordinator, DatasetJobState
+from py_mtlf.core.experiment_recording import ExperimentRecorder
 from py_mtlf.core.fl_client import (
     FLClientCapacityError,
     FLClientEngine,
@@ -2120,6 +2122,9 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         httpx.Response(503),
         httpx.Response(204),
     ]
+    procedure_id = str(uuid4())
+    recorder = ExperimentRecorder(ExperimentRecordingSettings(directory=tmp_path / "records"))
+    recorder.open("10000000-0000-4000-8000-000000000001")
     service = FLClientEngine(
         fl_settings(tmp_path),
         client_settings(),
@@ -2132,6 +2137,7 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         datasets,
         Mock(),
         client=client,
+        experiment_recorder=recorder,
     )
     service._loader = Mock()
     service._loader.load.return_value.manifest = {
@@ -2139,13 +2145,13 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         "model_interoperability": "001122",
     }
     try:
-        resource = service.create(
-            str(uuid4()), NwdafMLModelTrainSubsc.model_validate(preparation_payload())
-        )
+        subscription = preparation_payload()
+        subscription["mlCorreId"] = procedure_id
+        resource = service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(subscription))
         notification = NwdafMLModelTrainNotif.model_validate(
             {
                 "notifCorreId": "prep-client-a",
-                "mlCorreId": "fl-process-001",
+                "mlCorreId": procedure_id,
                 "mLModelInfos": [
                     {
                         "event": "UE_COMMUNICATION",
@@ -2169,6 +2175,24 @@ def test_callback_outbox_retries_the_same_notification_until_ack(tmp_path):
         )
     finally:
         service.close()
+        recorder.close()
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "records" / procedure_id / "observations.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    notifications = [
+        record
+        for record in records
+        if record["recordType"] == "MODEL_TRAINING_OPERATION"
+        and record["operation"] == "NOTIFY"
+        and record["direction"] == "SENT"
+    ]
+    assert len(notifications) == 1
+    assert notifications[0]["outcome"] == "SUCCESS"
+    assert notifications[0]["subscriptionId"] == resource.subscription_id
+    assert notifications[0]["message"]["notifCorreId"] == "prep-client-a"
 
 
 def test_duplicate_round_patch_is_idempotent_and_conflict_is_rejected(tmp_path):

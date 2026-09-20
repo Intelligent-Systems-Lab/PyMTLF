@@ -137,7 +137,8 @@ def hierarchy_topology(*groups: tuple[str, tuple[str, ...]]) -> str:
 
 
 def branch_replacement_topology(*, root_minimum: int = 2) -> str:
-    return f"""
+    return (
+        f"""
 admission:
   mode: complete_required
 policy: &root_policy
@@ -191,7 +192,9 @@ branch_groups:
       - nf_instance_id: {LEAF_D_ID}
         priority: 90
         report_after: {{count: 2, unit: epoch}}
-""".strip() + "\n"
+""".strip()
+        + "\n"
+    )
 
 
 def test_protocol_root_requires_round_model_distribution_owner():
@@ -505,12 +508,14 @@ def test_protocol_root_dispatches_two_explicit_branch_subtrees(tmp_path):
             BRANCH_ID,
             BRANCH_B_ID,
         )
-        assert tuple(
-            child.nf_instance_id for child in targets[0].topology.children
-        ) == (LEAF_A_ID, LEAF_B_ID)
-        assert tuple(
-            child.nf_instance_id for child in targets[1].topology.children
-        ) == (LEAF_C_ID, LEAF_D_ID)
+        assert tuple(child.nf_instance_id for child in targets[0].topology.children) == (
+            LEAF_A_ID,
+            LEAF_B_ID,
+        )
+        assert tuple(child.nf_instance_id for child in targets[1].topology.children) == (
+            LEAF_C_ID,
+            LEAF_D_ID,
+        )
     finally:
         coordinator.close()
 
@@ -549,9 +554,11 @@ def test_protocol_root_initial_discovery_uses_the_next_branch_candidate(tmp_path
         )
 
         assert waiting.state is RootRequestState.PREPARATION_WAITING
-        assert [
-            call.kwargs["nf_instance_id"] for call in resolver.resolve.call_args_list
-        ] == [BRANCH_ID, BRANCH_REPLACEMENT_ID, BRANCH_B_ID]
+        assert [call.kwargs["nf_instance_id"] for call in resolver.resolve.call_args_list] == [
+            BRANCH_ID,
+            BRANCH_REPLACEMENT_ID,
+            BRANCH_B_ID,
+        ]
         assert tuple(
             target.participant_nf_instance_id
             for target in server.start_protocol_preparation.call_args.kwargs["targets"]
@@ -672,9 +679,12 @@ def test_protocol_root_initial_preparation_failure_uses_next_branch_candidate(
     assert completed.state is RootRequestState.COMPLETE
     assert collection_count == 2
     assert server.add_protocol_preparation_targets.call_count == 1
-    assert server.add_protocol_preparation_targets.call_args.kwargs[
-        "targets"
-    ][0].participant_nf_instance_id == BRANCH_REPLACEMENT_ID
+    assert (
+        server.add_protocol_preparation_targets.call_args.kwargs["targets"][
+            0
+        ].participant_nf_instance_id
+        == BRANCH_REPLACEMENT_ID
+    )
     assert server.remove_protocol_participant.call_args_list[0].args[1] == BRANCH_ID
     assert resolver.resolve.call_args_list[-1].kwargs["nf_instance_id"] == (
         BRANCH_REPLACEMENT_ID
@@ -786,6 +796,7 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
         )
 
     server.collect_hierarchy_preparation.side_effect = collect_protocol
+
     def execute_round(**_kwargs):
         assert distribution.store.called
         return HierarchyRoundOutcome(
@@ -836,26 +847,28 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
     coordinator.close()
     recorder.close()
     records = recorded_observations(tmp_path, completed.plan_id)
-    assert [record["recordType"] for record in records] == [
+    assert [
+        record["recordType"]
+        for record in records
+        if record["recordType"] in {"MODEL_EVALUATION", "ROUND_AGGREGATION", "MODEL_ARTIFACT_SAVED"}
+    ] == [
         "MODEL_EVALUATION",
-        "ROOT_ROUND_OUTCOME",
+        "ROUND_AGGREGATION",
         "MODEL_EVALUATION",
-        "FINAL_MODEL_SAVED",
+        "MODEL_ARTIFACT_SAVED",
     ]
+    assert any(
+        record["recordType"] == "TOPOLOGY_ACCEPTANCE" and record["accepted"] for record in records
+    )
     assert [
         record.get("evaluationStage")
         for record in records
         if record["recordType"] == "MODEL_EVALUATION"
     ] == ["ROOT_INITIAL", "ROOT_GLOBAL"]
-    final_model = (
-        tmp_path
-        / "experiment-records"
-        / completed.plan_id
-        / "final-model.tar.gz"
-    )
+    final_model = tmp_path / "experiment-records" / completed.plan_id / "final-model.tar.gz"
     assert final_model.read_bytes() == aggregate_path.read_bytes()
     assert records[-1]["roundInd"] == 0
-    assert records[-1]["artifactDigest"] == aggregate.digest
+    assert records[-1]["artifactFile"] == "final-model.tar.gz"
     workspace.release_plan.assert_called_once_with(completed.plan_id)
 
 
@@ -1023,9 +1036,7 @@ def test_protocol_root_replaces_failed_branch_without_retained_result(tmp_path):
     assert server.execute_hierarchy_round.call_args_list[1].kwargs[
         "selected_participant_nf_instance_ids"
     ] == (BRANCH_REPLACEMENT_ID, BRANCH_B_ID)
-    assert resolver.resolve.call_args_list[-1].kwargs["nf_instance_id"] == (
-        BRANCH_REPLACEMENT_ID
-    )
+    assert resolver.resolve.call_args_list[-1].kwargs["nf_instance_id"] == (BRANCH_REPLACEMENT_ID)
     assert distribution.cleanup.call_count == 2
     coordinator.close()
 
@@ -1191,17 +1202,9 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
     coordinator.close()
     recorder.close()
     records = recorded_observations(tmp_path, completed.plan_id)
-    outcomes = [
-        record for record in records if record["recordType"] == "ROOT_ROUND_OUTCOME"
-    ]
-    globals_ = [
-        record
-        for record in records
-        if record.get("evaluationStage") == "ROOT_GLOBAL"
-    ]
-    final_models = [
-        record for record in records if record["recordType"] == "FINAL_MODEL_SAVED"
-    ]
+    outcomes = [record for record in records if record["recordType"] == "ROUND_AGGREGATION"]
+    globals_ = [record for record in records if record.get("evaluationStage") == "ROOT_GLOBAL"]
+    final_models = [record for record in records if record["recordType"] == "MODEL_ARTIFACT_SAVED"]
     assert [record["accepted"] for record in outcomes] == [False, True]
     assert [record["roundInd"] for record in globals_] == [1]
     assert [record["roundInd"] for record in final_models] == [1]
@@ -1405,25 +1408,38 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
         assert completed.state is RootRequestState.COMPLETE
         assert completed.completed_rounds == 3
         assert completed.branch_groups[0].state == "ACTIVE"
-        assert (
-            completed.branch_groups[0].active_branch_nf_instance_id
-            == BRANCH_REPLACEMENT_ID
-        )
+        assert completed.branch_groups[0].active_branch_nf_instance_id == BRANCH_REPLACEMENT_ID
         assert server.execute_hierarchy_round.call_args_list[2].kwargs[
             "selected_participant_nf_instance_ids"
         ] == (BRANCH_REPLACEMENT_ID, BRANCH_B_ID)
         records = recorded_observations(tmp_path, completed.plan_id)
-        assert len(
-            [record for record in records if record["recordType"] == "ROOT_ROUND_OUTCOME"]
-        ) == 3
+        assert (
+            len([record for record in records if record["recordType"] == "ROUND_AGGREGATION"]) == 3
+        )
         assert any(
-            record["recordType"] == "BRANCH_FAILURE_DETECTED"
-            and record["failedBranchNfInstanceId"] == BRANCH_ID
+            record["recordType"] == "EDGE_UNAVAILABLE"
+            and record["childNfInstanceId"] == BRANCH_ID
+            and "cause" not in record
             for record in records
         )
         assert any(
-            record["recordType"] == "BRANCH_REPLACEMENT_READY"
-            and record["replacementBranchNfInstanceId"] == BRANCH_REPLACEMENT_ID
+            record["recordType"] == "TOPOLOGY_ACCEPTANCE"
+            and record["accepted"]
+            and {child["nfInstanceId"] for child in record["realizedTopology"]["children"]}
+            == {BRANCH_REPLACEMENT_ID, BRANCH_B_ID}
+            for record in records
+        )
+        confirmed_children = [
+            record["childNfInstanceId"]
+            for record in records
+            if record["recordType"] == "EDGE_CONFIRMED"
+        ]
+        assert confirmed_children.count(BRANCH_B_ID) == 1
+        assert confirmed_children.count(BRANCH_REPLACEMENT_ID) == 1
+        assert any(
+            record["recordType"] == "REPAIR_SELECTION"
+            and record["childNfInstanceId"] == BRANCH_ID
+            and record["selectedNfInstanceIds"] == [BRANCH_REPLACEMENT_ID]
             for record in records
         )
     finally:
@@ -1756,8 +1772,8 @@ def test_protocol_root_generation_reset_cleans_replacement_created_in_flight(
 
 
 def test_go_generation_reset_discards_root_status_and_releases_slot(tmp_path):
-    coordinator, _resolver, _artifacts, _workspace, server, registry, *_ = (
-        root_coordinator(tmp_path)
+    coordinator, _resolver, _artifacts, _workspace, server, registry, *_ = root_coordinator(
+        tmp_path
     )
     coordinator.submit_manual(
         request_id=REQUEST_A_ID,
