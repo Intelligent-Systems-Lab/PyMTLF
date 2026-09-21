@@ -110,7 +110,7 @@ def candidate_preparation_payload() -> dict:
     payload = preparation_payload()
     payload.pop("mLModelInfos")
     payload["suppFeats"] = "4"
-    payload["x-flTopology"] = {
+    payload["flTopology"] = {
         "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "children": [
             {
@@ -137,7 +137,7 @@ def protocol_leaf_preparation_payload() -> dict:
             "modelInterInfo": "pymtlf-image-classification-mnist",
         }
     ]
-    payload["x-flTopology"] = {
+    payload["flTopology"] = {
         "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "strategy": {
             "method": "fedProx",
@@ -151,7 +151,7 @@ def protocol_leaf_preparation_payload() -> dict:
 
 def protocol_branch_preparation_payload() -> dict:
     payload = protocol_leaf_preparation_payload()
-    payload["x-flTopology"] = {
+    payload["flTopology"] = {
         "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "policy": {
             "allowAdditionalCandidates": False,
@@ -345,14 +345,14 @@ def test_candidate_create_rejects_retained_instruction_before_resource_creation(
     )
     try:
         payload = candidate_preparation_payload()
-        payload["x-retainedResultReq"] = True
-        payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
+        payload["retainedResultReq"] = True
+        payload["flTopology"]["children"][0]["retainedResultReq"] = True
         with pytest.raises(RequirementsError) as captured:
             service.create(str(uuid4()), NwdafMLModelTrainSubsc.model_validate(payload))
 
         assert [item.parameter for item in captured.value.violations] == [
-            "x-retainedResultReq",
-            "x-flTopology",
+            "retainedResultReq",
+            "flTopology",
         ]
         assert service._resources == {}
         assert service._capacity.acquire(blocking=False)
@@ -425,7 +425,7 @@ def test_protocol_leaf_preparation_reports_ready_without_model_or_dataset_read(t
             {
                 "mlCorreId": "99999999-9999-4999-8999-999999999999",
                 "notifCorreId": "prep-client-a",
-                "x-flTopologyReport": {
+                "flTopologyReport": {
                     "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                     "strategy": {
                         "method": "fedProx",
@@ -909,11 +909,11 @@ def test_protocol_topology_patch_reconfigures_branch_without_training_or_model_r
                 break
             time.sleep(0.01)
 
-        topology = protocol_branch_preparation_payload()["x-flTopology"]
+        topology = protocol_branch_preparation_payload()["flTopology"]
         topology["children"][0]["enabled"] = False
         updated = service.patch(
             created.subscription_id,
-            NwdafMLModelTrainSubscPatch.model_validate({"x-flTopology": topology}),
+            NwdafMLModelTrainSubscPatch.model_validate({"flTopology": topology}),
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -955,7 +955,7 @@ def test_candidate_create_validates_containing_nwdaf_identity(tmp_path):
             service.create(
                 str(uuid4()), NwdafMLModelTrainSubsc.model_validate(candidate_preparation_payload())
             )
-        assert captured.value.violations[0].parameter == "x-flTopology.nfInstanceId"
+        assert captured.value.violations[0].parameter == "flTopology.nfInstanceId"
     finally:
         service.close()
 
@@ -1003,7 +1003,7 @@ def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutat
             service.patch(
                 created.subscription_id,
                 NwdafMLModelTrainSubscPatch.model_validate(
-                    {"x-flTopology": {"policy": {"minTrainNodes": 1}}}
+                    {"flTopology": {"policy": {"minTrainNodes": 1}}}
                 ),
             )
         assert captured.value.violations[0].parameter == "suppFeats"
@@ -1012,7 +1012,7 @@ def test_candidate_resource_preserves_standard_patch_and_rejects_candidate_mutat
         assert after_rejected_patch.representation == before_rejected_patch.representation
 
         replacement_payload = candidate_preparation_payload()
-        replacement_payload["x-flTopology"]["children"][0]["priority"] = 80
+        replacement_payload["flTopology"]["children"][0]["priority"] = 80
         with pytest.raises(RequirementsError):
             service.replace(
                 created.subscription_id,

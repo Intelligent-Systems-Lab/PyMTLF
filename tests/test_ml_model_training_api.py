@@ -33,7 +33,7 @@ def candidate_payload() -> dict:
                 "timeAvReq": "PT5M",
             }
         ],
-        "x-flTopology": {
+        "flTopology": {
             "nfInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "children": [
                 {
@@ -141,7 +141,7 @@ def test_receiving_create_records_actual_subscription_and_rejection(settings, tm
         assert duplicate.status_code == 403
         patch = client.patch(
             first.headers["location"],
-            json={"x-flTopology": {"policy": {"minTrainNodes": 1}}},
+            json={"flTopology": {"policy": {"minTrainNodes": 1}}},
             headers={"Content-Type": "application/merge-patch+json"},
         )
         assert patch.status_code == 403
@@ -160,14 +160,14 @@ def test_receiving_create_records_actual_subscription_and_rejection(settings, tm
     assert [record["outcome"] for record in creates] == ["SUCCESS", "REJECTED"]
     assert creates[0]["subscriptionId"] == resource_id
     assert "subscriptionId" not in creates[1]
-    assert creates[0]["message"]["x-flTopology"]["children"][0]["priority"] == 100
+    assert creates[0]["message"]["flTopology"]["children"][0]["priority"] == 100
     received_patch = next(
         record
         for record in records
         if record["recordType"] == "MODEL_TRAINING_OPERATION" and record["operation"] == "PATCH"
     )
     assert received_patch["subscriptionId"] == resource_id
-    assert received_patch["message"]["x-flTopology"] == {"policy": {"minTrainNodes": 1}}
+    assert received_patch["message"]["flTopology"] == {"policy": {"minTrainNodes": 1}}
     assert any(
         record["operation"] == "DELETE" and record["subscriptionId"] == resource_id
         for record in records
@@ -303,16 +303,16 @@ def test_candidate_create_returns_lossless_persistent_contract_without_feature(
         assert "/subscriptions/" in response.headers["location"]
         representation = response.json()
         assert representation["suppFeats"] == ""
-        assert representation["x-flTopology"]["nfInstanceId"].startswith("aaaaaaaa")
-        assert "x-retainedResultReq" not in representation
-        assert "retainedResultReq" not in representation["x-flTopology"]["children"][0]
+        assert representation["flTopology"]["nfInstanceId"].startswith("aaaaaaaa")
+        assert "retainedResultReq" not in representation
+        assert "retainedResultReq" not in representation["flTopology"]["children"][0]
 
 
 def test_candidate_retained_result_instruction_is_rejected_atomically(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
     payload = candidate_payload()
-    payload["x-retainedResultReq"] = True
-    payload["x-flTopology"]["children"][0]["retainedResultReq"] = True
+    payload["retainedResultReq"] = True
+    payload["flTopology"]["children"][0]["retainedResultReq"] = True
     with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         rejected = client.post(
             "/internal/v1/ml-model-training/subscriptions",
@@ -333,7 +333,7 @@ def test_candidate_retained_result_instruction_is_rejected_atomically(settings, 
 def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
     payload = candidate_payload()
-    payload["x-flTopology"]["strategy"] = {
+    payload["flTopology"]["strategy"] = {
         "method": "fedProx",
         "aggregation": "sampleWeighted",
         "methodParameters": {"proximalMu": 0.01, "unknown": True},
@@ -349,7 +349,7 @@ def test_candidate_nested_validation_reports_alias_path(settings, tmp_path):
     assert response.json()["cause"] == "INVALID_MSG_FORMAT"
     assert response.json()["invalidParams"] == [
         {
-            "param": "x-flTopology.strategy.methodParameters.unknown",
+            "param": "flTopology.strategy.methodParameters.unknown",
             "reason": "Extra inputs are not permitted",
         }
     ]
@@ -365,7 +365,7 @@ def test_candidate_patch_is_rejected_when_feature_was_not_negotiated(settings, t
         )
         response = client.patch(
             created.headers["location"],
-            json={"x-flTopology": {"policy": {"minTrainNodes": 1}}},
+            json={"flTopology": {"policy": {"minTrainNodes": 1}}},
             headers={"Content-Type": "application/merge-patch+json"},
         )
 
@@ -389,7 +389,7 @@ def test_candidate_put_is_rejected_when_feature_was_not_negotiated(settings, tmp
             json=candidate_payload(),
         )
         replacement = candidate_payload()
-        replacement["x-flTopology"]["children"][0]["priority"] = 80
+        replacement["flTopology"]["children"][0]["priority"] = 80
         response = client.put(created.headers["location"], json=replacement)
 
     assert created.status_code == 201
@@ -401,7 +401,7 @@ def test_candidate_put_is_rejected_when_feature_was_not_negotiated(settings, tmp
 def test_candidate_receiver_mismatch_is_structured_bad_request(settings, tmp_path):
     configured = candidate_settings(settings, tmp_path)
     payload = candidate_payload()
-    payload["x-flTopology"]["nfInstanceId"] = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    payload["flTopology"]["nfInstanceId"] = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     with TestClient(create_app(configured, nwdaf_context_client=candidate_context())) as client:
         response = client.post(
             "/internal/v1/ml-model-training/subscriptions",
@@ -413,7 +413,7 @@ def test_candidate_receiver_mismatch_is_structured_bad_request(settings, tmp_pat
     assert response.json()["cause"] == "INVALID_MSG_FORMAT"
     assert response.json()["invalidParams"] == [
         {
-            "param": "x-flTopology.nfInstanceId",
+            "param": "flTopology.nfInstanceId",
             "reason": "must identify the request receiver",
         }
     ]

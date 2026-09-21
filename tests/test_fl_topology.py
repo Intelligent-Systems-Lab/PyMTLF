@@ -29,8 +29,7 @@ def test_static_topology_planner_canonicalizes_and_freezes_snapshot(tmp_path):
     write_topology(
         path,
         f"""
-admission:
-  mode: complete_required
+on_branch_failure: replace_branch
 policy:
   allow_additional_candidates: false
   additional_candidate_priority: 0
@@ -118,7 +117,19 @@ branch_groups:
     assert assignment.branch_groups[0].leaves[0].report_after.count == 5
     assert assignment.branch_groups[1].branches[1].enabled is False
     assert assignment.branch_groups[1].strategy.method_parameters.proximal_mu == 0.02
-    assert assignment.admission_mode == "complete_required"
+    assert assignment.on_branch_failure == "replace_branch"
+
+    valid_body = path.read_text(encoding="utf-8")
+    for replacement in ("", "on_branch_failure: ignore_failure"):
+        write_topology(
+            path,
+            valid_body.replace("on_branch_failure: replace_branch", replacement),
+        )
+        with pytest.raises(ValidationError):
+            StaticTopologyPlanner.load(path)
+    write_topology(path, valid_body + "\nadmission: {mode: complete_required}")
+    with pytest.raises(ValidationError):
+        StaticTopologyPlanner.load(path)
 
     write_topology(path, "unexpected: true")
     assert planner.build(root_nf_instance_id=ROOT_ID) == assignment
@@ -131,7 +142,7 @@ branch_groups:
         "admission: {mode: partial_allowed}",
         "admission: {mode: complete_required}\nbranch_groups: []",
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: priority, min_available_nodes: 1, fraction_train: 1.0,
@@ -148,7 +159,7 @@ branch_groups:
       - {{nf_instance_id: {LEAF_A_ID}, report_after: {{count: 1, unit: epoch}}}}
 """,
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: priority, min_available_nodes: 1, fraction_train: 1.0,
@@ -165,7 +176,7 @@ branch_groups:
       - {{nf_instance_id: {LEAF_A_ID}, report_after: {{count: 1, unit: round}}}}
 """,
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: priority, min_available_nodes: 1, fraction_train: 1.0,
@@ -202,7 +213,7 @@ def test_priority_selection_requires_explicit_enabled_candidate_priority(
     write_topology(
         path,
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: priority, min_available_nodes: 1, fraction_train: 1.0,
@@ -229,7 +240,7 @@ def test_random_selection_allows_omitted_candidate_priority(tmp_path):
     write_topology(
         path,
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: random, min_available_nodes: 1, fraction_train: 1.0,
@@ -258,7 +269,7 @@ def test_static_topology_rejects_containing_root_collision(tmp_path):
     write_topology(
         path,
         f"""
-admission: {{mode: complete_required}}
+on_branch_failure: replace_branch
 policy: &policy
   {{allow_additional_candidates: false, additional_candidate_priority: 0,
    selection_method: priority, min_available_nodes: 1, fraction_train: 1.0,

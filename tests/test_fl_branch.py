@@ -58,7 +58,7 @@ def _protocol_representation() -> NwdafMLModelTrainSubsc:
             "mlCorreId": PLAN,
             "mLPreFlag": True,
             "suppFeats": "4",
-            "x-flTopology": {
+            "flTopology": {
                 "nfInstanceId": BRANCH,
                 "policy": {
                     "allowAdditionalCandidates": False,
@@ -131,7 +131,7 @@ def _protocol_collection(
                     notifCorreId=f"callback-{leaf_id}",
                     mlCorreId=PLAN,
                     **{
-                        "x-flTopologyReport": FlTopologyReport(
+                        "flTopologyReport": FlTopologyReport(
                             nfInstanceId=leaf_id
                         )
                     },
@@ -195,7 +195,7 @@ def test_protocol_branch_establishes_children_and_composes_topology_report():
                 notification=NwdafMLModelTrainNotif(
                     notifCorreId=f"callback-{leaf_id}",
                     mlCorreId=PLAN,
-                    **{"x-flTopologyReport": reports[leaf_id]},
+                    **{"flTopologyReport": reports[leaf_id]},
                 ),
                 failure="",
                 delay_extensions=0,
@@ -276,7 +276,7 @@ def test_protocol_branch_combines_explicit_and_discovered_candidates_until_ready
             ]
         }
     }
-    topology = payload["x-flTopology"]
+    topology = payload["flTopology"]
     topology["policy"].update(
         {
             "allowAdditionalCandidates": True,
@@ -348,9 +348,9 @@ def test_protocol_branch_patch_deletes_disabled_child_and_keeps_existing_process
         exclude_none=True,
         mode="json",
     )
-    payload["x-flTopology"]["policy"]["minAvailableNodes"] = 1
-    payload["x-flTopology"]["policy"]["minTrainNodes"] = 1
-    payload["x-flTopology"]["children"][0]["enabled"] = False
+    payload["flTopology"]["policy"]["minAvailableNodes"] = 1
+    payload["flTopology"]["policy"]["minTrainNodes"] = 1
+    payload["flTopology"]["children"][0]["enabled"] = False
 
     report = coordinator.prepare_protocol(
         representation=NwdafMLModelTrainSubsc.model_validate(payload),
@@ -382,7 +382,7 @@ def test_protocol_branch_reuses_adrf_then_uses_local_round_input(tmp_path):
                     notifCorreId=f"callback-{leaf_id}",
                     mlCorreId=PLAN,
                     **{
-                        "x-flTopologyReport": FlTopologyReport(
+                        "flTopologyReport": FlTopologyReport(
                             nfInstanceId=leaf_id
                         )
                     },

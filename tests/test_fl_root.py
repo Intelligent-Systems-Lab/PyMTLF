@@ -85,8 +85,7 @@ def recorded_observations(tmp_path: Path, plan_id: str) -> list[dict]:
 
 def hierarchy_topology(*groups: tuple[str, tuple[str, ...]]) -> str:
     lines = [
-        "admission:",
-        "  mode: complete_required",
+        "on_branch_failure: replace_branch",
         "policy:",
         "  allow_additional_candidates: false",
         "  additional_candidate_priority: 0",
@@ -139,8 +138,7 @@ def hierarchy_topology(*groups: tuple[str, tuple[str, ...]]) -> str:
 def branch_replacement_topology(*, root_minimum: int = 2) -> str:
     return (
         f"""
-admission:
-  mode: complete_required
+on_branch_failure: replace_branch
 policy: &root_policy
   allow_additional_candidates: false
   additional_candidate_priority: 0
@@ -364,7 +362,7 @@ def branch_preparation_outcome(
             notifCorreId=callback_id,
             mlCorreId=plan_id,
             **{
-                "x-flTopologyReport": FlTopologyReport.model_validate(
+                "flTopologyReport": FlTopologyReport.model_validate(
                     {
                         "nfInstanceId": branch_id,
                         "children": [
@@ -768,7 +766,7 @@ def test_protocol_root_stores_before_round_dispatch_and_cleans_record(tmp_path):
                             "ml_correlation_id"
                         ],
                         **{
-                            "x-flTopologyReport": FlTopologyReport.model_validate(
+                            "flTopologyReport": FlTopologyReport.model_validate(
                                 {
                                     "nfInstanceId": branch_id,
                                     "children": [
@@ -931,7 +929,7 @@ def test_protocol_root_replaces_failed_branch_without_retained_result(tmp_path):
                 "ml_correlation_id"
             ],
             **{
-                "x-flTopologyReport": FlTopologyReport.model_validate(
+                "flTopologyReport": FlTopologyReport.model_validate(
                     {
                         "nfInstanceId": branch_id,
                         "children": [
@@ -1096,7 +1094,7 @@ def test_protocol_root_rejected_attempt_reuses_last_committed_model_and_final_ag
                 "ml_correlation_id"
             ],
             **{
-                "x-flTopologyReport": FlTopologyReport.model_validate(
+                "flTopologyReport": FlTopologyReport.model_validate(
                     {
                         "nfInstanceId": branch_id,
                         "children": [
@@ -1277,7 +1275,7 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
                 "ml_correlation_id"
             ],
             **{
-                "x-flTopologyReport": FlTopologyReport.model_validate(
+                "flTopologyReport": FlTopologyReport.model_validate(
                     {
                         "nfInstanceId": branch_id,
                         "children": [
@@ -1445,6 +1443,193 @@ def test_protocol_root_continues_while_replacement_prepares_and_adopts_next_coho
     finally:
         allow_replacement_completion.set()
         allow_second_round_completion.set()
+        coordinator.close()
+        recorder.close()
+
+
+@pytest.mark.parametrize("a2_available", [True, False])
+def test_protocol_root_reparents_confirmed_leaves_without_rebuilding_other_edges(
+    tmp_path, a2_available
+):
+    distribution = Mock()
+    distribution.store.return_value = SimpleNamespace(
+        model_unique_id=77,
+        wire_reference=MLModelAdrf(
+            adrfId="00000000-0000-4000-8000-000000000900",
+            storTransId="round-store",
+        ),
+    )
+    topology = branch_replacement_topology(root_minimum=1).replace(
+        "on_branch_failure: replace_branch",
+        "on_branch_failure: reparent_leaves_to_root",
+    )
+    recorder = experiment_recorder(tmp_path, validation=False)
+    coordinator, resolver, artifacts, workspace, server, *_ = root_coordinator(
+        tmp_path,
+        round_count=4,
+        round_model_distribution=distribution,
+        topology_text=topology,
+        experiment_recorder=recorder,
+    )
+    round_inputs = []
+    aggregates = []
+    for index in range(4):
+        round_path = tmp_path / f"reparent-round-{index}.tar.gz"
+        aggregate_path = tmp_path / f"reparent-aggregate-{index}.tar.gz"
+        round_path.write_bytes(b"round")
+        aggregate_path.write_bytes(b"aggregate")
+        round_inputs.append(
+            SimpleNamespace(
+                digest=str(index + 2) * 64,
+                path=round_path,
+                url=f"http://root.example/reparent-round-{index}",
+            )
+        )
+        aggregates.append(
+            SimpleNamespace(
+                digest=str(index + 5) * 64,
+                path=aggregate_path,
+                url=f"http://root.example/reparent-aggregate-{index}",
+            )
+        )
+    artifacts.publish_round_input.side_effect = round_inputs
+    workspace.republish_validation_candidate.return_value = SimpleNamespace(
+        digest="9" * 64,
+        path=tmp_path / "reparent-handoff.tar.gz",
+        url="http://root.example/reparent-handoff",
+    )
+    server.collect_hierarchy_preparation.side_effect = lambda process_id: (
+        two_group_preparation_collection(server, process_id)
+    )
+    server.remove_protocol_participant.return_value = ""
+    started = set()
+    started_lock = threading.Lock()
+    both_started = threading.Event()
+    release_a1 = threading.Event()
+    release_a2 = threading.Event()
+    round_one_dispatched = threading.Event()
+    round_two_dispatched = threading.Event()
+    release_round_one = threading.Event()
+    release_round_two = threading.Event()
+    selections = []
+
+    def prepare_leaf(**kwargs):
+        target = kwargs["target"]
+        leaf_id = target.participant_nf_instance_id
+        assert target.topology.children is None
+        assert target.topology.report_after.unit == "epoch"
+        with started_lock:
+            started.add(leaf_id)
+            if len(started) == 2:
+                both_started.set()
+        assert (release_a1 if leaf_id == LEAF_A_ID else release_a2).wait(3)
+        failure = (
+            "preparation deadline expired"
+            if leaf_id == LEAF_B_ID and not a2_available
+            else ""
+        )
+        return HierarchyParticipantPreparationOutcome(
+            participant_nf_instance_id=leaf_id,
+            resource_location=f"http://{leaf_id}.example/subscriptions/new",
+            notification=(
+                None
+                if failure
+                else NwdafMLModelTrainNotif(
+                    notifCorreId=f"callback-{leaf_id}",
+                    mlCorreId=server.start_protocol_preparation.call_args.kwargs[
+                        "ml_correlation_id"
+                    ],
+                    flTopologyReport=FlTopologyReport(nfInstanceId=leaf_id),
+                )
+            ),
+            failure=failure,
+            delay_extensions=0,
+            granted_extension_seconds=0,
+        )
+
+    def execute_round(**kwargs):
+        index = len(selections)
+        selected = kwargs["selected_participant_nf_instance_ids"]
+        selections.append(selected)
+        if index == 1:
+            round_one_dispatched.set()
+            assert release_round_one.wait(3)
+        if index == 2:
+            round_two_dispatched.set()
+            assert release_round_two.wait(3)
+        return HierarchyRoundOutcome(
+            aggregate=aggregates[index],
+            accepted=True,
+            selected_participant_nf_instance_ids=selected,
+            successful_participant_nf_instance_ids=(
+                (BRANCH_B_ID,) if index == 0 else selected
+            ),
+            failed_participant_nf_instance_ids=((BRANCH_ID,) if index == 0 else ()),
+        )
+
+    server.prepare_protocol_replacement_target.side_effect = prepare_leaf
+    server.execute_hierarchy_round.side_effect = execute_round
+    coordinator.submit_manual(request_id=REQUEST_A_ID, model_family_id="ue-communication-default")
+    try:
+        assert round_one_dispatched.wait(3)
+        assert both_started.wait(3)
+        assert selections[1] == (BRANCH_B_ID,)
+        release_a1.set()
+        with coordinator._condition:
+            assert coordinator._condition.wait_for(
+                lambda: LEAF_A_ID in coordinator._records[REQUEST_A_ID].direct_leaves,
+                timeout=3,
+            )
+        release_round_one.set()
+        assert round_two_dispatched.wait(3)
+        assert selections[2] == (BRANCH_B_ID, LEAF_A_ID)
+        release_a2.set()
+        with coordinator._condition:
+            assert coordinator._condition.wait_for(
+                lambda: (
+                    LEAF_B_ID in coordinator._records[REQUEST_A_ID].direct_leaves
+                    if a2_available
+                    else LEAF_B_ID in coordinator._records[REQUEST_A_ID].pending_leaf_removals
+                ),
+                timeout=3,
+            )
+        release_round_two.set()
+        completed = coordinator.wait_for_state(
+            REQUEST_A_ID, {RootRequestState.COMPLETE, RootRequestState.FAILED}, timeout=3
+        )
+        assert completed.state is RootRequestState.COMPLETE
+        expected = {BRANCH_B_ID, LEAF_A_ID}
+        if a2_available:
+            expected.add(LEAF_B_ID)
+        assert set(selections[3]) == expected
+        assert all(BRANCH_REPLACEMENT_ID not in selected for selected in selections)
+        records = recorded_observations(tmp_path, completed.plan_id)
+        assert any(
+            item["recordType"] == "TOPOLOGY_ACCEPTANCE"
+            and {child["nfInstanceId"] for child in item["realizedTopology"]["children"]}
+            == expected
+            for item in records
+        )
+        assert any(
+            item["recordType"] == "EDGE_CONFIRMED" and item["childNfInstanceId"] == LEAF_A_ID
+            for item in records
+        )
+        if not a2_available:
+            assert not any(
+                item["recordType"] == "EDGE_CONFIRMED"
+                and item["childNfInstanceId"] == LEAF_B_ID
+                for item in records
+            )
+        assert {
+            call.kwargs["nf_instance_id"]
+            for call in resolver.resolve.call_args_list
+            if call.kwargs["role"].value == "LEAF"
+        } == {LEAF_A_ID, LEAF_B_ID}
+    finally:
+        release_a1.set()
+        release_a2.set()
+        release_round_one.set()
+        release_round_two.set()
         coordinator.close()
         recorder.close()
 
@@ -1720,7 +1905,7 @@ def test_protocol_root_generation_reset_cleans_replacement_created_in_flight(
                 notifCorreId="callback-replacement",
                 mlCorreId=plan_id,
                 **{
-                    "x-flTopologyReport": FlTopologyReport.model_validate(
+                    "flTopologyReport": FlTopologyReport.model_validate(
                         {
                             "nfInstanceId": BRANCH_REPLACEMENT_ID,
                             "children": [

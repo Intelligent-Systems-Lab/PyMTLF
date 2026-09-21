@@ -93,8 +93,7 @@ def with_static_flat(settings, workspace: Path, topology_path: Path):
 def write_topology(path: Path) -> None:
     path.write_text(
         """
-admission:
-  mode: complete_required
+on_branch_failure: replace_branch
 policy: &policy
   allow_additional_candidates: false
   additional_candidate_priority: 0

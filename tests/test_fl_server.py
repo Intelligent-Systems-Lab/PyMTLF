@@ -277,7 +277,7 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
         ]
         assert data_requirement["minNumSamples"] == 1
         assert create_payload["mLModelTrainInfos"][0]["timeAvReq"] == "PT300S"
-        assert create_payload["x-flTopology"]["nfInstanceId"] == branch_id
+        assert create_payload["flTopology"]["nfInstanceId"] == branch_id
         assert create_payload["mLEventSubscs"] == [
             {
                 "mLEvent": "X_IMAGE_CLASSIFICATION",
@@ -298,7 +298,7 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
             {
                 "notifCorreId": participant.notification_correlation_id,
                 "mlCorreId": procedure_id,
-                "x-flTopologyReport": {"nfInstanceId": branch_id},
+                "flTopologyReport": {"nfInstanceId": branch_id},
             }
         )
         request = SimpleNamespace(
@@ -334,7 +334,7 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
     )
     assert sent_create["targetNfInstanceId"] == branch_id
     assert sent_create["subscriptionId"] == "resource-a"
-    assert sent_create["message"]["x-flTopology"]["children"][0]["priority"] == 10
+    assert sent_create["message"]["flTopology"]["children"][0]["priority"] == 10
     assert "notifUri" not in sent_create["message"]
     received_notify = next(
         record
@@ -345,7 +345,7 @@ def test_protocol_preparation_is_model_free_and_accepts_topology_only_callback(c
     )
     assert received_notify["subscriptionId"] == "resource-a"
     assert received_notify["sourceNfInstanceId"] == branch_id
-    assert received_notify["message"]["x-flTopologyReport"]["nfInstanceId"] == branch_id
+    assert received_notify["message"]["flTopologyReport"]["nfInstanceId"] == branch_id
 
 
 def test_protocol_feature_mismatch_is_a_participant_failure():
@@ -510,7 +510,7 @@ def test_protocol_process_adds_and_removes_participants_after_admission():
                 {
                     "notifCorreId": first.notification_correlation_id,
                     "mlCorreId": procedure_id,
-                    "x-flTopologyReport": {"nfInstanceId": branch_a},
+                    "flTopologyReport": {"nfInstanceId": branch_a},
                 }
             )
         )
@@ -534,7 +534,7 @@ def test_protocol_process_adds_and_removes_participants_after_admission():
                 {
                     "notifCorreId": second.notification_correlation_id,
                     "mlCorreId": procedure_id,
-                    "x-flTopologyReport": {"nfInstanceId": branch_b},
+                    "flTopologyReport": {"nfInstanceId": branch_b},
                 }
             )
         )
@@ -663,7 +663,7 @@ def test_protocol_replacement_prepares_independently_of_ready_process_cohort(tmp
                 {
                     "notifCorreId": replacement.notification_correlation_id,
                     "mlCorreId": procedure_id,
-                    "x-flTopologyReport": {"nfInstanceId": replacement_id},
+                    "flTopologyReport": {"nfInstanceId": replacement_id},
                 }
             )
         )
@@ -3702,6 +3702,52 @@ def test_root_aggregation_weights_two_branch_results_by_effective_sample_count(
         assert (
             partial_publication["metadata"]["fl_metadata"]["aggregated_training_sample_count"] == 1
         )
+
+        direct_leaf = branch_bundles[1]
+        direct_leaf.manifest["result_type"] = "TRAINING"
+        direct_leaf_metadata = direct_leaf.manifest["fl_metadata"]
+        for key in ("lower_round_ind", "lower_global_artifact_digest", "subordinate_participants"):
+            direct_leaf_metadata.pop(key)
+        direct_leaf_metadata["dataset_evidence"] = {
+            "workload_profile": "image_classification",
+            "dataset": "mnist",
+            "training_sample_count": 3,
+        }
+        workspace.download.side_effect = [
+            SimpleNamespace(key="4" * 64),
+            SimpleNamespace(key="5" * 64),
+        ]
+        orchestrator._loader.load.side_effect = [base, branch_bundles[0], direct_leaf]
+        orchestrator._aggregate_round(
+            process,
+            "http://root.example/round-input",
+            0,
+            round_input_artifact=owned_round_input,
+            expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+            expected_result_types={
+                branch_ids[0]: RoundLocalResultType.HIERARCHY_AGGREGATE,
+                branch_ids[1]: RoundLocalResultType.TRAINING,
+            },
+            expected_subordinates={branch_ids[0]: (leaf_ids[0],)},
+        )
+        publication = workspace.publish.call_args.kwargs
+        assert publication["model"].weight.item() == pytest.approx(8.0)
+        assert publication["metadata"]["fl_metadata"]["aggregated_training_sample_count"] == 4
+
+        workspace.download.side_effect = [
+            SimpleNamespace(key="4" * 64),
+            SimpleNamespace(key="5" * 64),
+        ]
+        orchestrator._loader.load.side_effect = [base, branch_bundles[0], direct_leaf]
+        with pytest.raises(RuntimeError, match="unexpected local artifact type"):
+            orchestrator._aggregate_round(
+                process,
+                "http://root.example/round-input",
+                0,
+                round_input_artifact=owned_round_input,
+                expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+                expected_subordinates={branch_ids[0]: (leaf_ids[0],)},
+            )
     finally:
         orchestrator.close()
 

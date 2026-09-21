@@ -1,5 +1,4 @@
-admission:
-  mode: complete_required
+on_branch_failure: replace_branch
 
 policy:
   allow_additional_candidates: false

@@ -203,7 +203,7 @@ def test_training_operation_keeps_wire_topology_but_not_callback_uri_or_model_pa
         message={
             "notifUri": "http://callback.example/private",
             "notifCorreId": "root-to-branch",
-            "x-flTopology": {
+            "flTopology": {
                 "nfInstanceId": child,
                 "children": [{"nfInstanceId": NF_INSTANCE_ID, "priority": 50}],
             },
@@ -223,7 +223,7 @@ def test_training_operation_keeps_wire_topology_but_not_callback_uri_or_model_pa
     assert record["recordedAt"] >= record["startedAt"]
     assert record["subscriptionId"] == subscription_id
     assert record["targetNfInstanceId"] == child
-    assert record["message"]["x-flTopology"]["children"][0]["priority"] == 50
+    assert record["message"]["flTopology"]["children"][0]["priority"] == 50
     assert "notifUri" not in record["message"]
     assert "mlFile" not in record["message"]["mLModelInfos"][0]
 

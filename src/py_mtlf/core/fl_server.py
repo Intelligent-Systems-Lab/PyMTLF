@@ -743,6 +743,11 @@ class FLServerEngine:
             return
         if not process.hierarchy_plan_id:
             raise KeyError(process_id)
+        with self._lock, process.condition:
+            if not process.failure:
+                process.failure = "hierarchy Server process is closed"
+                process.state = FLServerState.COMPLETE
+            process.condition.notify_all()
         self._cleanup_hierarchy_process(process)
         active = self._experiments.for_server_process(process.process_id)
         if active is not None:
@@ -1252,6 +1257,7 @@ class FLServerEngine:
         round_input_model: MLEventNotification | None = None,
         input_round_indicator: int | None = None,
         expected_result_type: RoundLocalResultType,
+        expected_result_types: dict[str, RoundLocalResultType] | None = None,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
         selected_participant_nf_instance_ids: tuple[str, ...] | None = None,
         accept_failures: bool = False,
@@ -1300,6 +1306,8 @@ class FLServerEngine:
                 "hierarchy round selection contains unknown participants: " + ",".join(missing)
             )
         selected = [all_participants[nf_id] for nf_id in selected_ids]
+        if expected_result_types is not None and set(expected_result_types) != set(selected_ids):
+            raise ValueError("hierarchy result types must match selected participants")
         timeout = min(
             timeout_seconds or self._server_settings.round_timeout_seconds,
             self._server_settings.round_timeout_seconds,
@@ -1396,6 +1404,7 @@ class FLServerEngine:
                 "round_input_artifact": round_input_artifact,
                 "expected_input_round": input_round_indicator,
                 "expected_result_type": expected_result_type,
+                "expected_result_types": expected_result_types,
                 "expected_subordinates": expected_subordinates,
             }
             if explicit_selection or failed:
@@ -2151,7 +2160,10 @@ class FLServerEngine:
 
     def _ensure_process_generation(self, process: FLProcess) -> None:
         with self._lock:
-            current = process.generation == self._generation
+            current = (
+                process.generation == self._generation
+                and self._processes.get(process.process_id) is process
+            )
         if not current:
             raise RuntimeError("containing NWDAF process generation changed")
         self._raise_if_failed(process)
@@ -2246,6 +2258,7 @@ class FLServerEngine:
         round_input_artifact: FLWorkspaceArtifact,
         expected_input_round: int | None = None,
         expected_result_type: RoundLocalResultType = RoundLocalResultType.TRAINING,
+        expected_result_types: dict[str, RoundLocalResultType] | None = None,
         expected_subordinates: dict[str, tuple[str, ...]] | None = None,
         participant_nf_instance_ids: tuple[str, ...] | None = None,
     ) -> FLWorkspaceArtifact:
@@ -2296,11 +2309,16 @@ class FLServerEngine:
             contract = validate_fl_artifact(projection)
             if not isinstance(contract, RoundLocalArtifact):
                 raise RuntimeError("participant returned a non-local FL artifact")
-            if contract.result_type is not expected_result_type:
+            participant_result_type = (
+                expected_result_types[participant.candidate.target.nf_instance_id]
+                if expected_result_types is not None
+                else expected_result_type
+            )
+            if contract.result_type is not participant_result_type:
                 raise RuntimeError("participant returned an unexpected local artifact type")
             metadata = contract.fl_metadata
             validate_model_compatibility(base, bundle)
-            if expected_result_type is RoundLocalResultType.HIERARCHY_AGGREGATE:
+            if participant_result_type is RoundLocalResultType.HIERARCHY_AGGREGATE:
                 if not isinstance(metadata, RoundLocalHierarchyAggregateMetadata):
                     raise RuntimeError("Branch result lacks hierarchy aggregate metadata")
                 expected = (expected_subordinates or {}).get(

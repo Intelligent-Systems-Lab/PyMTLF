@@ -338,11 +338,11 @@ class NwdafMLModelTrainNotif(StandardModel):
     termination_request: str | None = Field(default=None, alias="termTrainReq")
     fl_topology_report: FlTopologyReport | None = Field(
         default=None,
-        alias="x-flTopologyReport",
+        alias="flTopologyReport",
     )
     retained_result_status: str | None = Field(
         default=None,
-        alias="x-retainedResultStatus",
+        alias="retainedResultStatus",
     )
 
     _reject_candidate_nulls = field_validator(
@@ -404,10 +404,10 @@ class NwdafMLModelTrainSubsc(StandardModel):
     round_indicator: int | None = Field(default=None, alias="roundInd", ge=0)
     target_reporting_ue: dict[str, JsonValue] | None = Field(default=None, alias="tgtRepUe")
     skip_fl_indicator: bool | None = Field(default=None, alias="skipFlInd")
-    fl_topology: FlTopologyNode | None = Field(default=None, alias="x-flTopology")
+    fl_topology: FlTopologyNode | None = Field(default=None, alias="flTopology")
     retained_result_request: StrictBool | None = Field(
         default=None,
-        alias="x-retainedResultReq",
+        alias="retainedResultReq",
     )
 
     _reject_candidate_nulls = field_validator(
@@ -448,10 +448,10 @@ class NwdafMLModelTrainSubscPatch(StandardModel):
     round_indicator: int | None = Field(default=None, alias="roundInd", ge=0)
     target_reporting_ue: dict[str, JsonValue] | None = Field(default=None, alias="tgtRepUe")
     skip_fl_indicator: bool | None = Field(default=None, alias="skipFlInd")
-    fl_topology: FlTopologyNodePatch | None = Field(default=None, alias="x-flTopology")
+    fl_topology: FlTopologyNodePatch | None = Field(default=None, alias="flTopology")
     retained_result_request: StrictBool | None = Field(
         default=None,
-        alias="x-retainedResultReq",
+        alias="retainedResultReq",
     )
 
 
@@ -714,7 +714,7 @@ def validate_candidate_subscription_receiver(
         return
     if not _same_nf_instance_id(value.fl_topology.nf_instance_id, expected_nf_instance_id):
         raise _candidate_invalid(
-            "x-flTopology.nfInstanceId",
+            "flTopology.nfInstanceId",
             "must identify the request receiver",
         )
 
@@ -730,7 +730,7 @@ def validate_candidate_notification_participant(
         expected_nf_instance_id,
     ):
         raise _candidate_invalid(
-            "x-flTopologyReport.nfInstanceId",
+            "flTopologyReport.nfInstanceId",
             "must identify the bound direct participant",
         )
 
@@ -744,29 +744,29 @@ def _validate_retained_result(value: NwdafMLModelTrainNotif, prefix: str = "") -
         return f"{prefix}.{field}" if prefix else field
 
     if not status.strip():
-        raise _candidate_invalid(path("x-retainedResultStatus"), "is required")
+        raise _candidate_invalid(path("retainedResultStatus"), "is required")
 
     if status == "FOUND":
         if value.round_indicator is None:
             raise _candidate_invalid(
                 path("roundInd"),
-                "is required when x-retainedResultStatus is FOUND",
+                "is required when retainedResultStatus is FOUND",
             )
         if not value.ml_model_infos:
             raise _candidate_invalid(
                 path("mLModelInfos"),
-                "is required when x-retainedResultStatus is FOUND",
+                "is required when retainedResultStatus is FOUND",
             )
     elif status in {"NOT_FOUND", "FAILED"}:
         if value.round_indicator is not None:
             raise _candidate_invalid(
                 path("roundInd"),
-                "is not allowed when x-retainedResultStatus is not FOUND",
+                "is not allowed when retainedResultStatus is not FOUND",
             )
         if value.ml_model_infos:
             raise _candidate_invalid(
                 path("mLModelInfos"),
-                "is not allowed when x-retainedResultStatus is not FOUND",
+                "is not allowed when retainedResultStatus is not FOUND",
             )
 
 
@@ -774,11 +774,11 @@ def validate_fl_subscription(
     value: NwdafMLModelTrainSubsc,
     existing: TrainingResourceIdentity | None = None,
 ) -> None:
-    _validate_topology(value.fl_topology, "x-flTopology")
+    _validate_topology(value.fl_topology, "flTopology")
     if value.immediate_report is not None:
         _validate_topology_report(
             value.immediate_report.fl_topology_report,
-            "immReport.x-flTopologyReport",
+            "immReport.flTopologyReport",
         )
         _validate_retained_result(value.immediate_report, "immReport")
     if (
@@ -885,7 +885,7 @@ def validate_fl_notification(
     value: NwdafMLModelTrainNotif,
     existing: TrainingResourceIdentity,
 ) -> None:
-    _validate_topology_report(value.fl_topology_report, "x-flTopologyReport")
+    _validate_topology_report(value.fl_topology_report, "flTopologyReport")
     _validate_retained_result(value)
     if has_candidate_notification_fields(value) and not (value.ml_correlation_id or "").strip():
         raise _candidate_invalid(

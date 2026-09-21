@@ -517,13 +517,13 @@ class FLClientEngine:
         if operation.top_level_retained_result_request:
             violations.append(
                 InvalidParameter(
-                    "x-retainedResultReq",
+                    "retainedResultReq",
                     "retained-result execution is not supported",
                 )
             )
         violations.extend(
             InvalidParameter(
-                "x-flTopology",
+                "flTopology",
                 f"retained-result execution is not supported for node {node_id}",
             )
             for node_id in operation.node_requests
@@ -957,7 +957,7 @@ class FLClientEngine:
             )
         if value.fl_topology is None:
             violations.append(
-                InvalidParameter("x-flTopology", "is required for protocol preparation")
+                InvalidParameter("flTopology", "is required for protocol preparation")
             )
         if violations:
             raise RequirementsError(violations)

@@ -67,7 +67,7 @@ def preparation_payload() -> dict:
 def candidate_payload() -> dict:
     payload = preparation_payload()
     payload["suppFeats"] = "4"
-    payload["x-flTopology"] = {
+    payload["flTopology"] = {
         "nfInstanceId": "10000000-0000-4000-8000-000000000001",
         "children": [
             {
@@ -373,17 +373,17 @@ def test_accuracy_check_notification_uses_model_info_and_real_accuracy_only() ->
 
 def test_candidate_subscription_round_trip_and_nested_objects_are_closed() -> None:
     payload = candidate_payload()
-    payload["x-retainedResultReq"] = False
-    payload["x-flTopology"]["children"][0].update({"enabled": True, "retainedResultReq": False})
+    payload["retainedResultReq"] = False
+    payload["flTopology"]["children"][0].update({"enabled": True, "retainedResultReq": False})
     value = NwdafMLModelTrainSubsc.model_validate(payload)
     validate_fl_subscription(value)
     encoded = value.model_dump(by_alias=True, exclude_none=True, mode="json")
 
-    assert encoded["x-flTopology"] == payload["x-flTopology"]
-    assert encoded["x-retainedResultReq"] is False
+    assert encoded["flTopology"] == payload["flTopology"]
+    assert encoded["retainedResultReq"] is False
 
     invalid = candidate_payload()
-    invalid["x-flTopology"]["strategy"]["methodParameters"]["unknown"] = True
+    invalid["flTopology"]["strategy"]["methodParameters"]["unknown"] = True
     with pytest.raises(ValidationError) as captured:
         NwdafMLModelTrainSubsc.model_validate(invalid)
     assert captured.value.errors()[0]["loc"][-1] == "unknown"
@@ -391,8 +391,8 @@ def test_candidate_subscription_round_trip_and_nested_objects_are_closed() -> No
 
 def test_candidate_patch_round_trip_preserves_complete_extension_contract() -> None:
     payload = {
-        "x-retainedResultReq": True,
-        "x-flTopology": {
+        "retainedResultReq": True,
+        "flTopology": {
             "nfInstanceId": "10000000-0000-4000-8000-000000000001",
             "enabled": True,
             "priority": 100,
@@ -437,8 +437,8 @@ def test_candidate_notification_round_trip_preserves_complete_extension_contract
     payload = {
         "notifCorreId": "root-branch-a",
         "mlCorreId": "hierarchical-fl-001",
-        "x-retainedResultStatus": "NOT_FOUND",
-        "x-flTopologyReport": {
+        "retainedResultStatus": "NOT_FOUND",
+        "flTopologyReport": {
             "nfInstanceId": "10000000-0000-4000-8000-000000000001",
             "policy": {
                 "allowAdditionalCandidates": True,
@@ -492,18 +492,18 @@ def test_candidate_notification_round_trip_preserves_complete_extension_contract
     )
     encoded = value.model_dump(by_alias=True, exclude_none=True, mode="json")
 
-    assert encoded["x-flTopologyReport"] == payload["x-flTopologyReport"]
-    assert encoded["x-retainedResultStatus"] == payload["x-retainedResultStatus"]
+    assert encoded["flTopologyReport"] == payload["flTopologyReport"]
+    assert encoded["retainedResultStatus"] == payload["retainedResultStatus"]
 
 
 @pytest.mark.parametrize(
     ("field_path", "invalid_value"),
     [
-        (("x-flTopology", "children", 0, "enabled"), "yes"),
-        (("x-flTopology", "policy", "fractionTrain"), "all"),
+        (("flTopology", "children", 0, "enabled"), "yes"),
+        (("flTopology", "policy", "fractionTrain"), "all"),
         (
             (
-                "x-flTopology",
+                "flTopology",
                 "strategy",
                 "methodParameters",
                 "proximalMu",
@@ -528,27 +528,27 @@ def test_candidate_nested_types_are_strict(field_path, invalid_value) -> None:
     ("mutate", "path"),
     [
         (
-            lambda payload: payload["x-flTopology"]["children"].append(
+            lambda payload: payload["flTopology"]["children"].append(
                 {
                     "nfInstanceId": "10000000-0000-4000-8000-000000000101",
                     "priority": 90,
                 }
             ),
-            "x-flTopology.children[1].nfInstanceId",
+            "flTopology.children[1].nfInstanceId",
         ),
         (
-            lambda payload: payload["x-flTopology"]["children"][0].pop("priority"),
-            "x-flTopology.children[0].priority",
+            lambda payload: payload["flTopology"]["children"][0].pop("priority"),
+            "flTopology.children[0].priority",
         ),
         (
-            lambda payload: payload["x-flTopology"]["policy"].update({"minTrainNodes": 2}),
-            "x-flTopology.policy.minAvailableNodes",
+            lambda payload: payload["flTopology"]["policy"].update({"minTrainNodes": 2}),
+            "flTopology.policy.minAvailableNodes",
         ),
         (
-            lambda payload: payload["x-flTopology"]["children"][0].update(
+            lambda payload: payload["flTopology"]["children"][0].update(
                 {"enabled": False, "retainedResultReq": True}
             ),
-            "x-flTopology.children[0].retainedResultReq",
+            "flTopology.children[0].retainedResultReq",
         ),
     ],
 )
@@ -563,7 +563,7 @@ def test_candidate_topology_cross_field_validation(mutate, path: str) -> None:
 
 def test_candidate_topology_safety_bounds() -> None:
     payload = candidate_payload()
-    root = payload["x-flTopology"]
+    root = payload["flTopology"]
     root.pop("children")
     root.pop("policy")
     cursor = root
@@ -576,8 +576,8 @@ def test_candidate_topology_safety_bounds() -> None:
         validate_fl_subscription(value)
 
     payload = candidate_payload()
-    payload["x-flTopology"].pop("policy")
-    payload["x-flTopology"]["children"] = [
+    payload["flTopology"].pop("policy")
+    payload["flTopology"]["children"] = [
         {"nfInstanceId": f"10000000-0000-4000-8000-{index:012d}"}
         for index in range(2, CANDIDATE_TOPOLOGY_MAX_NODES + 2)
     ]
@@ -588,22 +588,22 @@ def test_candidate_topology_safety_bounds() -> None:
 
 def test_candidate_full_message_rejects_null_but_patch_can_remove_values() -> None:
     payload = candidate_payload()
-    payload["x-flTopology"]["children"][0]["enabled"] = None
+    payload["flTopology"]["children"][0]["enabled"] = None
     with pytest.raises(ValidationError):
         NwdafMLModelTrainSubsc.model_validate(payload)
 
-    patch = NwdafMLModelTrainSubscPatch.model_validate({"x-flTopology": {"strategy": None}})
+    patch = NwdafMLModelTrainSubscPatch.model_validate({"flTopology": {"strategy": None}})
     assert "strategy" in patch.fl_topology.model_fields_set
     assert patch.fl_topology.strategy is None
 
 
 def test_candidate_strategy_method_is_closed() -> None:
     payload = candidate_payload()
-    payload["x-flTopology"]["strategy"]["method"] = "fedAvg"
+    payload["flTopology"]["strategy"]["method"] = "fedAvg"
     with pytest.raises(ValidationError) as captured:
         NwdafMLModelTrainSubsc.model_validate(payload)
     assert captured.value.errors()[0]["loc"] == (
-        "x-flTopology",
+        "flTopology",
         "strategy",
         "method",
     )
@@ -613,8 +613,8 @@ def test_candidate_patch_uses_merge_patch_and_strips_operations() -> None:
     current = NwdafMLModelTrainSubsc.model_validate(candidate_payload())
     patch = NwdafMLModelTrainSubscPatch.model_validate(
         {
-            "x-retainedResultReq": True,
-            "x-flTopology": {
+            "retainedResultReq": True,
+            "flTopology": {
                 "strategy": None,
                 "children": [
                     {
@@ -633,10 +633,10 @@ def test_candidate_patch_uses_merge_patch_and_strips_operations() -> None:
     assert operation.top_level_retained_result_request is True
     assert operation.node_requests == ("10000000-0000-4000-8000-000000000202",)
     encoded = persistent.model_dump(by_alias=True, exclude_none=True, mode="json")
-    assert "strategy" not in encoded["x-flTopology"]
-    assert encoded["x-flTopology"]["children"][0]["nfInstanceId"].endswith("202")
-    assert "x-retainedResultReq" not in encoded
-    assert "retainedResultReq" not in encoded["x-flTopology"]["children"][0]
+    assert "strategy" not in encoded["flTopology"]
+    assert encoded["flTopology"]["children"][0]["nfInstanceId"].endswith("202")
+    assert "retainedResultReq" not in encoded
+    assert "retainedResultReq" not in encoded["flTopology"]["children"][0]
 
 
 def test_candidate_notification_status_and_retained_result_rules() -> None:
@@ -644,7 +644,7 @@ def test_candidate_notification_status_and_retained_result_rules() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-flTopologyReport": {
+            "flTopologyReport": {
                 "nfInstanceId": "10000000-0000-4000-8000-000000000001",
                 "children": [
                     {
@@ -671,7 +671,7 @@ def test_candidate_notification_status_and_retained_result_rules() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-retainedResultStatus": "FOUND",
+            "retainedResultStatus": "FOUND",
             "roundInd": 5,
             "mLModelInfos": [
                 {
@@ -695,7 +695,7 @@ def test_candidate_notification_status_and_retained_result_rules() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-retainedResultStatus": "NOT_FOUND",
+            "retainedResultStatus": "NOT_FOUND",
             "mLModelInfos": [
                 {
                     "event": "UE_COMMUNICATION",
@@ -720,7 +720,7 @@ def test_candidate_notification_requires_process_and_bound_participant_identity(
     without_process = NwdafMLModelTrainNotif.model_validate(
         {
             "notifCorreId": "root-branch-a",
-            "x-flTopologyReport": {
+            "flTopologyReport": {
                 "nfInstanceId": "10000000-0000-4000-8000-000000000001",
             },
         }
@@ -749,7 +749,7 @@ def test_candidate_notification_requires_process_and_bound_participant_identity(
                 bound_participant_nf_instance_id=("20000000-0000-4000-8000-000000000001"),
             ),
         )
-    assert captured.value.violations[0].parameter == ("x-flTopologyReport.nfInstanceId")
+    assert captured.value.violations[0].parameter == ("flTopologyReport.nfInstanceId")
 
 
 def test_candidate_report_timestamp_requires_strict_rfc3339() -> None:
@@ -757,7 +757,7 @@ def test_candidate_report_timestamp_requires_strict_rfc3339() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-flTopologyReport": {
+            "flTopologyReport": {
                 "nfInstanceId": "10000000-0000-4000-8000-000000000001",
                 "children": [
                     {
@@ -786,7 +786,7 @@ def test_candidate_topology_report_recursive_validation_and_bounds() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-flTopologyReport": {
+            "flTopologyReport": {
                 "nfInstanceId": "10000000-0000-4000-8000-000000000001",
                 "children": [
                     {
@@ -827,7 +827,7 @@ def test_candidate_topology_report_recursive_validation_and_bounds() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-flTopologyReport": report,
+            "flTopologyReport": report,
         }
     )
     with pytest.raises(InvalidMessageError, match="maximum topology depth"):
@@ -855,7 +855,7 @@ def test_candidate_topology_report_recursive_validation_and_bounds() -> None:
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-flTopologyReport": wide_report,
+            "flTopologyReport": wide_report,
         }
     )
     with pytest.raises(InvalidMessageError, match="maximum topology node count"):
@@ -871,22 +871,22 @@ def test_candidate_topology_report_recursive_validation_and_bounds() -> None:
 
 def test_candidate_forward_compatible_enums_remain_lossless() -> None:
     payload = candidate_payload()
-    payload["x-flTopology"]["policy"]["selectionMethod"] = "vendorSelection"
-    payload["x-flTopology"]["strategy"]["aggregation"] = "vendorWeighted"
-    payload["x-flTopology"]["reportAfter"]["unit"] = "window"
+    payload["flTopology"]["policy"]["selectionMethod"] = "vendorSelection"
+    payload["flTopology"]["strategy"]["aggregation"] = "vendorWeighted"
+    payload["flTopology"]["reportAfter"]["unit"] = "window"
     value = NwdafMLModelTrainSubsc.model_validate(payload)
     validate_fl_subscription(value)
     encoded = value.model_dump(by_alias=True, exclude_none=True, mode="json")
-    assert encoded["x-flTopology"]["policy"]["selectionMethod"] == "vendorSelection"
-    assert encoded["x-flTopology"]["strategy"]["aggregation"] == "vendorWeighted"
-    assert encoded["x-flTopology"]["reportAfter"]["unit"] == "window"
+    assert encoded["flTopology"]["policy"]["selectionMethod"] == "vendorSelection"
+    assert encoded["flTopology"]["strategy"]["aggregation"] == "vendorWeighted"
+    assert encoded["flTopology"]["reportAfter"]["unit"] == "window"
 
     notification = NwdafMLModelTrainNotif.model_validate(
         {
             "notifCorreId": "root-branch-a",
             "mlCorreId": "hierarchical-fl-001",
-            "x-retainedResultStatus": "VENDOR_OUTCOME",
-            "x-flTopologyReport": {
+            "retainedResultStatus": "VENDOR_OUTCOME",
+            "flTopologyReport": {
                 "nfInstanceId": "10000000-0000-4000-8000-000000000001",
                 "children": [
                     {
@@ -913,8 +913,8 @@ def test_candidate_forward_compatible_enums_remain_lossless() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "path"),
     [
-        ("aggregation", " ", "x-flTopology.strategy.aggregation"),
-        ("reportAfter.unit", " ", "x-flTopology.reportAfter.unit"),
+        ("aggregation", " ", "flTopology.strategy.aggregation"),
+        ("reportAfter.unit", " ", "flTopology.reportAfter.unit"),
     ],
 )
 def test_candidate_required_strategy_strings_are_not_blank(
@@ -924,9 +924,9 @@ def test_candidate_required_strategy_strings_are_not_blank(
 ) -> None:
     payload = candidate_payload()
     if field == "aggregation":
-        payload["x-flTopology"]["strategy"][field] = value
+        payload["flTopology"]["strategy"][field] = value
     else:
-        payload["x-flTopology"]["reportAfter"]["unit"] = value
+        payload["flTopology"]["reportAfter"]["unit"] = value
     parsed = NwdafMLModelTrainSubsc.model_validate(payload)
 
     with pytest.raises(InvalidMessageError) as captured:
@@ -937,8 +937,8 @@ def test_candidate_required_strategy_strings_are_not_blank(
 @pytest.mark.parametrize(
     ("field", "path"),
     [
-        ("status", "x-flTopologyReport.children[0].status"),
-        ("x-retainedResultStatus", "x-retainedResultStatus"),
+        ("status", "flTopologyReport.children[0].status"),
+        ("retainedResultStatus", "retainedResultStatus"),
     ],
 )
 def test_candidate_forward_compatible_status_strings_are_not_blank(
@@ -948,7 +948,7 @@ def test_candidate_forward_compatible_status_strings_are_not_blank(
     payload = {
         "notifCorreId": "root-branch-a",
         "mlCorreId": "hierarchical-fl-001",
-        "x-flTopologyReport": {
+        "flTopologyReport": {
             "nfInstanceId": "10000000-0000-4000-8000-000000000001",
             "children": [
                 {
@@ -960,7 +960,7 @@ def test_candidate_forward_compatible_status_strings_are_not_blank(
         },
     }
     if field == "status":
-        payload["x-flTopologyReport"]["children"][0][field] = " "
+        payload["flTopologyReport"]["children"][0][field] = " "
     else:
         payload[field] = " "
     parsed = NwdafMLModelTrainNotif.model_validate(payload)

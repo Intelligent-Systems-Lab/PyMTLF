@@ -41,7 +41,7 @@ _REQUEST_FIELDS = frozenset(
         "mLTrainRepInfo",
         "roundInd",
         "mLModelInfos",
-        "x-flTopology",
+        "flTopology",
         "skipFlInd",
         "mLAccChkFlg",
     }
@@ -50,7 +50,7 @@ _NOTIFICATION_FIELDS = frozenset(
     {
         "notifCorreId",
         "roundInd",
-        "x-flTopologyReport",
+        "flTopologyReport",
         "mLModelInfos",
         "statusReport",
         "termTrainReq",

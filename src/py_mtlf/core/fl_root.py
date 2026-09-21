@@ -182,6 +182,16 @@ class _RootBranchGroup:
     state: RootBranchGroupState = RootBranchGroupState.UNAVAILABLE
     replacement_future: Future | None = None
     replacement_error: Exception | None = None
+    reparent_futures: dict[str, Future] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _DirectLeaf:
+    nf_instance_id: str
+    group_index: int
+    priority: int
+    report: FlTopologyReport
+    resource_location: str
 
 
 @dataclass
@@ -194,6 +204,8 @@ class _RootRequestRecord:
     server_process_id: str = ""
     admission: RootAdmissionSnapshot | None = None
     branch_groups: list[_RootBranchGroup] = field(default_factory=list)
+    direct_leaves: dict[str, _DirectLeaf] = field(default_factory=dict)
+    pending_leaf_removals: set[str] = field(default_factory=set)
     current_round: int | None = None
     completed_rounds: int = 0
     candidate_url: str = ""
@@ -254,7 +266,7 @@ class FLRootCoordinator:
         self._closing = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fl-root")
         self._replacement_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=3,
             thread_name_prefix="fl-root-replacement",
         )
 
@@ -690,47 +702,57 @@ class FLRootCoordinator:
         final_accepted_round_indicator: int | None = None
         round_indicator = 0
         while record.completed_rounds < self._server_settings.round_count:
+            self._remove_pending_direct_leaves(record, process.process_id)
             self._wait_for_root_readiness(record, topology)
-            active_groups = self._active_branch_groups(record)
+            active_groups, direct_leaves = self._direct_children_snapshot(record)
             expected_subordinates = {
                 group.active_branch_nf_instance_id: _active_report_children(
                     group.active_report
                 )
                 for group in active_groups
             }
-            branch_priorities = {
+            direct_priorities = {
                 group.active_branch_nf_instance_id: _branch_priority(
                     group,
                     group.active_branch_nf_instance_id,
                 )
                 for group in active_groups
             }
-            active_branch_ids = tuple(sorted(expected_subordinates))
+            direct_priorities.update(
+                {leaf.nf_instance_id: leaf.priority for leaf in direct_leaves}
+            )
+            direct_ids = tuple(sorted(direct_priorities))
             selected_count = min(
-                len(active_branch_ids),
+                len(direct_ids),
                 max(
                     math.floor(
-                        len(active_branch_ids) * topology.policy.fraction_train
+                        len(direct_ids) * topology.policy.fraction_train
                     ),
                     topology.policy.minimum_train_nodes,
                 ),
             )
-            ordered = list(active_branch_ids)
+            ordered = list(direct_ids)
             if topology.policy.selection_method == "priority":
-                ordered.sort(key=lambda value: (-branch_priorities[value], value))
+                ordered.sort(key=lambda value: (-direct_priorities[value], value))
             else:
                 self._random.shuffle(ordered)
-            selected_branch_ids = tuple(sorted(ordered[:selected_count]))
+            selected_ids = tuple(sorted(ordered[:selected_count]))
+            selected_types = {
+                nf_id: (
+                    RoundLocalResultType.HIERARCHY_AGGREGATE
+                    if nf_id in expected_subordinates
+                    else RoundLocalResultType.TRAINING
+                )
+                for nf_id in selected_ids
+            }
             allowed_consumers = tuple(
                 sorted(
-                    {
+                    set(selected_ids)
+                    | {
                         participant_id
                         for group in active_groups
-                        if group.active_branch_nf_instance_id in selected_branch_ids
-                        for participant_id in (
-                            group.active_branch_nf_instance_id,
-                            *_active_report_descendants(group.active_report),
-                        )
+                        if group.active_branch_nf_instance_id in selected_ids
+                        for participant_id in _active_report_descendants(group.active_report)
                     }
                 )
             )
@@ -769,8 +791,9 @@ class FLRootCoordinator:
                     round_input_model=round_model,
                     input_round_indicator=round_indicator,
                     expected_result_type=RoundLocalResultType.HIERARCHY_AGGREGATE,
+                    expected_result_types=selected_types,
                     expected_subordinates=expected_subordinates,
-                    selected_participant_nf_instance_ids=selected_branch_ids,
+                    selected_participant_nf_instance_ids=selected_ids,
                     accept_failures=topology.policy.accept_failures,
                     minimum_completion_rate=topology.policy.minimum_completion_rate,
                     state_observer=lambda state, current_round=round_indicator: (
@@ -797,10 +820,17 @@ class FLRootCoordinator:
             finally:
                 distribution.cleanup(record.initiation.plan_id, round_indicator)
             self._ensure_active_generation(record)
-            if len(outcome.failed_participant_nf_instance_ids) > 1:
+            failed_branches = tuple(
+                nf_id for nf_id in outcome.failed_participant_nf_instance_ids
+                if nf_id in expected_subordinates
+            )
+            if len(failed_branches) > 1:
                 raise RuntimeError("multiple direct Branch failures are not recoverable")
             completed_after_attempt = record.completed_rounds + int(outcome.accepted)
-            for failed_branch_id in outcome.failed_participant_nf_instance_ids:
+            for failed_leaf_id in outcome.failed_participant_nf_instance_ids:
+                if failed_leaf_id not in expected_subordinates:
+                    self._retire_failed_direct_leaf(record, topology, failed_leaf_id)
+            for failed_branch_id in failed_branches:
                 if self._experiment_recorder is not None:
                     failed_group = next(
                         group
@@ -1127,6 +1157,28 @@ class FLRootCoordinator:
                 and group.active_report is not None
             )
 
+    def _direct_children_snapshot(
+        self, record: _RootRequestRecord
+    ) -> tuple[tuple[_RootBranchGroup, ...], tuple[_DirectLeaf, ...]]:
+        with self._condition:
+            groups = tuple(
+                group for group in record.branch_groups
+                if group.state is RootBranchGroupState.ACTIVE
+                and group.active_branch_nf_instance_id
+                and group.active_report is not None
+            )
+            return groups, tuple(record.direct_leaves.values())
+
+    def _remove_pending_direct_leaves(self, record: _RootRequestRecord, process_id: str) -> None:
+        with self._condition:
+            pending = tuple(sorted(record.pending_leaf_removals))
+            record.pending_leaf_removals.clear()
+        for nf_id in pending:
+            try:
+                self._server.remove_protocol_participant(process_id, nf_id)
+            except KeyError:
+                continue
+
     def _wait_for_root_readiness(self, record: _RootRequestRecord, topology) -> None:
         with self._condition:
             while True:
@@ -1141,7 +1193,7 @@ class FLRootCoordinator:
                 active_count = sum(
                     group.state is RootBranchGroupState.ACTIVE
                     for group in record.branch_groups
-                )
+                ) + len(record.direct_leaves)
                 if (
                     active_count >= topology.policy.minimum_available_nodes
                     and active_count >= topology.policy.minimum_train_nodes
@@ -1151,9 +1203,13 @@ class FLRootCoordinator:
                     group.replacement_future is not None
                     and not group.replacement_future.done()
                     for group in record.branch_groups
+                ) or any(
+                    not future.done()
+                    for group in record.branch_groups
+                    for future in group.reparent_futures.values()
                 )
                 if not pending:
-                    raise RuntimeError("Root Branch pool cannot satisfy its readiness policy")
+                    raise RuntimeError("Root direct-child pool cannot satisfy its readiness policy")
                 self._condition.wait(timeout=0.1)
 
     def _retire_failed_branch(
@@ -1176,6 +1232,12 @@ class FLRootCoordinator:
         )
         if group is None:
             raise RuntimeError("failed Branch does not own an active group")
+        confirmed_leaf_ids = _active_report_children(group.active_report)
+        configured_leaves = {
+            leaf.nf_instance_id: leaf
+            for leaf in group.assignment.leaves
+            if leaf.enabled
+        }
         cleanup_failure = self._server.remove_protocol_participant(
             process.process_id,
             failed_branch_nf_instance_id,
@@ -1196,23 +1258,36 @@ class FLRootCoordinator:
             group.upper_resource_location = ""
             group.state = (
                 RootBranchGroupState.BRANCH_REPLACING
-                if replace
+                if replace and topology.on_branch_failure == "replace_branch"
                 else RootBranchGroupState.UNAVAILABLE
             )
             self._refresh_admission_locked(record)
             self._condition.notify_all()
         if self._experiment_recorder is not None:
-            active_count = len(self._active_branch_groups(record))
-            self._experiment_recorder.record_decision(
-                ml_correlation_id=record.initiation.plan_id,
-                record_type="TOPOLOGY_ACCEPTANCE",
-                accepted=(
-                    active_count >= topology.policy.minimum_available_nodes
-                    and active_count >= topology.policy.minimum_train_nodes
-                ),
-                realizedTopology=self._realized_topology(record),
-            )
+            self._record_topology_acceptance(record, topology)
         if not replace:
+            return
+        if topology.on_branch_failure == "reparent_leaves_to_root":
+            group_index = record.branch_groups.index(group)
+            for leaf_id in confirmed_leaf_ids:
+                leaf = configured_leaves.get(leaf_id)
+                if leaf is None:
+                    continue
+                future = self._replacement_executor.submit(
+                    self._reparent_leaf,
+                    record,
+                    process.process_id,
+                    topology,
+                    group,
+                    group_index,
+                    leaf,
+                    descriptor.event,
+                    descriptor.event_filter,
+                    descriptor.model_interoperability,
+                )
+                with self._condition:
+                    group.reparent_futures[leaf_id] = future
+                    self._condition.notify_all()
             return
         logger.info(
             "Root Branch replacement started plan_id=%s failed_nf=%s",
@@ -1322,6 +1397,115 @@ class FLRootCoordinator:
                 group.state = RootBranchGroupState.UNAVAILABLE
                 self._condition.notify_all()
 
+    def _reparent_leaf(
+        self,
+        record: _RootRequestRecord,
+        process_id: str,
+        topology,
+        group: _RootBranchGroup,
+        group_index: int,
+        leaf,
+        ml_event: str,
+        ml_event_filter: dict,
+        model_interoperability: str,
+    ) -> None:
+        leaf_id = leaf.nf_instance_id
+        try:
+            self._ensure_active_generation(record)
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.record_decision(
+                    ml_correlation_id=record.initiation.plan_id,
+                    record_type="REPAIR_SELECTION",
+                    childNfInstanceId=leaf_id,
+                    candidateNfInstanceIds=[leaf_id],
+                    selectedNfInstanceIds=[leaf_id],
+                )
+            resolved = self._resolver.resolve(
+                nf_instance_id=leaf_id,
+                role=HierarchyNodeRole.LEAF,
+                ml_event=ml_event,
+                model_interoperability=model_interoperability,
+            )
+            strategy = FlStrategy.model_validate(
+                group.assignment.strategy.model_dump(by_alias=True, mode="json")
+            )
+            target = ProtocolPreparationTarget(
+                participant_nf_instance_id=leaf_id,
+                candidate=FLClientCandidate(target=resolved.target, tracking_areas=()),
+                topology=FlTopologyNode(
+                    nfInstanceId=leaf_id,
+                    enabled=True,
+                    priority=leaf.priority,
+                    strategy=strategy,
+                    reportAfter=FlReportAfter.model_validate(
+                        leaf.report_after.model_dump(by_alias=True, mode="json")
+                    ),
+                ),
+            )
+            outcome = self._server.prepare_protocol_replacement_target(
+                process_id=process_id,
+                ml_event=ml_event,
+                ml_event_filter=ml_event_filter,
+                model_interoperability=model_interoperability,
+                target=target,
+            )
+            self._ensure_active_generation(record)
+            report = outcome.notification.fl_topology_report if outcome.notification else None
+            if (
+                outcome.failure
+                or not outcome.resource_location
+                or report is None
+                or report.nf_instance_id != leaf_id
+                or _active_report_children(report)
+            ):
+                with self._condition:
+                    record.pending_leaf_removals.add(leaf_id)
+                    self._condition.notify_all()
+                return
+            with self._condition:
+                self._ensure_active_generation(record)
+                record.direct_leaves[leaf_id] = _DirectLeaf(
+                    nf_instance_id=leaf_id,
+                    group_index=group_index,
+                    priority=leaf.priority,
+                    report=report.model_copy(deep=True),
+                    resource_location=outcome.resource_location,
+                )
+                self._condition.notify_all()
+            if self._experiment_recorder is not None:
+                self._experiment_recorder.record_decision(
+                    ml_correlation_id=record.initiation.plan_id,
+                    record_type="EDGE_CONFIRMED",
+                    childNfInstanceId=leaf_id,
+                    subscriptionId=unquote(
+                        urlsplit(outcome.resource_location).path.rsplit("/", 1)[-1]
+                    ),
+                )
+                self._record_topology_acceptance(record, topology)
+        except (HierarchyDiscoveryError, RuntimeError, ValueError) as error:
+            logger.info("Direct Leaf reparenting did not confirm nf=%s: %s", leaf_id, error)
+            with self._condition:
+                record.pending_leaf_removals.add(leaf_id)
+                self._condition.notify_all()
+
+    def _retire_failed_direct_leaf(
+        self, record: _RootRequestRecord, topology, leaf_id: str
+    ) -> None:
+        with self._condition:
+            leaf = record.direct_leaves.pop(leaf_id, None)
+            if leaf is None:
+                raise RuntimeError("failed direct Leaf is not confirmed")
+            record.pending_leaf_removals.add(leaf_id)
+            self._condition.notify_all()
+        if self._experiment_recorder is not None:
+            self._experiment_recorder.record_decision(
+                ml_correlation_id=record.initiation.plan_id,
+                record_type="EDGE_UNAVAILABLE",
+                childNfInstanceId=leaf_id,
+                subscriptionId=unquote(urlsplit(leaf.resource_location).path.rsplit("/", 1)[-1]),
+            )
+            self._record_topology_acceptance(record, topology)
+
     def _refresh_admission_locked(self, record: _RootRequestRecord) -> None:
         record.admission = RootAdmissionSnapshot(
             plan_id=record.initiation.plan_id,
@@ -1340,12 +1524,23 @@ class FLRootCoordinator:
         )
 
     def _record_accepted_topology(self, record: _RootRequestRecord) -> None:
+        topology = self._planner.build(
+            root_nf_instance_id=self._nwdaf_context.get().nf_instance_id
+        )
+        self._record_topology_acceptance(record, topology)
+
+    def _record_topology_acceptance(self, record: _RootRequestRecord, topology) -> None:
         if self._experiment_recorder is None:
             return
+        groups, leaves = self._direct_children_snapshot(record)
+        direct_count = len(groups) + len(leaves)
         self._experiment_recorder.record_decision(
             ml_correlation_id=record.initiation.plan_id,
             record_type="TOPOLOGY_ACCEPTANCE",
-            accepted=True,
+            accepted=(
+                direct_count >= topology.policy.minimum_available_nodes
+                and direct_count >= topology.policy.minimum_train_nodes
+            ),
             realizedTopology=self._realized_topology(record),
         )
 
@@ -1356,6 +1551,11 @@ class FLRootCoordinator:
                 for group in record.branch_groups
                 if group.state is RootBranchGroupState.ACTIVE and group.active_report is not None
             ]
+            children.extend(
+                _realized_report(leaf.report)
+                for leaf in record.direct_leaves.values()
+            )
+            children.sort(key=lambda item: item["nfInstanceId"])
         return {
             "nfInstanceId": self._nwdaf_context.get().nf_instance_id,
             "children": children,

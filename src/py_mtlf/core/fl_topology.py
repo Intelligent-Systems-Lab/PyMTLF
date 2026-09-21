@@ -184,12 +184,8 @@ class StaticTopologyBranchGroup(TopologyContractModel):
         return self
 
 
-class CompleteRequiredTopologyAdmission(TopologyContractModel):
-    mode: Literal["complete_required"]
-
-
 class StaticTopologyFile(TopologyContractModel):
-    admission: CompleteRequiredTopologyAdmission
+    on_branch_failure: Literal["replace_branch", "reparent_leaves_to_root"]
     policy: StaticTopologyPolicy
     strategy: StaticTopologyStrategy
     branch_groups: tuple[StaticTopologyBranchGroup, ...] = Field(min_length=1)
@@ -301,7 +297,7 @@ class TopologyBranchGroupAssignment(TopologyContractModel):
 
 class TopologyAssignment(TopologyContractModel):
     root_nf_instance_id: str
-    admission_mode: Literal["complete_required"]
+    on_branch_failure: Literal["replace_branch", "reparent_leaves_to_root"]
     policy: StaticTopologyPolicy
     strategy: StaticTopologyStrategy
     branch_groups: tuple[TopologyBranchGroupAssignment, ...] = Field(min_length=1)
@@ -383,7 +379,7 @@ class StaticTopologyPlanner:
         )
         return TopologyAssignment(
             root_nf_instance_id=root_id,
-            admission_mode=self._topology.admission.mode,
+            on_branch_failure=self._topology.on_branch_failure,
             policy=self._topology.policy.model_copy(deep=True),
             strategy=self._topology.strategy.model_copy(deep=True),
             branch_groups=branch_groups,
