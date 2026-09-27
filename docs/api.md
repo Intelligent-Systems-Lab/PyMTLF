@@ -1,292 +1,205 @@
 # PyMTLF HTTP API
 
-PyMTLF is the private MTLF backend of a containing Go NWDAF. It is not an
-independently registered 3GPP NF. Go owns public
-`Nnwdaf_MLModelProvision`/`Nnwdaf_MLModelMonitor` SBI exposure and routes the
-same Release 18-shaped representations to the backend.
+## Scope and Ownership
+
+PyMTLF is a private backend of one containing Go NWDAF. These routes are not
+public 3GPP SBI endpoints. The Go NWDAF owns public SBI paths, peer transport,
+subscription resource creation, NRF access, and ADRF forwarding. PyMTLF owns
+the backend state and decisions reached through the private routes below.
 
 The implementation is authoritative:
 
-- routes: `src/py_mtlf/api/`
-- wire models: `src/py_mtlf/wire/`
-- application wiring: `src/py_mtlf/app.py`
-- provision and monitor state: `src/py_mtlf/core/`
+- route registration: `src/py_mtlf/app.py`;
+- route handlers: `src/py_mtlf/api/`;
+- wire models: `src/py_mtlf/wire/`; and
+- runtime owners: `src/py_mtlf/core/`.
 
-FastAPI exposes `/docs`, `/redoc`, and `/openapi.json` while running.
+FastAPI exposes the exact running schema through `/openapi.json`, `/docs`, and
+`/redoc`.
 
-Route availability depends on `runtime.mode` and the enabled federated engine
-sections:
+## Route Availability
 
-| Mode | Enabled engines | Provision/Monitor routes | Local trainer | Training handler availability |
-| --- | --- | --- | --- | --- |
-| `local` | none | yes | yes | none |
-| `federated` | Server | yes | no | notification ingress only |
-| `federated` | Client | no | no | subscription CRUD only |
-| `federated` | Server + Client | yes | no | notification ingress and subscription CRUD |
+| Runtime capability | Routes enabled |
+| --- | --- |
+| Always | readiness, artifact download, training-data descriptors, ADRF retrieval notifications |
+| `runtime.mode: local` | Model Provision and Model Monitor routes |
+| FL Server engine | Model Provision, Model Monitor, Model Training notification ingress |
+| FL Client engine | Model Training subscription create, replace, patch, and delete |
+| Private training-data collection | collection-control and UPF callback routes |
+| Top-level coordinator with private trigger enabled | federated training-request routes |
 
-Readiness, artifact, incremental training-data descriptor, and ADRF callback
-routes remain available in both modes. The shared Model Training router is
-mounted when either FL engine is enabled; each handler returns service
-unavailable when its required engine is disabled.
+The shared Model Training router is mounted when either FL engine is enabled.
+An operation returns `503 SERVICE_NOT_AVAILABLE` when its required engine is
+not enabled in that process.
 
-## Endpoint Summary
+## Complete Inbound Route Summary
 
-| Caller | Method and path | Purpose | Success |
+### Readiness and artifacts
+
+| Caller | Method and path | Success | Purpose |
 | --- | --- | --- | --- |
-| Go | `GET /health/ready` | Artifact readiness and process identity | `200` or `503` |
-| PyAnLF through Go | `PUT /internal/v1/anlf/training-data-descriptors/{id}` | Publish or replace a stored training-data descriptor | `204` |
-| PyAnLF through Go | `DELETE /internal/v1/anlf/training-data-descriptors/{id}` | Remove a data descriptor | `204` |
-| PyAnLF through Go | `POST /internal/v1/ml-model-provision/subscriptions` | Create a provision resource | `201` |
-| PyAnLF through Go | `PUT /internal/v1/ml-model-provision/subscriptions/{id}` | Replace a provision resource | `200` |
-| PyAnLF through Go | `DELETE /internal/v1/ml-model-provision/subscriptions/{id}` | Delete a provision resource | `204` |
-| PyAnLF through Go | `POST /internal/v1/ml-model-monitor/registrations` | Register one READY model-use scope | `201` |
-| PyAnLF through Go | `DELETE /internal/v1/ml-model-monitor/registrations/{id}` | Deregister a model-use scope | `204` |
-| Go | `POST /internal/v1/ml-model-monitor/notifications` | Deliver a correlated accuracy notification | `204` |
-| Go | `POST /internal/v1/adrf-data-management/retrieval-notifications` | Deliver a complete ADRF retrieval notification | `204` |
-| PyAnLF | `GET /internal/v1/artifacts/{sha256}` | Download an immutable model bundle | `200` |
-| Peer NWDAF through Go | `/internal/v1/ml-model-training/subscriptions...` | Model Training resource lifecycle | standard create/update/patch/delete results |
+| Operator or containing Go NWDAF | `GET /health/ready` | `200` or `503` | Report process identity, runtime mode, artifact readiness, enabled engines, advertised engines, and capability consistency. |
+| Model consumer | `GET /internal/v1/artifacts/{artifact_key}` | `200` | Download an immutable completed-model bundle. |
+| FL peer | `GET /internal/v1/fl-artifacts/{process_id}/{participant_id}/{round_indicator}/{role}/{digest}` | `200` | Download a temporary round artifact by its exact identity and digest. |
 
-JSON Model Provision and Monitor errors use `application/problem+json`.
-Malformed standard-shaped bodies return `400`; unknown resources or
-correlations return `404`. Resource creation returns an owner-generated UUID
-in `Location`.
+Completed bundles use immutable cache headers and a SHA-256 ETag. Round
+artifacts are temporary workspace objects and are removed with their FL
+lifecycle.
 
-`GET /health/live` and `POST /internal/v1/sync` are deliberately absent.
+### Training-data inputs
 
-## Readiness And Containing NWDAF Context
+| Caller | Method and path | Success | Purpose |
+| --- | --- | --- | --- |
+| PyAnLF through Go | `PUT /internal/v1/anlf/training-data-descriptors/{descriptor_id}` | `204` | Create or replace a local training-data descriptor. |
+| PyAnLF through Go | `DELETE /internal/v1/anlf/training-data-descriptors/{descriptor_id}` | `204` | Remove a descriptor. |
+| Go NWDAF | `POST /internal/v1/adrf-data-management/retrieval-notifications` | `204` | Deliver an ADRF retrieval notification to the dataset coordinator. |
 
-`GET /health/ready` returns the current `processInstanceId`, `runtimeMode`,
-artifact status, `enabledFlEngines`, `advertisedFlEngines`, and
-`capabilityVerification`. Both ready `200` and not-ready `503` retain the same
-UUID for the lifetime of the process. A configured seed catalog is validated
-during startup; a missing or invalid artifact prevents readiness. Go context
-unavailability, malformed capability projection, or an exact engine mismatch
-also returns `503`. Each probe refreshes the context, so a late or temporarily
-unavailable Go listener can recover without restarting PyMTLF.
+### Private training-data collection
 
-PyMTLF reads immutable containing-NWDAF information from the corresponding Go
-MTLF edge:
+These routes exist only when an FL Client selects the `private_api` collection
+trigger.
 
-```http
-GET /internal/v1/nwdaf-context
-```
+| Caller | Method and path | Success | Purpose |
+| --- | --- | --- | --- |
+| Operator | `POST /internal/v1/training-data-collections` | `202` | Start one configured collection request. |
+| Operator | `GET /internal/v1/training-data-collections/{request_id}` | `200` | Read collection progress and outcome. |
+| Operator | `DELETE /internal/v1/training-data-collections/{request_id}` | `202` | Request collection cancellation and cleanup. |
+| Event Exposure producer | `POST /callbacks/upf-event-exposure` | `204` | Deliver data collected for an active request. |
 
-```json
-{
-  "nfInstanceId": "11111111-1111-4111-8111-111111111111",
-  "apiRoot": "http://127.0.0.1:8000",
-  "internalApiRoot": "http://127.0.0.1:8091",
-  "mlAnalyticsCapabilities": [
-    {
-      "mlAnalyticsIds": ["UE_COMMUNICATION"],
-      "flCapabilityType": "FL_SERVER_AND_CLIENT"
-    }
-  ]
-}
-```
+### Model Provision
 
-This endpoint supplies identity, origins, and the canonical FL capability
-projection from the containing NWDAF's NRF profile. It does not carry topology
-roles, plan identity, resource snapshots, storage selection, raw data, policy
-state, or model bytes. A new process starts with empty volatile provision,
-monitor, retrieval, training, and FL state; durable completed model artifacts
-remain available locally.
+| Caller | Method and path | Success | Purpose |
+| --- | --- | --- | --- |
+| PyAnLF through Go | `POST /internal/v1/ml-model-provision/subscriptions` | `201` | Create a provision resource. |
+| PyAnLF through Go | `PUT /internal/v1/ml-model-provision/subscriptions/{subscription_id}` | `200` | Replace a provision resource. |
+| PyAnLF through Go | `DELETE /internal/v1/ml-model-provision/subscriptions/{subscription_id}` | `204` | Delete a provision resource and cancel pending delivery. |
 
-## Initial Model Provision
+The request and response use the implemented Release 18-shaped
+`NwdafMLModelProvSubsc` representation. Immediate reporting may include the
+matching model notification in the response; otherwise PyMTLF dispatches the
+notification asynchronously through Go.
 
-The request and accepted representation use the Release 18
-`NwdafMLModelProvSubsc` shape. PyMTLF resolves each `mLEventSubscs` entry
-against its configured seed catalog. Every seed has an explicit internal
-`family_id`; the family remains stable across retraining while every promoted
-artifact receives a new standard `modelUniqueId`.
+### Model Monitor
 
-When `eventReq.immRep` is true and a compatible seed exists, the `201` or `200`
-representation includes `mLEventNotifs` with:
+| Caller | Method and path | Success | Purpose |
+| --- | --- | --- | --- |
+| PyAnLF through Go | `POST /internal/v1/ml-model-monitor/registrations` | `201` | Register one local model-use scope. |
+| PyAnLF through Go | `DELETE /internal/v1/ml-model-monitor/registrations/{registration_id}` | `204` | Remove the scope and reconcile its downstream monitor subscription. |
+| Go NWDAF | `POST /internal/v1/ml-model-monitor/notifications` | `204` | Deliver an accuracy-monitoring notification. |
 
-- the requested event and notification correlation
-- `modelUniqueId`
-- the seed's applicability filter and target, when configured
-- `mLFileAddr.mLModelUrl` pointing to the immutable artifact endpoint
+Monitor notifications are correlated by `notifCorrId`. In local mode a
+degradation decision may start local retraining. In federated mode it may
+trigger the configured top-level coordinator only when the federated
+degradation trigger is enabled.
 
-If one generic seed covers multiple active-demand entries, PyMTLF reports that
-model once rather than duplicating the same model notification for every
-covered entry.
+### Model Training
 
-Without immediate reporting, the accepted resource is returned first and a
-standard `NwdafMLModelProvNotif` is delivered asynchronously through Go to the
-original notification destination. A no-match request remains a valid
-subscription but does not invent an address or start training.
+| Caller | Method and path | Success | Required engine |
+| --- | --- | --- | --- |
+| Peer NWDAF through Go | `POST /internal/v1/ml-model-training/subscriptions` | `201` | FL Client |
+| Peer NWDAF through Go | `PUT /internal/v1/ml-model-training/subscriptions/{subscription_id}` | `200` | FL Client |
+| Peer NWDAF through Go | `PATCH /internal/v1/ml-model-training/subscriptions/{subscription_id}` | `200` | FL Client |
+| Peer NWDAF through Go | `DELETE /internal/v1/ml-model-training/subscriptions/{subscription_id}` | `204` | FL Client |
+| Peer NWDAF through Go | `POST /internal/v1/ml-model-training/notifications` | `204` | FL Server |
 
-Artifact responses use `application/gzip`, exact `Content-Length`, a strong
-SHA-256 ETag, `X-Artifact-SHA256`, `nosniff`, and immutable cache semantics.
-There is no mutable `latest` alias or directory listing.
-
-## ML Model Monitoring
-
-PyMTLF owns Model Monitor registrations. Each local registration represents a
-READY AnLF model-use scope. A reconciliation worker creates one corresponding
-standard `MLModelMonitorSub` through Go; Go routes it to PyAnLF. Registration
-create/delete is not blocked on that downstream resource operation, and
-transport failures retry with bounded backoff.
-
-Incoming `MLModelMonitorNotify` is located by `notifCorrId`. A valid
-notification must contain at least one `modelAccuInfos` or `anaFeedbacks`
-entry. The current policy consumes `modelAccuInfos[].deviation` as a WAPE error
-ratio:
-
-- missing `deviation` is a liveness report and does not update the baseline
-- only the degradation path is active
-- reference samples, population standard deviation with `min_std`, the fixed
-  WAPE floor, strict z-score comparison, and N-in-M decisions are configured
-  under `accuracy_policy`
-- each canonical event/filter/target/consumer scope has independent state
-- any degraded scope claims one model-level in-flight retrain intent and
-  records all active scopes
-
-One model-level retrain intent snapshots the triggering scope and every active
-scope for that model. The dataset coordinator resolves those scopes through
-current incremental training-data descriptors or the MongoDB fallback, fixes
-one historical time window, and never merges the two sources. Every required scope
-must contain at least one valid UPF record before a `READY` snapshot is
-published. `READY` is atomically claimed by the bounded local-training
-coordinator and keeps the model retrain-in-flight until a terminal outcome.
-
-The local trainer:
-
-- converts ADRF-aligned raw notifications into the bundle's fixed ten-feature
-  order, summing volume/packet fields and averaging throughput fields per
-  timestamp and scope
-- reserves the older 20% of each scope as reference validation, uses the newer
-  80% for training, and applies a purge gap between the two regions
-- fits a new `StandardScaler` only on training-period observations
-- warm-starts the current Torch model on CPU with deterministic seeds, Adam,
-  and Huber loss
-- always records current/candidate per-scope and aggregate WAPE; the
-  `training.enforce_performance_gate` switch decides whether regression blocks
-  promotion
-
-The triggering scope must be eligible for both training and evaluation.
-Other active scopes participate when eligible and otherwise remain recorded
-with an exclusion reason in logs and the candidate manifest. Scope drift
-during training is logged but does not discard an otherwise valid candidate;
-a stale base generation or removed model demand does.
-
-An accepted candidate reserves a provider-wide model ID, is packaged with the
-same four-file bundle contract,
-reloaded for validation, published under a content-addressed immutable URL,
-and atomically promoted in the process-local family catalog. Retired IDs remain
-indexed to the family but are never reused during the process lifetime. The
-existing Model Provision resources then resolve the new URL at send time.
-Notification delivery keeps only the latest desired artifact per resource,
-retries retryable failures with capped exponential backoff, and cancels a
-stale resource revision. Job completion does not wait for PyAnLF activation
-because standard callback `204` only acknowledges acceptance.
-
-After promotion, reports for the retired model ID are ignored. Each scope
-starts a fresh baseline only after PyAnLF registers the new model identity and
-PyMTLF establishes the corresponding owned subscription/correlation.
-Liveness-only reports still describe insufficient data and never signal
-activation.
-
-### Periodic monitor watchdog
-
-Each active periodic Monitor subscription records its negotiated `repPeriod`.
-A valid notification, including a liveness-only notification without
-`deviation`, resets the watchdog. By default the relationship expires after
-two missed report periods plus a 30-second grace interval. Expiry performs one
-best-effort standard DELETE, clears the local subscription and registration,
-and removes the associated accuracy-policy state. It does not stop AnLF
-analytics or invalidate a model already loaded by AnLF.
-
-## Historical Dataset Retrieval
-
-A successfully stored collection is announced incrementally with:
+The receiving Go NWDAF creates the public Model Training subscription resource
+ID. On create it calls PyMTLF with:
 
 ```http
-PUT /internal/v1/anlf/training-data-descriptors/{descriptor_id}
+POST /internal/v1/ml-model-training/subscriptions
+X-NWDAF-Subscription-Id: <canonical UUIDv4>
+Content-Type: application/json
 ```
 
-The path ID equals `correlationId`. Its representation carries the standard
-`dataSpec`, stored time period, ML event and target scope, source NWDAF,
-lifecycle state, and retention time. `adrfInstanceId` is present for
-ADRF-backed data and absent for MongoDB-backed data. DELETE removes that
-descriptor. The descriptor exists only in PyMTLF memory and is not replayed
-after restart.
+PyMTLF validates the identifier, uses it as the resource key, and returns the
+accepted representation with a private `Location` ending in the same
+identifier. It does not generate a second Model Training subscription ID.
+Replace, patch, and delete use that same identifier in the private path.
 
-When a matching current descriptor exists, PyMTLF independently resolves `nadrf-datamanagement` through the
-containing Go NWDAF's generic NRF proxy or uses `adrf.configured_endpoint`.
-For each accepted SMF collection resource it creates a Release 18-shaped
-retrieval subscription through Go, accepts complete callbacks on the endpoint
-listed above, and directly issues
-`GET /nadrf-datamanagement/v1/data-store-records?fetch-correlation-ids=...`.
-The request carries the descriptor's complete `dataSub` plus the requested
-`timePeriod`. The workspace ADRF V0 currently selects records using only
-`dataSub.smfDataSub.supi`, the time window, and the subscription snapshot
-cutoff; it does not structurally match `notifId`, `notifUri`, or the complete
-`eventSubs` value.
+The request representation includes the implemented Release 18 Model Training
+fields plus the current project-defined properties:
 
-One callback may contain multiple `fetchCorrIds`. The current interoperability
-profile fetches them sequentially, with one identifier in each collection GET,
-and expects one `NadrfDataStoreRecord` response. The Release 18 query parameter
-can represent multiple identifiers, so this is an ADRF V0 profile restriction
-rather than a standard cardinality restriction.
+| Property | Meaning |
+| --- | --- |
+| `flTopology` | Recursive node instruction carrying candidates, direct-child policy, training strategy, reporting cadence, and descendants. |
+| `retainedResultReq` | Requests the latest retained result for the correlated procedure. The current formal experiments do not depend on it. |
 
-The retrieval target is built from the selected ADRF API root; the callback's
-mandatory `fetchUri` is not dereferenced because TS 29.575 defines the
-`data-store-records` resource and notes that this URI is not needed by the
-consumer for ADRF retrieval. Go never receives dataset bytes. The workspace
-ADRF V0 terminal callback with
-an empty ID list is accepted only when `terminationReq=true`; it produces a
-zero-data result and does not relax the required-scope completeness rule.
+Model Training notifications may add:
 
-The pinned workspace free5GC NRF accepts ADRF registration but its older NF
-Discovery schema rejects `target-nf-type=ADRF`. Use configured mode with that
-build. NRF mode remains available for Release 18-compatible NRF
-implementations and does not silently fall back to NF Management listing.
+| Property | Meaning |
+| --- | --- |
+| `flTopologyReport` | Recursive report of realized direct-child and descendant state. |
+| `retainedResultStatus` | Result of a retained-result request. |
 
-When no usable ADRF descriptor exists, PyMTLF opens the configured MongoDB
-collection read-only and queries
-distinct accepted SUPIs with the same inclusive time window. Only documents
-with a non-empty standard `dataNotif.upfEventNotifs` alternative qualify.
-PyMTLF does not create indexes, write records, query legacy correlation IDs,
-or merge data from ADRF.
+The current topology policy can express additional-candidate authority,
+additional-candidate priority, selection method, minimum available nodes,
+training fraction, minimum training nodes, failure acceptance, and minimum
+completion rate. The current strategy requires `method: fedProx`, an
+aggregation name, and `methodParameters.proximalMu`. `reportAfter` carries a
+positive count and a unit.
 
-## Outbound Dependency
+Each direct parent-child edge has its own `subscriptionId` and `notifCorreId`.
+`mlCorreId` correlates the edge-local resources that belong to one hierarchical
+procedure. `roundInd` remains local to the Model Training relationship that
+carries it.
 
-PyMTLF calls the containing Go NWDAF for monitor and ADRF control resources:
+### Federated training trigger
 
-| Purpose | Method and Go path | Required success |
-| --- | --- | --- |
-| Read containing NWDAF | `GET /internal/v1/nwdaf-context` | `200` |
-| Create monitor subscription | `POST /internal/v1/ml-model-monitor/subscriptions` | `201`, `Location`, JSON |
-| Delete monitor subscription | `DELETE /internal/v1/ml-model-monitor/subscriptions/{id}` | `204`; `404` is terminal cleanup |
-| Create ADRF retrieval subscription | `POST /internal/v1/adrf-data-management/data-retrieval-subscriptions` | `201`, `Location`, JSON |
-| Delete ADRF retrieval subscription | `DELETE /internal/v1/adrf-data-management/data-retrieval-subscriptions/{id}` | `204`; peer `404` is terminal cleanup |
+These routes exist only when a flat or hierarchical top-level coordinator is
+configured and `training_trigger.private_api.enabled` is true.
 
-Create also sends the private
-`X-NWDAF-Monitor-Registration-Id` header. The request body remains the
-Release 18 `MLModelMonitorSub` representation; Go stores the header only in
-its process-local route ledger. No registration or subscription is restored
-to a replacement PyMTLF process.
+| Caller | Method and path | Success | Purpose |
+| --- | --- | --- | --- |
+| Experiment controller | `POST /internal/v1/federated-learning/training-requests` | `202` | Submit one model family for training with a caller-provided UUIDv4 request ID. |
+| Experiment controller | `GET /internal/v1/federated-learning/training-requests/{request_id}` | `200` | Read request state, plan identity, progress, result digest, or failure. |
 
-The callback URI in the standard subscription points back to
-`/internal/v1/ml-model-monitor/notifications`. Go replaces it with its own
-internal callback while routing, then restores the PyMTLF URI in the accepted
-representation. PyMTLF never calls PyAnLF directly.
+## Outbound Dependencies Through Go NWDAF
 
-## Deployment Boundary
+PyMTLF does not perform public SBI routing itself. Depending on its enabled
+features, it calls private routes on the containing Go NWDAF for:
 
-The default listener is `127.0.0.1:9092` over ordinary HTTP. TLS, OAuth
-delegation, independent NRF registration, and cross-Go-restart persistence are
-outside the current deployment. Runtime artifacts live below `data/`, which is
-excluded from git. The reproducible, version-controlled initial bundle source
-is owned by PyMTLF under `seed_models/initial`; importing it publishes a
-content-addressed runtime artifact. PyAnLF receives only the resulting Model
-Provision metadata and downloads the artifact from this service.
+| Private Go route family | Purpose |
+| --- | --- |
+| `GET /internal/v1/nwdaf-context` | Read the containing NF identity, API roots, and advertised FL capability. |
+| `GET /internal/v1/nrf/nf-instances` | Resolve ADRF, FL participants, or model-monitor peers through NRF discovery. |
+| `/internal/v1/ml-model-training/subscriptions...` | Create, update, or remove peer Model Training resources. |
+| `/internal/v1/ml-model-monitor/subscriptions...` | Reconcile public Model Monitor subscriptions. |
+| `/internal/v1/adrf-data-management/...` | Create and remove retrieval subscriptions or store collected records. |
+| `/internal/v1/adrf-mlmodelmanagement/mlmodel-store-records...` | Publish, query, or remove ADRF model records. |
+| `/internal/v1/udm-sdm/...` and `/internal/v1/udm-uecm/...` | Resolve group members and serving-SMF registrations for private collection. |
+| `/internal/v1/smf-event-exposure/subscriptions...` | Establish and remove Event Exposure subscriptions for private collection. |
 
-Go polls readiness and treats the UUID as the process generation. A same-ID
-`503` temporarily blocks new work without resetting routes. A changed UUID or
-two consecutive transport failures confirms process loss. Go drains admitted
-operations, clears volatile MTLF routes, and waits for a ready process. It does
-not terminate existing AnLF analytics and does not replay old runtime state to
-the replacement process.
+Callbacks and peer Model Training messages use the callback URI or peer target
+provided by the active resource and topology state. Go owns the actual external
+request and returns the peer result to PyMTLF.
+
+## Error Representation
+
+Standard-shaped private operations return `application/problem+json` errors.
+Malformed request bodies and candidate extension violations return `400` with
+`INVALID_MSG_FORMAT` and, when available, `invalidParams`. Missing resources
+return `404 RESOURCE_NOT_FOUND`. Disabled roles or unavailable runtime state
+return `503` with the corresponding cause.
+
+Routes outside these standard-shaped families may return the private
+`PrivateError` representation. Request validation for standard-shaped private
+paths is normalized to HTTP `400`; other FastAPI validation failures use HTTP
+`422`.
+
+## Experiment Output
+
+When experiment recording is enabled, PyMTLF writes node-local append-only
+records to `<directory>/<mlCorreId>/observations.jsonl`. Record families
+include:
+
+- `MODEL_TRAINING_OPERATION` for sent and received create, replace, patch,
+  delete, and notification operations;
+- candidate, edge, repair, and topology-acceptance decisions;
+- `ROUND_AGGREGATION` participant and acceptance outcomes;
+- `MODEL_EVALUATION` validation loss and accuracy; and
+- `MODEL_ARTIFACT_SAVED` for the Root final model.
+
+The recorder preserves `subscriptionId`, peer NF instance identity, operation
+direction, request start time, result time, outcome, cause, relevant message
+fields, `roundInd`, and `mlCorreId` when those values exist at the recording
+point. Every file contains observations from its local PyMTLF process only.
